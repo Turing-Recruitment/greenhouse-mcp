@@ -1,140 +1,151 @@
 # Greenhouse MCP
 
-**Built by Sam Vangelos.** Permission-scoped MCP servers over our own Greenhouse tenant: per-user
-enforcement on every read, paired preview/apply write intents, metadata-only audit, and an
-evidence-gated rollout. This is the internal cut — it names the real Supabase projects, the real
-Render service, and the real Greenhouse identifiers the system runs against.
+Greenhouse MCP provides permission-scoped Model Context Protocol servers over
+Greenhouse Harvest v3. It includes a recruiter-facing read surface, a separate
+operator control plane, and an approval-gated action package mounted into the
+recruiter runtime for explicitly entitled sessions.
 
-Give an AI workspace a Greenhouse API key and you have handed every user the whole tenant: every
-candidate, every confidential requisition, every scorecard, regardless of what their own Greenhouse
-account is allowed to see. These servers take the opposite position — Greenhouse's own permission
-model is the boundary, and the server re-derives and enforces it on every single read, after every
-fetch, before anything reaches the model.
+This repository is a curated snapshot of the internal system as of 21 August
+2026. Private development history, credentials, issued sessions, and live rollout
+evidence are not included.
 
-```mermaid
-flowchart TB
-    C[AI desktop client] -->|stdio · streamable HTTP| R[recruiter MCP<br/>evidence tools · analysis recipes · QA front door]
-    R --> CH["scoped-reader — the one sanctioned chokepoint<br/>(static guard: write client forbidden everywhere)"]
-    CH --> SC[scoped-core<br/>per-actor row filtering after every read · default deny]
-    SC --> RO[read-only client<br/>single-flight OAuth · 429/401/timeout budgets · bounded cache]
-    RO --> GH[Greenhouse Harvest v3]
-    R --> AU[metadata-only audit<br/>failed emission ⇒ no data]
-    W[action MCP — write plane] --> I[paired preview/apply tools<br/>HMAC intents · short expiry]
-    I --> L[(action ledger · resource locks<br/>replay-safe apply)]
-    L --> GH
-    G[rollout gate<br/>live probes · leakage sample · revocation drill] -.blocks distribution.- R
-```
-
----
-
-## How the read-only guarantee is enforced
-
-The claim that a server is read-only is usually a code-review promise. Here it is a static proof
-that runs in CI: `packages/recruiter-mcp/scripts/verify-guards.mjs` walks every runtime file and
-enforces two rules with no exemptions. The write-bearing Greenhouse client module may not be
-imported by any runtime file — the chokepoint included, at any relative path — and the raw read
-primitives may be named in exactly one place, `src/scoped-reader.ts`. Every other file gets its data
-through the chokepoint, which applies the actor's scope before returning anything.
-
-That design earned its shape adversarially: an earlier version exempted the chokepoint file from the
-module rule, so reverting one import would have reloaded the full write surface with the guard still
-green. The guard's own test suite proves each rule fires, including that exact regression.
-
-The scoping core underneath (`packages/scoped-core`) filters rows per actor after every fetch and
-denies by default: a user Greenhouse lists on nothing sees nothing, and an unrecognized permission
-shape fails closed instead of widening.
-
-## Sessions, identity, and per-read scope
+## Runtime topology
 
 ```mermaid
 flowchart LR
-    T["durable session token<br/>subject: a person's email · token id · issue time"] --> V[server-side validation<br/>rejects any authority-shaped claim]
-    V --> D[identity directory<br/>Greenhouse account lookup at read time]
-    D --> S[per-read scope<br/>what THAT account can see today]
-    RV[(revocation list)] -.checked every session.- V
+    C["AI client"] --> R["Recruiter MCP<br/>stdio or Streamable HTTP"]
+    R --> I["Session and identity resolution"]
+    I --> SR["scoped-reader"]
+    SR --> SC["scoped-core<br/>per-user filtering"]
+    SC --> RO["Read-only Harvest client"]
+    RO --> GH["Greenhouse Harvest v3"]
+    R --> AU["Metadata-only audit"]
+    I --> E{"Write entitlement"}
+    E -->|present| AP["Action package<br/>preview and apply tools"]
+    AP --> L[("Action ledger and resource locks")]
+    L --> GH
+    OP["Operator control-plane MCP"] --> RO
 ```
 
-Session tokens carry identity, never authority. Issuance refuses to embed roles or scopes; validation
-rejects any token that claims them anyway. What a recruiter can see is decided per read, from what
-Greenhouse says about their account at that moment — so a permission change in the ATS takes effect
-immediately, and a revoked token dies at the next session check. Identity and revocation both live in
-the `Greenhouse MCP` Supabase project, `ibxvxmfhovmththllwoi`, whose ref the runtime asserts on every
-identity, revocation, bootstrap, and readiness path so a misconfigured deploy fails loudly instead of
-quietly reading the separate `recruiting-ops-analytics` project (`ilkbfyubwvbpsevybsfe`).
+The hosted recruiter server starts from
+`packages/recruiter-mcp/bin/greenhouse-recruiter-mcp-http.mjs`. A stdio
+entrypoint serves local MCP clients. Both use the same scoped read path.
 
-## The write plane: paired preview and apply
+The action package is not a second MCP service in the current runtime. When the
+action plane is configured and a session has an active entitlement, its tools are
+appended to that session's recruiter catalog. A session without the entitlement
+receives the unchanged read catalog.
 
-The write plane (`packages/action-mcp`) exposes no direct mutation. Every action is a pair: a preview
-tool that computes and signs an intent — an HMAC over the exact change, expiring in minutes — and an
-apply tool that will execute only that signed intent, once, under a resource lock, with the outcome
-recorded in a ledger before Greenhouse is touched. A replayed apply is a no-op; an expired intent is
-a refusal; a drifted target voids the signature. Since `f11a509` the write plane has no separate
-service: it mounts inside the recruiter server, so both planes share one URL, one session, and one
-audit sink.
+## Recruiter read path
 
-## Audit, and the gate that blocks distribution
+Recruiter sessions identify a person; they do not carry Greenhouse roles, job ids,
+or permission claims. On every scoped read, the runtime resolves the session
+identity and derives current access from Greenhouse. Permission changes therefore
+take effect without reissuing authority in the MCP token.
 
-Every tool call emits metadata-only audit events — who, what tool, which scope, never candidate
-content. Emission failure means the data does not flow: the audit sink refusing is treated exactly
-like the permission check refusing. Two retained backends exist because Cloud Run cannot append to a
-GCS FUSE mount, so `GREENHOUSE_RECRUITER_AUDIT_BACKEND=gcs_object` writes one create-only object per
-event instead; an unrecognized backend value fails closed everywhere instead of silently downgrading
-audit. The rollout gate extends the same posture to distribution — a build cannot go to recruiters
-until live probes, a leakage sample over real responses, and a revocation drill have all passed and
-their evidence is on file.
+All recruiter tools route raw reads through `src/scoped-reader.ts`. Static guards
+enforce two boundaries:
 
-## What the servers connect to
+1. Raw Greenhouse read primitives may be called only from the scoped reader.
+2. The write-bearing client module may not be imported by recruiter runtime code.
 
-Every read and write in this repository goes to Greenhouse's public Harvest v3 API at
-`https://harvest.greenhouse.io`, authenticated as a Harvest OAuth app whose credentials the operator
-supplies through `GREENHOUSE_CLIENT_ID` and `GREENHOUSE_CLIENT_SECRET`. The origin is a constant in
-`packages/control-plane/src/client-readonly.ts`; there is no configurable base URL and no
-private-API adapter mode anywhere in this tree. An earlier operator-facing admin plane that did carry
-one was removed in `e2203b9` when the action package replaced it, and `client.ts` is now a three-line
-re-export of the read-only client — the write transport it used to expose no longer exists.
+The scoped core filters returned rows by actor and denies unknown permission
+shapes. Tool-specific projections then remove fields that do not belong on the
+model-facing surface. Resume content has one explicit path:
+`read_my_resume` accepts an attachment id, rechecks access, downloads under
+size and time limits, extracts text, and never returns the signed URL or raw bytes.
+
+The curated recruiter catalog combines scoped evidence reads with deterministic
+analysis tools for job scope, feedback drag, stage latency, pipeline state, source
+outcomes, and rejection-reason drift. Analysis tools compute their metrics in code
+and return evidence ids for follow-up; the model does not calculate the result.
+
+## Action path
+
+The action package defines eleven fixed capabilities as twenty-two paired tools:
+one preview and one apply tool per capability. There is no bulk endpoint and no
+model-selectable HTTP method or route.
+
+A preview resolves the actor, current state, visibility, permissions, destination,
+and effects, then signs a short-lived intent over the exact change. Apply accepts
+that intent and approval echo, repeats the material reads, claims the resource
+lock, sends at most one mutation, and verifies the result by readback.
+
+Network failures, timeouts, ambiguous acknowledgements, and inconclusive readback
+are recorded as unknown rather than retried. The reconciliation command reads
+Greenhouse to resolve those records without sending business-data mutations.
+Action state contains bindings, fingerprints, and operational metadata rather than
+candidate text, note bodies, contact values, compensation values, or bearer tokens.
+
+The service and write switches default off. Per-user entitlements independently
+control preview, apply, and high-impact apply access.
 
 ## Packages
 
-| Package | What it is |
+| Path | Responsibility |
 |---|---|
-| `packages/control-plane` | The unscoped operator MCP (~65 read tools) for whoever runs the ATS — see its `start-here.md` |
-| `packages/scoped-core` | The security core: actor resolution and per-row permission filtering, dependency-free |
-| `packages/recruiter-mcp` | The per-user server: scoped reads, evidence tools, analysis recipes, sessions, audit, OAuth sign-in, rollout gate |
-| `packages/action-mcp` | The write plane: paired preview/apply tools over signed intents and a ledger |
-| `packages/slack-mcp` | The TA Ops Slack notifier: validated DM delivery with a resolver cache and a user allowlist |
+| `packages/control-plane/` | Unscoped, read-only operator MCP for ATS administration |
+| `packages/scoped-core/` | Actor resolution and permission filtering with default-deny behavior |
+| `packages/recruiter-mcp/` | Recruiter sessions, scoped tools, HTTP/stdio transports, audit, and action mounting |
+| `packages/action-mcp/` | Typed preview/apply definitions, signing, ledger, locking, and reconciliation |
+| `packages/slack-mcp/` | Allowlisted Slack direct-message delivery with cached user resolution |
 
-## Running it
+The unscoped control plane is an operator surface and should be distributed only
+to people who already hold tenant-wide ATS authority. Recruiter clients should use
+the scoped server.
 
-```bash
-npm ci
-npm run verify   # builds the control plane, then typechecks, tests, and guards every package
-```
+## Entrypoints
 
-That is 1,896 tests across the five packages and it needs no credentials. One suite skips by design:
-the Harvest contract-conformance tests read a vendored mirror of Greenhouse's own API documentation,
-which is not redistributed here, so they announce the reason and skip unless you supply a local
-mirror under `docs/harvest-v3-api`. Live probes, the Docker smoke harness, and the rollout gate are
-separate documented commands that refuse or skip without their credentials.
+| Surface | Entrypoint |
+|---|---|
+| Recruiter MCP over HTTP | `packages/recruiter-mcp/bin/greenhouse-recruiter-mcp-http.mjs` |
+| Recruiter MCP over stdio | `packages/recruiter-mcp/bin/greenhouse-recruiter-mcp.mjs` |
+| Operator MCP over stdio | `packages/control-plane/dist/index.js` after build |
+| Action reconciliation | `packages/action-mcp/bin/greenhouse-action-reconcile.mjs` |
+| Slack MCP over stdio | `packages/slack-mcp/dist/index.js` after build |
 
-Each package's README covers its own deployment. The recruiter server ships a production image built
-from the workspace root:
+The production container combines the compiled control-plane and action packages
+with the recruiter runtime:
 
 ```bash
 docker build -f packages/recruiter-mcp/deploy/Dockerfile .
 ```
 
-Configuration is documented in each package's `production.env.example`, and both files carry the real
-project refs, not placeholders.
+## Verification
 
-## Where it runs today
+Node.js 22 is the CI runtime. Install the locked workspace dependencies and run
+the credential-free gate from the repository root:
 
-The scoped recruiter server runs on Render as service `srv-d92vprtaeets73aqcj50`, with the
-`GREENHOUSE_ACTION_*` switches on that service and the shared `Greenhouse MCP` environment group;
-both were `true` in production as of `392a69c`. It went out behind the rollout gate with real probes,
-a leakage sample over live responses, and a revocation drill. The gate's evidence format is preserved
-here as the sanitized `packages/recruiter-mcp/examples/rollout-evidence/` set; the pilot's actual
-issued-token evidence is deliberately not in this repository, since those files name real sessions.
-The action MCP's release runbook (`packages/action-mcp/deploy/runbook.md`) is partially archived and
-says so in its first paragraph — sections 4 and 5 describe the standalone service that no longer
-exists, and there is no scheduled reconciler, so an interrupted apply holds its resource lock until
-someone runs the manual sweep.
+```bash
+npm ci
+npm run verify
+node packages/recruiter-mcp/scripts/verify-package.mjs
+```
+
+The gate builds the compiled packages, type-checks every workspace, runs the test
+suites, and executes package guards. Harvest contract-conformance tests skip when
+the optional local vendor-documentation mirror is absent; the generated registry
+remains source-controlled.
+
+Credentialed probes, container smoke tests, session issuance, and distribution
+evidence are separate operator workflows. They do not run as part of the default
+verification command.
+
+## Configuration and data handling
+
+The recruiter and action environment contracts live in their package deployment
+directories. Secrets belong in the runtime environment or secret manager, never in
+the image or repository. Durable session files are bearer credentials and are not
+source artifacts.
+
+Every recruiter tool call emits metadata-only audit information. Candidate
+content, resume text, signed attachment URLs, prompts, and bearer tokens are
+excluded. If audit emission is required and fails, the protected data is not
+returned.
+
+Package-level details:
+
+- [Recruiter MCP](packages/recruiter-mcp/README.md)
+- [Scoped core](packages/scoped-core/README.md)
+- [Action package](packages/action-mcp/README.md)
+- [Operator control plane](packages/control-plane/start-here.md)
