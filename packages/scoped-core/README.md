@@ -1,6 +1,6 @@
-# Scoped Greenhouse Reads
+# Greenhouse Scoped Core
 
-This module adds a per-user read-scoping layer around the Greenhouse MCP raw read client. It is additive: it does not modify `greenhouse/src`, and it does not change the existing org-wide operator or analytics path.
+This package is the permission boundary between recruiter-facing tools and the raw Greenhouse read client. It resolves an authenticated actor, derives current job access, filters each supported response, and denies records whose scope cannot be established.
 
 ## Surface Contract
 
@@ -67,16 +67,27 @@ Operator behavior:
 
 `actAsUser` is an option passed by trusted surface code. It is not read from tool params. Identity-looking params such as `on_behalf_of_user_id`, `actor_id`, and `actAsUserId` are stripped before raw reads.
 
-## Registered Scoped Tools
+## Filtering contract
 
-The v1 scoped read registry includes:
+The default registry covers the raw objects used by the recruiter catalog, including jobs, applications, candidates, interviews, scorecards, notes, attachments, offers, openings, users, stage history, ownership, and reference dictionaries. Unsupported tool names receive a `TOOL_NOT_AVAILABLE` denial.
 
-- `list_applications`, `get_application`
-- `list_candidates`, `get_candidate`
-- `list_scorecards`
-- `list_notes`
-- `list_jobs`, `get_job`
+Filtering is default-deny:
 
-Unsupported tools return an explicit `TOOL_NOT_AVAILABLE` denial. Write tools are not in the registry, so they are denied by the same default-deny path; the scoped surface never calls raw write helpers.
+- Directly job-scoped rows must name a permitted job.
+- Applications and their dependent records resolve through the application-to-job relationship.
+- Candidate rows are scoped through visible applications, and embedded applications are pruned.
+- Notes must satisfy both job scope and note-visibility rules.
+- Global reference dictionaries use explicit projection policies rather than inheriting broad records by default.
+- Unknown permission shapes and unresolved associations are denied.
 
-Filtering is default-deny. Rows with no resolvable job association are dropped. Candidate rows are scoped through their applications; embedded application arrays are pruned to permitted jobs, and candidates with no permitted application are dropped. Scoped note reads also require public note visibility.
+Write tools are absent from the raw read registry. The recruiter runtime mounts the separate action package only after session, identity, visibility, and entitlement checks.
+
+## Verify
+
+From the workspace root:
+
+```bash
+npm --workspace @greenhouse-mcp/scoped-core run verify
+```
+
+The suite covers permission lookup, operator impersonation, cursor pagination, relationship resolution, filtering, default-deny behavior, and cancellation.
