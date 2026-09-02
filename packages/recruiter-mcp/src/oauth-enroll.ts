@@ -117,7 +117,13 @@ export function createOauthEnrollment(deps: OauthEnrollmentDeps): OauthEnrollmen
         //    never reverses it.
         const byEmail = await directoryRows({ primary_email: `eq.${email}` });
         if (byEmail.length > 0) {
-          return { status: "denied", code: "directory_row_exists", reason: `A directory row already exists for this email (status ${String(byEmail[0]!["status"])}).` };
+          const existing = byEmail[0]!;
+          // An operator's bootstrap that landed between the resolve and this read is the one row
+          // that is not a decision against this person: same user, resolved — already enrolled.
+          if (String(existing["status"]) === "resolved" && Number(existing["greenhouse_user_id"]) === entry.greenhouseUserId) {
+            return { status: "enrolled", greenhouseUserId: entry.greenhouseUserId, alreadyEnrolled: true };
+          }
+          return { status: "denied", code: "directory_row_exists", reason: `A directory row already exists for this email (status ${String(existing["status"])}).` };
         }
 
         // 3. Insert WITHOUT on_conflict: the greenhouse_user_id unique constraint is the guard

@@ -40,6 +40,8 @@ export interface IdentityDirectoryRow {
   greenhouseUserId: number;
   primaryEmail: string;
   status: string;
+  /** ISO; when present, a row newer than the roster is never tombstoned (see rosterAsOf). */
+  lastVerifiedAt?: string;
 }
 
 export type ReconciliationAction = "keep" | "revoke" | "tombstone" | "skip";
@@ -74,6 +76,12 @@ export interface BuildIdentityReconciliationPlanOptions {
   greenhouseUsers: unknown;
   rosterComplete: boolean;
   generatedAt?: string;
+  // When the roster was read (ISO). Since first-sign-in enrollment (CLO-271) rows appear without an
+  // operator, a row whose last_verified_at is NEWER than the roster cannot be "absent from the
+  // roster" — it simply postdates it — and is skipped instead of tombstoned. Without this a stale
+  // file export would deprovision everyone who enrolled after it was taken, and enrollment refuses
+  // to re-create a row it finds in any status, so the lockout would not self-heal.
+  rosterAsOf?: string;
   // Override the blast-radius floor for a genuine large offboarding. Does NOT override the
   // empty-roster floor — an empty roster is never a legitimate "deprovision everyone".
   confirmMassDeprovision?: boolean;
@@ -106,6 +114,13 @@ export function buildIdentityReconciliationPlan(
       } else {
         kept.push({ ...base, action: "keep", reason: "Greenhouse user is present and active in the roster." });
       }
+      continue;
+    }
+    if (
+      options.rosterAsOf !== undefined && row.lastVerifiedAt !== undefined &&
+      Date.parse(row.lastVerifiedAt) > Date.parse(options.rosterAsOf)
+    ) {
+      skipped.push({ ...base, action: "skip", reason: `Absent from the roster, but the directory row (${row.lastVerifiedAt}) is newer than the roster (${options.rosterAsOf}); re-run with a fresher roster.` });
       continue;
     }
     absent.push({ ...base, action: "tombstone", reason: "Greenhouse user is absent from the latest complete roster." });
@@ -210,7 +225,7 @@ export async function fetchResolvedDirectoryRows(
   const table = normalizeOptionalSupabaseIdentifier(config.table, "recruiter_identity_directory", "Supabase identity directory table");
 
   const url = new URL(`${baseUrl}/rest/v1/${encodeURIComponent(table)}`);
-  url.searchParams.set("select", "greenhouse_user_id,primary_email,status");
+  url.searchParams.set("select", "greenhouse_user_id,primary_email,status,last_verified_at");
   url.searchParams.set("status", `eq.${DIRECTORY_RESOLVED_STATUS}`);
 
   const response = await (config.fetchImpl ?? fetch)(url, {
@@ -236,7 +251,8 @@ export async function fetchResolvedDirectoryRows(
     const primaryEmail = typeof row.primary_email === "string" ? row.primary_email : undefined;
     const status = typeof row.status === "string" ? row.status : undefined;
     if (greenhouseUserId === undefined || primaryEmail === undefined || status === undefined) continue;
-    rows.push({ greenhouseUserId, primaryEmail, status });
+    const lastVerifiedAt = typeof row.last_verified_at === "string" ? row.last_verified_at : undefined;
+    rows.push({ greenhouseUserId, primaryEmail, status, ...(lastVerifiedAt !== undefined ? { lastVerifiedAt } : {}) });
   }
   return rows;
 }
@@ -332,6 +348,7 @@ export interface ReconciliationOauthRevocation {
 interface ReconciliationCliArgs {
   greenhouseUsersFile?: string;
   fetchRoster: boolean;
+  rosterAsOf?: string;
   out?: string;
   apply: boolean;
   rosterComplete: boolean;
@@ -356,19 +373,27 @@ export async function startIdentityReconciliationCli(
     // completeness, never asserted by hand: an incomplete fetch can only under-deprovision.
     let greenhouseUsers: unknown;
     let rosterComplete = parsed.rosterComplete;
+    // The roster's age bounds what "absent" can mean: a live fetch is as-of the moment it started;
+    // a file is as-of its modification time unless --roster-as-of says otherwise.
+    let rosterAsOf: string;
     if (parsed.fetchRoster) {
+      rosterAsOf = parsed.rosterAsOf ?? new Date().toISOString();
       const { readFullGreenhouseUsersRoster } = await import("./scoped-reader.js");
       const roster = await readFullGreenhouseUsersRoster(env);
       greenhouseUsers = roster.users;
       rosterComplete = roster.complete;
     } else {
-      greenhouseUsers = JSON.parse(await readFile(parsed.greenhouseUsersFile as string, "utf8")) as unknown;
+      const file = parsed.greenhouseUsersFile as string;
+      const { stat } = await import("node:fs/promises");
+      rosterAsOf = parsed.rosterAsOf ?? (await stat(file)).mtime.toISOString();
+      greenhouseUsers = JSON.parse(await readFile(file, "utf8")) as unknown;
     }
     const directoryRows = await fetchResolvedDirectoryRows(accessConfig);
     const plan = buildIdentityReconciliationPlan({
       directoryRows,
       greenhouseUsers,
       rosterComplete,
+      rosterAsOf,
       confirmMassDeprovision: parsed.confirmMassDeprovision,
     });
 
@@ -420,13 +445,18 @@ function parseReconciliationArgs(args: string[]): ReconciliationCliArgs {
   const greenhouseUsersFile = values.get("greenhouse-users-file");
   if (!fetchRoster && !greenhouseUsersFile) {
     throw new Error(
-      "Usage: greenhouse-recruiter-reconcile-identity (--fetch-roster | --greenhouse-users-file greenhouse-users.json) [--out plan.json] [--roster-complete] [--confirm-mass-deprovision] [--apply]. " +
+      "Usage: greenhouse-recruiter-reconcile-identity (--fetch-roster | --greenhouse-users-file greenhouse-users.json) [--roster-as-of ISO] [--out plan.json] [--roster-complete] [--confirm-mass-deprovision] [--apply]. " +
+        "A directory row newer than the roster (its file mtime, or --roster-as-of) is never tombstoned — first sign-in enrollment creates rows without an operator. " +
         "--fetch-roster reads the live COMPLETE /v3/users roster itself (roster completeness derived from pagination, never asserted). " +
         "With a file, it must be the COMPLETE /v3/users export; pass --roster-complete to allow deprovisioning recruiters who are absent from it. " +
         "If a complete roster would deprovision more than half the directory, pass --confirm-mass-deprovision to override the blast-radius floor."
     );
   }
-  return { greenhouseUsersFile, fetchRoster, out: values.get("out"), apply, rosterComplete, confirmMassDeprovision };
+  const rosterAsOf = values.get("roster-as-of");
+  if (rosterAsOf !== undefined && Number.isNaN(Date.parse(rosterAsOf))) {
+    throw new Error("--roster-as-of must be an ISO timestamp.");
+  }
+  return { greenhouseUsersFile, fetchRoster, rosterAsOf, out: values.get("out"), apply, rosterComplete, confirmMassDeprovision };
 }
 
 function requireEnv(env: NodeJS.ProcessEnv, name: string): string {

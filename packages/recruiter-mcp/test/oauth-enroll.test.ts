@@ -88,6 +88,13 @@ describe("first-sign-in enrollment (CLO-271)", () => {
     assert.equal(requests.filter((r) => r.method === "POST").length, 0, "no denial ever writes a row");
   });
 
+  it("treats an operator bootstrap that landed a moment earlier (same user, resolved) as already enrolled, not as a denial", async () => {
+    const { fetchImpl, requests } = directoryFake({ rowsByEmail: [{ id: "row-1", greenhouse_user_id: 5182584004, primary_email: EMAIL, status: "resolved" }] });
+    const result = await createOauthEnrollment(deps({ fetchImpl })).enroll(EMAIL);
+    assert.deepEqual(result, { status: "enrolled", greenhouseUserId: 5182584004, alreadyEnrolled: true });
+    assert.equal(requests.filter((r) => r.method === "POST").length, 0);
+  });
+
   it("never overrides an existing directory row for the email, whatever its status", async () => {
     const { fetchImpl, requests } = directoryFake({ rowsByEmail: [{ id: "row-1", greenhouse_user_id: 5182584004, primary_email: EMAIL, status: "deactivated" }] });
     const result = await createOauthEnrollment(deps({ fetchImpl })).enroll(EMAIL);

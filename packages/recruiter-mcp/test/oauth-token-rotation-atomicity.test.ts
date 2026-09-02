@@ -285,6 +285,8 @@ describe("migration 0007 — session termination reaches the refresh family (CLO
   it("the operator RPCs take the same per-family advisory lock BEFORE sweeping, in family_id order", () => {
     const byEmail = sql.slice(sql.indexOf("create or replace function revoke_oauth_grants_for_email("), sql.indexOf("create or replace function redeem_oauth_refresh("));
     assert.match(byEmail, /order by family_id/);
+    // An email with no live family is reported not_found, never as a successful revocation.
+    assert.match(byEmail, /case when v_families = 0 then 'not_found' else 'revoked' end/);
     const lockIdx = byEmail.indexOf("pg_advisory_xact_lock(hashtext(v_family))");
     const sweepIdx = byEmail.indexOf("revoke_oauth_family_locked(v_family");
     assert.ok(lockIdx >= 0 && sweepIdx > lockIdx, "each family is locked before it is swept");

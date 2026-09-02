@@ -25,12 +25,16 @@
 -- successor is visible to the sweep (or the redeem sees the revoked family). Families are locked
 -- in family_id order so two multi-family sweeps cannot deadlock each other.
 --
--- ROLLBACK (code revert FIRST, then this — the store calls the two RPCs and must not 404 on them):
---   drop function if exists revoke_oauth_grants_for_email(text, timestamptz, text, text);
---   drop function if exists revoke_oauth_family(text, timestamptz, text, text);
---   drop function if exists revoke_oauth_family_locked(text, timestamptz, text, text);
---   then re-run the `create or replace function redeem_oauth_refresh` block from 0006 verbatim.
--- No columns or tables are added, so rows written under 0007 need no cleanup.
+-- ROLLBACK (code revert FIRST, then this — the store calls the two RPCs and must not 404 on them),
+-- in ONE management-API call so no statement runs against a half-rolled-back tree:
+--   1. re-run the `create or replace function redeem_oauth_refresh` block from 0006 verbatim
+--      (0007's body calls revoke_oauth_family_locked at runtime; drop the helper only once no
+--      installed function references it);
+--   2. drop function if exists revoke_oauth_grants_for_email(text, timestamptz, text, text);
+--      drop function if exists revoke_oauth_family(text, timestamptz, text, text);
+--      drop function if exists revoke_oauth_family_locked(text, timestamptz, text, text);
+-- No columns or tables are added, so rows written under 0007 need no cleanup; families killed
+-- under 0007 stay dead because 0006's rotation honours recruiter_mcp_oauth_revoked_families.
 
 create or replace function revoke_oauth_family_locked(
   p_family text,
@@ -122,8 +126,10 @@ begin
     v_grants := v_grants + coalesce((v_one->>'grants_revoked')::integer, 0);
     v_jtis := v_jtis + coalesce((v_one->>'jtis_revoked')::integer, 0);
   end loop;
+  -- Nothing to sweep is reported as such, so a typo'd email cannot read as a successful revocation
+  -- (the single-family RPC says not_found for the same situation; the CLI exits non-zero).
   return jsonb_build_object(
-    'status', 'revoked',
+    'status', case when v_families = 0 then 'not_found' else 'revoked' end,
     'email', v_email,
     'families_revoked', v_families,
     'grants_revoked', v_grants,

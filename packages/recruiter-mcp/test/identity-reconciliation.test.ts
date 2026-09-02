@@ -47,6 +47,28 @@ describe("identity directory reconciliation (Slice G #23)", () => {
     assert.equal(plan.containsTokens, false);
   });
 
+  it("never tombstones a row that is newer than the roster — a colleague who enrolled after the export is skipped, not deprovisioned (CLO-271)", () => {
+    const plan = buildIdentityReconciliationPlan({
+      directoryRows: [
+        ...DIRECTORY,
+        { greenhouseUserId: 999, primaryEmail: "self-enrolled@company.com", status: "resolved", lastVerifiedAt: "2026-09-02T18:00:00.000Z" },
+      ],
+      greenhouseUsers: ROSTER,
+      rosterComplete: true,
+      rosterAsOf: "2026-09-01T00:00:00.000Z",
+    });
+    assert.deepEqual(ids(plan.tombstoned), [333], "the genuinely absent row still tombstones");
+    assert.deepEqual(ids(plan.skipped), [999]);
+    assert.match(plan.skipped[0]!.reason, /newer than the roster/);
+    // Without a roster age nothing changes — the older behaviour is preserved exactly.
+    const ageless = buildIdentityReconciliationPlan({
+      directoryRows: [...DIRECTORY, { greenhouseUserId: 999, primaryEmail: "self-enrolled@company.com", status: "resolved", lastVerifiedAt: "2026-09-02T18:00:00.000Z" }],
+      greenhouseUsers: ROSTER,
+      rosterComplete: true,
+    });
+    assert.deepEqual(ids(ageless.tombstoned), [333, 999]);
+  });
+
   it("only ever processes resolved rows — never re-activates an already-deactivated row", () => {
     const plan = buildIdentityReconciliationPlan({
       directoryRows: DIRECTORY,
@@ -149,7 +171,7 @@ describe("identity directory reconciliation (Slice G #23)", () => {
       fetched = true;
       const url = new URL(String(input));
       assert.equal(url.searchParams.get("status"), "eq.resolved");
-      assert.equal(url.searchParams.get("select"), "greenhouse_user_id,primary_email,status");
+      assert.equal(url.searchParams.get("select"), "greenhouse_user_id,primary_email,status,last_verified_at");
       return {
         ok: true,
         status: 200,

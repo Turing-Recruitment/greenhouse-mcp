@@ -552,10 +552,12 @@ function projectApplicationRow(row: Record<string, unknown>): Record<string, unk
   const stage = projectStageReference(row.current_stage);
   if (stage) projected.current_stage = stage;
   else delete projected.current_stage;
-  // The denormalized `candidate` embed is dropped by the denylist AND the global list before this
-  // runs, so the reference is hand-built from the raw row, exactly like current_stage above: id +
-  // name only, never email/phone/raw_profile, so "who are the stalest candidates on this req" can
-  // answer with a name without a second lookup. The generic sanitizer would strip the name at depth.
+  // Defensive, not a capability: Harvest v3 application rows carry candidate_id only (no embed
+  // in the contract, no adapter expands one), so this branch is inert on the live tenant. If a
+  // future revision or an expand ever embeds `candidate`, the denylist and the global list drop
+  // the raw object before this runs and only {id, first_name, last_name} is rebuilt here — never
+  // email/phone/raw_profile. Naming the stalest candidates on a req is a candidate_ids ->
+  // search_my_candidates join, which the candidate row now serves.
   const candidate = projectCandidateReference(row.candidate);
   if (candidate) projected.candidate = candidate;
   return projected;
