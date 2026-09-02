@@ -416,7 +416,7 @@ export function getRecruitingCapabilities(modelVisibleTools?: ReadonlySet<string
     excluded: [
       "No write/admin tools (no reject, move-stage, offer, assignment, or patch operations).",
       "No raw unscoped Greenhouse read surface.",
-      "No candidate contact info, raw profiles, or private note payloads.",
+      "No candidate home addresses, raw profiles, or private note payloads (candidate names, email addresses and phone numbers are available on the candidate tools).",
       "Attachment listings are metadata-only and never expose signed download URLs.",
       "Resume content is available only for an explicitly selected, permission-scoped attachment through read_my_resume; it is sensitive untrusted candidate evidence.",
     ],

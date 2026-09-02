@@ -20,6 +20,7 @@ import {
 import { HttpRequestBodyError, readBoundedFormBody } from "../src/http-request.js";
 import { startHttpRecruiterMcp } from "../src/http-server.js";
 import { CLAUDE_CODE_CIMD_URL } from "../src/oauth-clients.js";
+import type { IdentityDirectory } from "../src/identity.js";
 
 const STRONG_SESSION_SECRET = "session-secret-value-with-at-least-32-chars";
 const OAUTH_SIGNING_SECRET = "oauth-signing-secret-value-with-at-least-32-chars";
@@ -42,6 +43,8 @@ function oauthEnv(): NodeJS.ProcessEnv {
     GREENHOUSE_RECRUITER_OAUTH_GOOGLE_CLIENT_SECRET: "google-client-secret-value",
     GREENHOUSE_RECRUITER_OAUTH_SUPABASE_URL: "https://ibxvxmfhovmththllwoi.supabase.co",
     GREENHOUSE_RECRUITER_OAUTH_SUPABASE_KEY: "oauth-grants-key-value",
+    // The refresh leg re-checks enrollment (CLO-272); the seeded grant's recruiter is enrolled here.
+    GREENHOUSE_RECRUITER_IDENTITY_JSON: JSON.stringify([{ email: "recruiter@example.com", status: "resolved", greenhouseUserId: 4242 }]),
   } as NodeJS.ProcessEnv;
 }
 
@@ -120,6 +123,8 @@ interface MemoryGrantStore extends OauthGrantStore {
   revokedFamilies: string[];
   /** jtis the reuse-revoke path copied into the session revocation list (the migration's side effect). */
   revokedTokenIds: Set<string>;
+  /** Operator-side revocations the store was asked for (revokeFamily / revokeGrantsForEmail), in order. */
+  revocationRequests: Array<{ familyId?: string; email?: string; reason?: string }>;
   seed(input: OauthGrantRecordInput): void;
 }
 
@@ -132,6 +137,7 @@ function memoryGrantStore(now: () => number = () => Date.now()): MemoryGrantStor
   const revokedFamilies: string[] = [];
   const revokedFamilySet = new Set<string>();
   const revokedTokenIds = new Set<string>();
+  const revocationRequests: Array<{ familyId?: string; email?: string; reason?: string }> = [];
   const toRow = (hash: string, entry: MutableGrantRow): OauthGrantRow => ({
     kind: entry.input.kind,
     tokenHash: hash,
@@ -159,12 +165,64 @@ function memoryGrantStore(now: () => number = () => Date.now()): MemoryGrantStor
       }
     }
   };
+  // Models migration 0007's revoke_oauth_family_locked: rows revoked, family dead, every jti the
+  // family minted copied into the session revocation list.
+  const sweepFamily = (familyId: string, at: number): { grants: number; jtis: number } => {
+    let grants = 0;
+    let jtis = 0;
+    for (const entry of rows.values()) {
+      if (entry.input.familyId !== familyId) continue;
+      if (entry.revokedAt === undefined) grants += 1;
+      if (entry.input.accessJti !== undefined && !revokedTokenIds.has(entry.input.accessJti)) {
+        revokedTokenIds.add(entry.input.accessJti);
+        jtis += 1;
+      }
+    }
+    revokeFamily(familyId, at);
+    return { grants, jtis };
+  };
   return {
     rows,
     revokedFamilies,
     revokedTokenIds,
+    revocationRequests,
     seed(input) {
       rows.set(hashOauthGrantSecret(input.secret), { input });
+    },
+    async peekRefresh(secret) {
+      const entry = rows.get(hashOauthGrantSecret(secret));
+      if (!entry || entry.input.kind !== "refresh") return { status: "not_found" };
+      return {
+        status: "found",
+        email: entry.input.email,
+        familyId: entry.input.familyId,
+        clientId: entry.input.clientId,
+        surface: entry.input.surface,
+        client: entry.input.client,
+        consumed: entry.consumedAt !== undefined,
+        revoked: entry.revokedAt !== undefined,
+      };
+    },
+    async revokeFamily(familyId, options = {}) {
+      revocationRequests.push({ familyId, ...(options.reason !== undefined ? { reason: options.reason } : {}) });
+      const known = [...rows.values()].some((entry) => entry.input.familyId === familyId);
+      if (!known) return { status: "not_found", familiesRevoked: 0, grantsRevoked: 0, jtisRevoked: 0 };
+      const swept = sweepFamily(familyId, now());
+      return { status: "revoked", familiesRevoked: 1, grantsRevoked: swept.grants, jtisRevoked: swept.jtis };
+    },
+    async revokeGrantsForEmail(email, options = {}) {
+      revocationRequests.push({ email, ...(options.reason !== undefined ? { reason: options.reason } : {}) });
+      const families = new Set(
+        [...rows.values()].filter((entry) => entry.input.email === email && entry.revokedAt === undefined).map((entry) => entry.input.familyId)
+      );
+      let grants = 0;
+      let jtis = 0;
+      for (const familyId of [...families].sort()) {
+        const swept = sweepFamily(familyId, now());
+        grants += swept.grants;
+        jtis += swept.jtis;
+      }
+      return { status: "revoked", familiesRevoked: families.size, grantsRevoked: grants, jtisRevoked: jtis };
     },
     async insertGrant(input) {
       rows.set(hashOauthGrantSecret(input.secret), { input });
@@ -187,6 +245,17 @@ function memoryGrantStore(now: () => number = () => Date.now()): MemoryGrantStor
       if (!entry) return { status: "not_redeemable", detail: "not_found" };
       const family = entry.input.familyId;
       const familyRevoked = revokedFamilySet.has(family);
+      // Migration 0007: the session kill switch reaches the family — any jti this lineage minted
+      // that sits in the revocation list makes the whole lineage dead before the token is judged.
+      if (!familyRevoked) {
+        const jtiRevoked = [...rows.values()].some(
+          (other) => other.input.familyId === family && other.input.accessJti !== undefined && revokedTokenIds.has(other.input.accessJti)
+        );
+        if (jtiRevoked) {
+          sweepFamily(family, input.now);
+          return { status: "family_revoked" };
+        }
+      }
       if (entry.consumedAt === undefined && entry.revokedAt === undefined && !familyRevoked) {
         entry.consumedAt = new Date(input.now).toISOString();
         if (entry.input.kind !== "refresh") return { status: "not_redeemable", detail: "wrong_kind" };
@@ -655,3 +724,112 @@ void ((): void => {
   const digest = createHash("sha256").update(CODE_VERIFIER, "ascii").digest("base64url");
   assert.equal(digest, CODE_CHALLENGE);
 })();
+
+// CLO-272: the refresh leg is where a de-enrolled hosted-Claude session gets ended, and where an
+// operator's jti revocation reaches the whole family.
+describe("OAuth refresh identity gate and family termination (CLO-272)", () => {
+  const unresolvedDirectory: IdentityDirectory = {
+    async resolve() {
+      return { status: "unresolved", reason: "Recruiter identity mapping is not resolved." };
+    },
+  };
+  const brokenDirectory: IdentityDirectory = {
+    async resolve() {
+      throw new Error("Identity directory lookup failed with status 503.");
+    },
+  };
+
+  async function exchangedRefresh(store: MemoryGrantStore): Promise<{ refresh: string; jti: string }> {
+    seededCodeGrant(store);
+    const handler = createOauthTokenHandler(requireConfig(), oauthEnv(), { grantStore: store });
+    const exchange = await driveToken(handler, exchangeParams());
+    assert.equal(exchange.statusCode, 200, exchange.body);
+    const refresh = exchange.json()["refresh_token"] as string;
+    const row = store.rows.get(hashOauthGrantSecret(refresh))!;
+    return { refresh, jti: row.input.accessJti! };
+  }
+
+  it("a recruiter who is no longer enrolled is refused on refresh, the family is swept, and the presented token is NOT consumed", async () => {
+    const store = memoryGrantStore();
+    const { refresh, jti } = await exchangedRefresh(store);
+    const handler = createOauthTokenHandler(requireConfig(), oauthEnv(), { grantStore: store, identityDirectory: unresolvedDirectory });
+
+    const denied = await driveToken(handler, { grant_type: "refresh_token", refresh_token: refresh, client_id: CLAUDE_CODE_CIMD_URL });
+    assert.equal(denied.statusCode, 400, denied.body);
+    assert.equal(denied.json()["error"], "invalid_grant");
+    assert.deepEqual(store.revocationRequests, [{ familyId: "11111111-2222-4333-8444-555555555555", reason: "identity_unresolved" }]);
+    assert.deepEqual(store.revokedFamilies, ["11111111-2222-4333-8444-555555555555"]);
+    assert.ok(store.revokedTokenIds.has(jti), "the access-token jti minted with the family lands on the revocation list");
+    assert.equal(store.rows.get(hashOauthGrantSecret(refresh))!.consumedAt, undefined, "the gate runs BEFORE the rotation consumes the token");
+
+    // Even a recruiter who is re-enrolled cannot revive the dead family — a fresh sign-in is the only way back.
+    const resolvedAgain = createOauthTokenHandler(requireConfig(), oauthEnv(), { grantStore: store });
+    const afterwards = await driveToken(resolvedAgain, { grant_type: "refresh_token", refresh_token: refresh, client_id: CLAUDE_CODE_CIMD_URL });
+    assert.equal(afterwards.statusCode, 400);
+    assert.equal(afterwards.json()["error"], "invalid_grant");
+  });
+
+  it("a directory outage is 503 temporarily_unavailable: nothing consumed, nothing revoked, and the same token rotates once the directory is back", async () => {
+    const store = memoryGrantStore();
+    const { refresh } = await exchangedRefresh(store);
+    const outage = createOauthTokenHandler(requireConfig(), oauthEnv(), { grantStore: store, identityDirectory: brokenDirectory });
+
+    const blip = await driveToken(outage, { grant_type: "refresh_token", refresh_token: refresh, client_id: CLAUDE_CODE_CIMD_URL });
+    assert.equal(blip.statusCode, 503, blip.body);
+    assert.equal(blip.json()["error"], "temporarily_unavailable");
+    assert.deepEqual(store.revokedFamilies, []);
+    assert.deepEqual(store.revocationRequests, []);
+    assert.equal(store.rows.get(hashOauthGrantSecret(refresh))!.consumedAt, undefined);
+
+    const recovered = createOauthTokenHandler(requireConfig(), oauthEnv(), { grantStore: store });
+    const rotate = await driveToken(recovered, { grant_type: "refresh_token", refresh_token: refresh, client_id: CLAUDE_CODE_CIMD_URL });
+    assert.equal(rotate.statusCode, 200, rotate.body);
+  });
+
+  it("a grants-store outage on the peek is 503 temporarily_unavailable — never invalid_grant, which would make the client drop the session", async () => {
+    const store = memoryGrantStore();
+    const { refresh } = await exchangedRefresh(store);
+    const peekBroken: MemoryGrantStore = { ...store, async peekRefresh() { throw new Error("OAuth refresh peek failed with status 503."); } };
+    const handler = createOauthTokenHandler(requireConfig(), oauthEnv(), { grantStore: peekBroken });
+    const blip = await driveToken(handler, { grant_type: "refresh_token", refresh_token: refresh, client_id: CLAUDE_CODE_CIMD_URL });
+    assert.equal(blip.statusCode, 503, blip.body);
+    assert.equal(blip.json()["error"], "temporarily_unavailable");
+    assert.equal(store.rows.get(hashOauthGrantSecret(refresh))!.consumedAt, undefined);
+    assert.deepEqual(store.revocationRequests, []);
+  });
+
+  it("an operator's jti revocation (greenhouse-recruiter-revoke-session) reaches the family: the next refresh is refused and every jti the family minted is revoked", async () => {
+    const store = memoryGrantStore();
+    const { refresh, jti } = await exchangedRefresh(store);
+    // The kill switch: the operator revoked the current access token's jti.
+    store.revokedTokenIds.add(jti);
+
+    const handler = createOauthTokenHandler(requireConfig(), oauthEnv(), { grantStore: store });
+    const denied = await driveToken(handler, { grant_type: "refresh_token", refresh_token: refresh, client_id: CLAUDE_CODE_CIMD_URL });
+    assert.equal(denied.statusCode, 400, denied.body);
+    assert.equal(denied.json()["error"], "invalid_grant");
+    assert.deepEqual(store.revokedFamilies, ["11111111-2222-4333-8444-555555555555"], "the family is dead, not just the one jti");
+    assert.equal(store.rows.get(hashOauthGrantSecret(refresh))!.revokedAt !== undefined, true);
+  });
+
+  it("an enrolled recruiter's refresh still rotates normally — the gate is transparent to the healthy path", async () => {
+    const store = memoryGrantStore();
+    const { refresh } = await exchangedRefresh(store);
+    const handler = createOauthTokenHandler(requireConfig(), oauthEnv(), { grantStore: store });
+    const rotate = await driveToken(handler, { grant_type: "refresh_token", refresh_token: refresh, client_id: CLAUDE_CODE_CIMD_URL });
+    assert.equal(rotate.statusCode, 200, rotate.body);
+    assert.deepEqual(store.revocationRequests, []);
+  });
+
+  it("a refresh token the store does not know skips the gate and is refused as before (no directory call, no revocation)", async () => {
+    const store = memoryGrantStore();
+    let directoryCalls = 0;
+    const counting: IdentityDirectory = { async resolve() { directoryCalls += 1; return { status: "resolved", greenhouseUserId: 4242 }; } };
+    const handler = createOauthTokenHandler(requireConfig(), oauthEnv(), { grantStore: store, identityDirectory: counting });
+    const denied = await driveToken(handler, { grant_type: "refresh_token", refresh_token: "never-issued-refresh-token-value", client_id: CLAUDE_CODE_CIMD_URL });
+    assert.equal(denied.statusCode, 400);
+    assert.equal(denied.json()["error"], "invalid_grant");
+    assert.equal(directoryCalls, 0);
+    assert.deepEqual(store.revocationRequests, []);
+  });
+});

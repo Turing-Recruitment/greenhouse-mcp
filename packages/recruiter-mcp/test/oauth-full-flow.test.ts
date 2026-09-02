@@ -120,6 +120,21 @@ function grantsArm(world: FlowWorld, url: URL, method: string, init: RequestInit
     world.grantRows.set(String(row["token_hash"]), { consumed_at: null, revoked_at: null, ...row });
     return new Response("", { status: 201 });
   }
+  // The refresh leg's pre-rotation peek (CLO-272): PostgREST filter by token_hash, refresh rows only.
+  if (method === "GET") {
+    const hash = url.searchParams.get("token_hash")?.replace(/^eq\./, "");
+    const row = hash === undefined ? undefined : world.grantRows.get(hash);
+    if (row === undefined || row["grant_kind"] !== "refresh") return jsonResponse([]);
+    return jsonResponse([{
+      email: row["email"],
+      family_id: row["family_id"],
+      client_id: row["client_id"],
+      surface: row["surface"],
+      client: row["client"],
+      consumed_at: row["consumed_at"],
+      revoked_at: row["revoked_at"],
+    }]);
+  }
   throw new Error(`unexpected grants request: ${method} ${url}`);
 }
 

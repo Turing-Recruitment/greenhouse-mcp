@@ -6,6 +6,7 @@ import { fetchWithTimeout } from "./fetch-timeout.js";
 import { createIdentityDirectoryFromEnv, isSafePositiveGreenhouseUserId, type IdentityDirectory } from "./identity.js";
 import { resolveOauthClient } from "./oauth-clients.js";
 import { OAUTH_AUTHORIZATION_CODE_TTL_SECONDS, type OauthAuthorizationConfig } from "./oauth-config.js";
+import { createOauthEnrollmentFromEnv, type OauthEnrollment, type OauthEnrollmentDenialCode, type OauthEnrollmentResult } from "./oauth-enroll.js";
 import { createOauthGrantStore, type OauthGrantStore } from "./oauth-grant-store.js";
 import { OAUTH_CALLBACK_PATH } from "./oauth-metadata.js";
 import { writeJson } from "./remote.js";
@@ -18,8 +19,11 @@ import type { RecruiterClient } from "./types.js";
 //
 // Identity rule, verbatim from the email-session gate: the verified email must sit in an allowed
 // work-email domain AND resolve through the recruiter identity directory to exactly one safe
-// Greenhouse user, or the flow ends in access_denied with ZERO grant writes. Signing in is not
-// enrolling — and a Google personal address is refused at the domain gate before the lookup.
+// Greenhouse user, or the flow ends in access_denied with ZERO grant writes. A Google personal
+// address is refused at the domain gate before the lookup. Since CLO-271 a first sign-in whose
+// email has NO directory row is enrolled from the Greenhouse roster (oauth-enroll.ts, the
+// bootstrap CLI's own rules) and then resolved like everyone else; every other non-resolution is
+// still a denial, and now one that names the cause and who fixes it.
 
 export const GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 export const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
@@ -38,6 +42,8 @@ export interface OauthHttpRequestLike {
 export interface OauthAuthorizeHandlerDeps {
   fetchImpl?: typeof fetch;
   identityDirectory?: IdentityDirectory;
+  /** First-sign-in enrollment; defaults to the env-wired one, or none when the directory is not Supabase-backed. */
+  enrollIdentity?: OauthEnrollment;
   grantStore?: OauthGrantStore;
   now?: () => number;
   generateSecret?: () => string;
@@ -75,6 +81,10 @@ export function createOauthAuthorizeHandlers(
   const generateNonce = deps.generateNonce ?? (() => randomBytes(16).toString("base64url"));
   const generateFamilyId = deps.generateFamilyId ?? (() => randomUUID());
   const resolveIdentityDirectory = () => deps.identityDirectory ?? createIdentityDirectoryFromEnv(env);
+  const resolveEnrollment = async (): Promise<OauthEnrollment | undefined> =>
+    deps.enrollIdentity ?? await createOauthEnrollmentFromEnv(env, { allowedDomains: config.allowedEmailDomains, fetchImpl });
+  const contact = "Ask #ta-ops (Sam Vangelos)";
+  const workDomain = config.allowedEmailDomains[0] ?? "your work";
 
   return {
     async handleAuthorize(req, res) {
@@ -248,7 +258,7 @@ export function createOauthAuthorizeHandlers(
         email = normalizeWorkEmail(String(claims["email"]), config.allowedEmailDomains);
       } catch {
         logOauthDenial("callback", "email_domain_not_allowed");
-        redirectError("access_denied", "The Google account email is not a usable work email.");
+        redirectError("access_denied", `Sign in with your @${workDomain} Google account, not a personal or other-organization address.`);
         return;
       }
       // Google Workspace stamps the account's hosted domain in `hd`; when present it must be an
@@ -260,17 +270,35 @@ export function createOauthAuthorizeHandlers(
         redirectError("access_denied", "The Google account hosted domain is not allowed.");
         return;
       }
-      // The email-session gate, verbatim: the directory decides who exists. Anything but a
-      // single resolved, safe Greenhouse user id ends the flow with ZERO grant writes.
-      const resolutionResult = await resolveIdentityDirectory().resolve({
-        subject: `email:${email}`,
-        email,
-        surface: pending.surface,
-        client: pending.client,
-      });
+      // The email-session gate: the directory decides who exists. Anything but a single resolved,
+      // safe Greenhouse user id ends the flow with ZERO grant writes — except the one case where
+      // the directory has never heard of this email, which is now enrolled from the Greenhouse
+      // roster and resolved again (CLO-271). Ambiguous / invalid rows stay hard denials.
+      const sessionIdentity = { subject: `email:${email}`, email, surface: pending.surface, client: pending.client };
+      let resolutionResult = await resolveIdentityDirectory().resolve(sessionIdentity);
+      if (resolutionResult.status === "unresolved") {
+        const enrollment = await resolveEnrollment();
+        const outcome: OauthEnrollmentResult = enrollment === undefined
+          ? { status: "denied", code: "enrollment_disabled", reason: "No durable identity directory to enroll into." }
+          : await enrollment.enroll(email);
+        if (outcome.status === "error") {
+          logOauthDenial("callback", "enrollment_error");
+          redirectError("server_error", `Enrollment could not be completed. Try again in a minute, or ${contact.toLowerCase()} if it keeps failing.`);
+          return;
+        }
+        if (outcome.status === "denied") {
+          logOauthDenial("callback", `enrollment_${outcome.code}`);
+          redirectError("access_denied", enrollmentDenialCopy(outcome.code, contact));
+          return;
+        }
+        logOauthEnrollment(outcome.alreadyEnrolled ? "enrolled_concurrently" : "enrolled");
+        resolutionResult = await resolveIdentityDirectory().resolve(sessionIdentity);
+      }
       if (resolutionResult.status !== "resolved" || !isSafePositiveGreenhouseUserId(resolutionResult.greenhouseUserId)) {
         logOauthDenial("callback", `identity_${resolutionResult.status}`);
-        redirectError("access_denied", "This Google account is not enrolled for the recruiter MCP.");
+        redirectError("access_denied", resolutionResult.status === "ambiguous"
+          ? `This Google account matches more than one Greenhouse user. ${contact} to resolve it, then click Connect again.`
+          : `This Google account is not enabled for the Greenhouse connector. ${contact} to check it, then click Connect again.`);
         return;
       }
       const secret = generateSecret();
@@ -413,4 +441,29 @@ function redirectWithParams(
 function logOauthDenial(stage: "authorize" | "callback", reason: string): void {
   const sanitized = reason.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 80);
   console.error(`[greenhouse-recruiter-mcp] oauth_authorization_denied stage=${stage} reason=${sanitized}`);
+}
+
+// PII-free like the denial log: the outcome only, never the email.
+function logOauthEnrollment(outcome: "enrolled" | "enrolled_concurrently"): void {
+  console.error(`[greenhouse-recruiter-mcp] oauth_identity_enrolled outcome=${outcome}`);
+}
+
+// What the recruiter reads in Claude's connector dialog. Each branch names the cause and the
+// fixer; none carries the email (it rides in a redirect URL through the client and its history).
+export function enrollmentDenialCopy(code: OauthEnrollmentDenialCode, contact: string): string {
+  switch (code) {
+    case "email_missing":
+      return `The Google account you signed in with does not match an active Greenhouse user, so it cannot use the Greenhouse connector yet. ${contact} to check your Greenhouse account, then click Connect again.`;
+    case "deactivated":
+      return `The Greenhouse user for this Google account is deactivated. ${contact} if that is wrong.`;
+    case "ambiguous":
+      return `This Google account matches more than one Greenhouse user. ${contact} to resolve it, then click Connect again.`;
+    case "directory_row_exists":
+      return `This Google account is not currently enabled for the Greenhouse connector. ${contact} to re-enable it.`;
+    case "email_mismatch":
+      return `Your Greenhouse user is registered under a different email. ${contact} to update it, then click Connect again.`;
+    case "enrollment_disabled":
+    default:
+      return `This Google account is not enrolled for the Greenhouse connector. ${contact} to add you, then click Connect again.`;
+  }
 }

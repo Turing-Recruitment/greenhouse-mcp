@@ -81,8 +81,33 @@ export type OauthRefreshRedeemResult =
   | { status: "rotated"; grant: OauthRotatedGrant }
   /** A reused (already-rotated) refresh token: the family was revoked as a durable property. */
   | { status: "reuse_revoked" }
+  /**
+   * The session kill switch reached the family: an access-token jti this lineage minted was revoked
+   * (operator CLI, directory de-enrollment), so the RPC swept the whole family and refused — every
+   * jti it ever minted is now on the revocation list (migration 0007).
+   */
+  | { status: "family_revoked" }
   /** Never issued, wrong kind, expired, wrong client, or a family already dead — invalid_grant. */
   | { status: "not_redeemable"; detail: OauthRefreshNotRedeemableDetail };
+
+/** What a refresh row says about itself BEFORE it is consumed — the identity gate reads this. */
+export type OauthRefreshPeekResult =
+  | { status: "found"; email: string; familyId: string; clientId: string; surface: string; client: string; consumed: boolean; revoked: boolean }
+  | { status: "not_found" };
+
+export interface OauthRevocationTarget {
+  familyId?: string;
+  email?: string;
+  reason?: string;
+  revokedBy?: string;
+}
+
+export interface OauthRevocationOutcome {
+  status: "revoked" | "not_found" | "invalid";
+  familiesRevoked: number;
+  grantsRevoked: number;
+  jtisRevoked: number;
+}
 
 export type OauthRefreshNotRedeemableDetail =
   | "not_found"
@@ -107,6 +132,102 @@ export interface OauthGrantStore {
    * and a transient failure rolls back rather than burning the presented token without a heir.
    */
   redeemRefresh(input: OauthRefreshRedeemInput): Promise<OauthRefreshRedeemResult>;
+  /**
+   * Read the row a presented refresh token names WITHOUT consuming it, so the identity directory
+   * can be consulted before the rotation burns the token. A definitive "this person is no longer
+   * enrolled" then revokes the family with the token intact; a directory outage leaves everything
+   * untouched and the client retries later (CLO-272).
+   */
+  peekRefresh(secret: string): Promise<OauthRefreshPeekResult>;
+  /** Revoke one refresh family under its advisory lock (RPC revoke_oauth_family). */
+  revokeFamily(familyId: string, options?: { reason?: string; revokedBy?: string }): Promise<OauthRevocationOutcome>;
+  /** Revoke every live family of an email, each under its lock (RPC revoke_oauth_grants_for_email). */
+  revokeGrantsForEmail(email: string, options?: { reason?: string; revokedBy?: string }): Promise<OauthRevocationOutcome>;
+}
+
+/**
+ * Access to the revocation RPCs without the full OAuth config: the operator CLI and the identity
+ * reconciliation run from a shell that holds the identity Supabase pair (same canonical project),
+ * not the server's OAuth pair.
+ */
+export interface OauthRevocationAccess {
+  supabaseUrl: string;
+  apiKey: string;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}
+
+const DEFAULT_REVOCATION_TIMEOUT_MS = 5_000;
+// PostgREST answers a function it has not loaded into its schema cache with PGRST202; the migration
+// asks for a reload, but the watcher is asynchronous, so one short retry covers the gap.
+const SCHEMA_CACHE_RETRY_DELAY_MS = 750;
+
+export async function revokeOauthGrants(
+  access: OauthRevocationAccess,
+  target: OauthRevocationTarget
+): Promise<OauthRevocationOutcome> {
+  const fetchImpl = access.fetchImpl ?? fetch;
+  const timeoutMs = access.timeoutMs ?? DEFAULT_REVOCATION_TIMEOUT_MS;
+  const origin = access.supabaseUrl.replace(/\/+$/, "");
+  const headers = {
+    apikey: access.apiKey,
+    authorization: `Bearer ${access.apiKey}`,
+    accept: "application/json",
+    "content-type": "application/json",
+  };
+  const familyId = target.familyId?.trim();
+  const email = target.email?.trim().toLowerCase();
+  if ((familyId && email) || (!familyId && !email)) {
+    throw new Error("Revoke exactly one of familyId or email.");
+  }
+  const fn = familyId ? "revoke_oauth_family" : "revoke_oauth_grants_for_email";
+  const body = {
+    ...(familyId ? { p_family_id: familyId } : { p_email: email }),
+    p_now: new Date().toISOString(),
+    p_reason: target.reason ?? "operator_revocation",
+    p_revoked_by: target.revokedBy ?? null,
+  };
+  const result = await callRpcWithSchemaRetry(fetchImpl, new URL(`${origin}/rest/v1/rpc/${fn}`), headers, body, timeoutMs, "OAuth grant revocation");
+  return toRevocationOutcome(result);
+}
+
+async function callRpcWithSchemaRetry(
+  fetchImpl: typeof fetch,
+  url: URL,
+  headers: Record<string, string>,
+  body: unknown,
+  timeoutMs: number,
+  label: string
+): Promise<Record<string, unknown>> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await fetchWithTimeout(fetchImpl, url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    }, timeoutMs, label);
+    if (response.ok) return readRpcObject(response, label);
+    const text = await response.text().catch(() => "");
+    if (attempt === 0 && response.status === 404 && text.includes("PGRST202")) {
+      await new Promise((resolve) => setTimeout(resolve, SCHEMA_CACHE_RETRY_DELAY_MS));
+      continue;
+    }
+    throw new Error(`${label} failed with status ${response.status}.`);
+  }
+  throw new Error(`${label} failed: schema cache did not load the function.`);
+}
+
+function toRevocationOutcome(result: Record<string, unknown>): OauthRevocationOutcome {
+  const status = result["status"];
+  const count = (key: string): number => {
+    const value = result[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  };
+  return {
+    status: status === "revoked" ? "revoked" : status === "not_found" ? "not_found" : "invalid",
+    familiesRevoked: count("families_revoked"),
+    grantsRevoked: count("grants_revoked"),
+    jtisRevoked: count("jtis_revoked"),
+  };
 }
 
 export interface OauthGrantStoreOptions {
@@ -213,7 +334,55 @@ export function createOauthGrantStore(
       if (status === "reuse_revoked") {
         return { status: "reuse_revoked" };
       }
+      if (status === "family_revoked") {
+        return { status: "family_revoked" };
+      }
       return { status: "not_redeemable", detail: toNotRedeemableDetail(status) };
+    },
+
+    async peekRefresh(secret) {
+      const url = new URL(baseUrl);
+      url.searchParams.set("token_hash", `eq.${hashOauthGrantSecret(secret)}`);
+      url.searchParams.set("grant_kind", "eq.refresh");
+      url.searchParams.set("select", "email,family_id,client_id,surface,client,consumed_at,revoked_at");
+      url.searchParams.set("limit", "1");
+      const response = await fetchWithTimeout(fetchImpl, url, {
+        method: "GET",
+        headers: { apikey: headers.apikey, authorization: headers.authorization, accept: "application/json" },
+      }, config.lookupTimeoutMs, "OAuth refresh peek");
+      if (!response.ok) {
+        throw new Error(`OAuth refresh peek failed with status ${response.status}.`);
+      }
+      const rows = await response.json() as unknown;
+      const row = Array.isArray(rows) ? rows[0] : undefined;
+      if (row === undefined || row === null || typeof row !== "object" || Array.isArray(row)) {
+        return { status: "not_found" };
+      }
+      const record = row as Record<string, unknown>;
+      return {
+        status: "found",
+        email: asRequiredString(record, "email"),
+        familyId: asRequiredString(record, "family_id"),
+        clientId: asRequiredString(record, "client_id"),
+        surface: asRequiredString(record, "surface"),
+        client: asRequiredString(record, "client"),
+        consumed: typeof record["consumed_at"] === "string",
+        revoked: typeof record["revoked_at"] === "string",
+      };
+    },
+
+    async revokeFamily(familyId, options = {}) {
+      return revokeOauthGrants(
+        { supabaseUrl: config.grantsSupabaseUrl, apiKey: config.grantsSupabaseKey, fetchImpl, timeoutMs: config.lookupTimeoutMs },
+        { familyId, ...options }
+      );
+    },
+
+    async revokeGrantsForEmail(email, options = {}) {
+      return revokeOauthGrants(
+        { supabaseUrl: config.grantsSupabaseUrl, apiKey: config.grantsSupabaseKey, fetchImpl, timeoutMs: config.lookupTimeoutMs },
+        { email, ...options }
+      );
     },
   };
 }

@@ -47,6 +47,28 @@ describe("identity directory reconciliation (Slice G #23)", () => {
     assert.equal(plan.containsTokens, false);
   });
 
+  it("never tombstones a row that is newer than the roster — a colleague who enrolled after the export is skipped, not deprovisioned (CLO-271)", () => {
+    const plan = buildIdentityReconciliationPlan({
+      directoryRows: [
+        ...DIRECTORY,
+        { greenhouseUserId: 999, primaryEmail: "self-enrolled@company.com", status: "resolved", lastVerifiedAt: "2026-09-02T18:00:00.000Z" },
+      ],
+      greenhouseUsers: ROSTER,
+      rosterComplete: true,
+      rosterAsOf: "2026-09-01T00:00:00.000Z",
+    });
+    assert.deepEqual(ids(plan.tombstoned), [333], "the genuinely absent row still tombstones");
+    assert.deepEqual(ids(plan.skipped), [999]);
+    assert.match(plan.skipped[0]!.reason, /newer than the roster/);
+    // Without a roster age nothing changes — the older behaviour is preserved exactly.
+    const ageless = buildIdentityReconciliationPlan({
+      directoryRows: [...DIRECTORY, { greenhouseUserId: 999, primaryEmail: "self-enrolled@company.com", status: "resolved", lastVerifiedAt: "2026-09-02T18:00:00.000Z" }],
+      greenhouseUsers: ROSTER,
+      rosterComplete: true,
+    });
+    assert.deepEqual(ids(ageless.tombstoned), [333, 999]);
+  });
+
   it("only ever processes resolved rows — never re-activates an already-deactivated row", () => {
     const plan = buildIdentityReconciliationPlan({
       directoryRows: DIRECTORY,
@@ -115,8 +137,10 @@ describe("identity directory reconciliation (Slice G #23)", () => {
     assert.equal(report.revokedCount, 1);
     assert.equal(report.tombstonedCount, 1);
     assert.equal(report.containsTokens, false);
-    assert.equal(requests.length, 2, "one PATCH per revoke/tombstone, never for kept rows");
-    for (const request of requests) {
+    // The OAuth sweep after each flip (CLO-272) is a POST to an RPC; the directory writes are the PATCHes.
+    const patches = requests.filter((request) => request.method === "PATCH");
+    assert.equal(patches.length, 2, "one PATCH per revoke/tombstone, never for kept rows");
+    for (const request of patches) {
       assert.equal(request.method, "PATCH");
       assert.equal(request.url.pathname, "/rest/v1/recruiter_identity_directory");
       assert.equal(request.body.status, "deactivated");
@@ -126,7 +150,7 @@ describe("identity directory reconciliation (Slice G #23)", () => {
       assert.ok(evidence.action === "revoke" || evidence.action === "tombstone");
       assert.ok(typeof evidence.reason === "string" && (evidence.reason as string).length > 0);
     }
-    const patchedIds = requests.map((r) => r.url.searchParams.get("greenhouse_user_id")).sort();
+    const patchedIds = patches.map((r) => r.url.searchParams.get("greenhouse_user_id")).sort();
     assert.deepEqual(patchedIds, ["eq.222", "eq.333"]);
   });
 
@@ -147,7 +171,7 @@ describe("identity directory reconciliation (Slice G #23)", () => {
       fetched = true;
       const url = new URL(String(input));
       assert.equal(url.searchParams.get("status"), "eq.resolved");
-      assert.equal(url.searchParams.get("select"), "greenhouse_user_id,primary_email,status");
+      assert.equal(url.searchParams.get("select"), "greenhouse_user_id,primary_email,status,last_verified_at");
       return {
         ok: true,
         status: 200,
@@ -218,5 +242,55 @@ describe("identity directory reconciliation (Slice G #23)", () => {
     assert.deepEqual(ids(confirmed.tombstoned), [222, 333]);
     assert.equal(confirmed.tombstonesBlockedReason, undefined);
     assert.equal(confirmed.canApply, true);
+  });
+});
+
+describe("reconciliation ends the OAuth sessions it deprovisions (CLO-272)", () => {
+  function fetchAnswering(rpc: (body: Record<string, unknown>) => Response) {
+    const requests: Array<{ method: string; url: URL; body: Record<string, unknown> }> = [];
+    const fetchImpl = (async (input: URL | RequestInfo, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push({ method: String(init?.method), url, body });
+      if (url.pathname.startsWith("/rest/v1/rpc/")) return rpc(body);
+      return new Response(null, { status: 204 });
+    }) as typeof fetch;
+    return { fetchImpl, requests };
+  }
+
+  it("after each directory flip, revokes every OAuth family of that email through the same canonical project and reports it per row", async () => {
+    const plan = buildIdentityReconciliationPlan({ directoryRows: DIRECTORY, greenhouseUsers: ROSTER, rosterComplete: true });
+    const { fetchImpl, requests } = fetchAnswering((body) =>
+      new Response(JSON.stringify({ status: "revoked", email: body["p_email"], families_revoked: 1, grants_revoked: 2, jtis_revoked: 2 }), { status: 200 })
+    );
+    const report = await applyIdentityReconciliationPlan(plan, { supabaseUrl: CANONICAL, apiKey: "sb_secret_service_role_key", fetchImpl });
+    const rpcCalls = requests.filter((r) => r.url.pathname === "/rest/v1/rpc/revoke_oauth_grants_for_email");
+    assert.equal(rpcCalls.length, 2, "one sweep per deprovisioned row");
+    for (const call of rpcCalls) {
+      assert.equal(call.method, "POST");
+      assert.match(String(call.body["p_reason"]), /^identity_directory_reconciliation:(revoke|tombstone)$/);
+      assert.equal(call.body["p_revoked_by"], "identity_reconciliation");
+    }
+    assert.equal(report.oauthRevocations.length, 2);
+    assert.ok(report.oauthRevocations.every((entry) => entry.status === "revoked" && entry.familiesRevoked === 1 && entry.jtisRevoked === 2));
+    const sweptEmails = report.oauthRevocations.map((entry) => entry.primaryEmail).sort();
+    assert.deepEqual(sweptEmails, rpcCalls.map((c) => String(c.body["p_email"])).sort());
+  });
+
+  it("a sweep that finds no live families is reported as skipped, not revoked", async () => {
+    const plan = buildIdentityReconciliationPlan({ directoryRows: DIRECTORY, greenhouseUsers: ROSTER, rosterComplete: true });
+    const { fetchImpl } = fetchAnswering(() => new Response(JSON.stringify({ status: "not_found" }), { status: 200 }));
+    const report = await applyIdentityReconciliationPlan(plan, { supabaseUrl: CANONICAL, apiKey: "sb_secret_service_role_key", fetchImpl });
+    assert.ok(report.oauthRevocations.every((entry) => entry.status === "skipped" && entry.familiesRevoked === 0));
+  });
+
+  it("a failed sweep never un-flips the directory: the row stays deactivated, the report says failed, apply still succeeds", async () => {
+    const plan = buildIdentityReconciliationPlan({ directoryRows: DIRECTORY, greenhouseUsers: ROSTER, rosterComplete: true });
+    const { fetchImpl, requests } = fetchAnswering(() => new Response("boom", { status: 500 }));
+    const report = await applyIdentityReconciliationPlan(plan, { supabaseUrl: CANONICAL, apiKey: "sb_secret_service_role_key", fetchImpl });
+    assert.equal(report.ok, true);
+    assert.equal(requests.filter((r) => r.method === "PATCH").length, 2);
+    assert.equal(report.oauthRevocations.length, 2);
+    assert.ok(report.oauthRevocations.every((entry) => entry.status === "failed" && /status 500/.test(entry.message ?? "")));
   });
 });

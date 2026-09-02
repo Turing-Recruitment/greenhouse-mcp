@@ -233,3 +233,74 @@ describe("OAuth grant store (slice 4)", () => {
     );
   });
 });
+
+describe("OAuth grant store — peek and family revocation (CLO-272)", () => {
+  it("peekRefresh reads the row by token hash without consuming it, refresh rows only, and never sends the secret", async () => {
+    const { fetchImpl, requests } = capturingFetch(() =>
+      new Response(JSON.stringify([{ email: "someone@example.com", family_id: "fam-1", client_id: "https://claude.ai/oauth/mcp-oauth-client-metadata", surface: "claude_desktop", client: "claude_desktop_chat", consumed_at: null, revoked_at: null }]), { status: 200 })
+    );
+    const store = createOauthGrantStore(requireConfig(), { fetchImpl });
+    const peek = await store.peekRefresh("the-raw-refresh-secret-value");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0]!.method, "GET");
+    const url = new URL(requests[0]!.url);
+    assert.equal(url.searchParams.get("token_hash"), `eq.${hashOauthGrantSecret("the-raw-refresh-secret-value")}`);
+    assert.equal(url.searchParams.get("grant_kind"), "eq.refresh");
+    assert.doesNotMatch(requests[0]!.url, /the-raw-refresh-secret-value/);
+    assert.deepEqual(peek, {
+      status: "found",
+      email: "someone@example.com",
+      familyId: "fam-1",
+      clientId: "https://claude.ai/oauth/mcp-oauth-client-metadata",
+      surface: "claude_desktop",
+      client: "claude_desktop_chat",
+      consumed: false,
+      revoked: false,
+    });
+  });
+
+  it("peekRefresh answers not_found for an unknown token and throws on a transport failure (the caller turns that into 503)", async () => {
+    const empty = createOauthGrantStore(requireConfig(), { fetchImpl: capturingFetch(() => new Response("[]", { status: 200 })).fetchImpl });
+    assert.deepEqual(await empty.peekRefresh("unknown"), { status: "not_found" });
+    const broken = createOauthGrantStore(requireConfig(), { fetchImpl: capturingFetch(() => new Response("", { status: 503 })).fetchImpl });
+    await assert.rejects(() => broken.peekRefresh("unknown"), /status 503/);
+  });
+
+  it("redeemRefresh maps the migration-0007 family_revoked status (kill switch reached the family)", async () => {
+    const { fetchImpl } = capturingFetch(() => new Response(JSON.stringify({ status: "family_revoked" }), { status: 200 }));
+    const store = createOauthGrantStore(requireConfig(), { fetchImpl });
+    const result = await store.redeemRefresh({
+      presentedSecret: "presented", clientId: "c", now: Date.now(), successorSecret: "successor", successorExpiresAt: new Date().toISOString(), successorJti: "jti",
+    });
+    assert.deepEqual(result, { status: "family_revoked" });
+  });
+
+  it("an RPC answer the store does not recognise is reported as invalid, never as revoked", async () => {
+    const { fetchImpl } = capturingFetch(() => new Response(JSON.stringify({ status: "invalid_email" }), { status: 200 }));
+    const store = createOauthGrantStore(requireConfig(), { fetchImpl });
+    assert.deepEqual(await store.revokeGrantsForEmail("someone@example.com"), { status: "invalid", familiesRevoked: 0, grantsRevoked: 0, jtisRevoked: 0 });
+  });
+
+  it("revokeFamily and revokeGrantsForEmail call their RPCs with reason and revoked_by, and report counts", async () => {
+    const { fetchImpl, requests } = capturingFetch((request) =>
+      new Response(JSON.stringify(request.url.endsWith("revoke_oauth_family")
+        ? { status: "revoked", family_id: "fam-1", families_revoked: 1, grants_revoked: 3, jtis_revoked: 3 }
+        : { status: "revoked", email: "someone@example.com", families_revoked: 2, grants_revoked: 4, jtis_revoked: 4 }), { status: 200 })
+    );
+    const store = createOauthGrantStore(requireConfig(), { fetchImpl });
+    const family = await store.revokeFamily("fam-1", { reason: "identity_unresolved", revokedBy: "oauth_refresh_identity_gate" });
+    const email = await store.revokeGrantsForEmail("Someone@Example.com", { reason: "offboarded" });
+    assert.equal(requests.length, 2);
+    assert.match(requests[0]!.url, /\/rest\/v1\/rpc\/revoke_oauth_family$/);
+    const familyBody = JSON.parse(requests[0]!.body) as Record<string, unknown>;
+    assert.equal(familyBody["p_family_id"], "fam-1");
+    assert.equal(familyBody["p_reason"], "identity_unresolved");
+    assert.equal(familyBody["p_revoked_by"], "oauth_refresh_identity_gate");
+    assert.match(requests[1]!.url, /\/rest\/v1\/rpc\/revoke_oauth_grants_for_email$/);
+    const emailBody = JSON.parse(requests[1]!.body) as Record<string, unknown>;
+    assert.equal(emailBody["p_email"], "someone@example.com");
+    assert.equal(emailBody["p_revoked_by"], null);
+    assert.deepEqual(family, { status: "revoked", familiesRevoked: 1, grantsRevoked: 3, jtisRevoked: 3 });
+    assert.deepEqual(email, { status: "revoked", familiesRevoked: 2, grantsRevoked: 4, jtisRevoked: 4 });
+  });
+});

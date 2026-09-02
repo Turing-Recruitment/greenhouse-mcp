@@ -39,8 +39,33 @@ function oauthEnv(): NodeJS.ProcessEnv {
     GREENHOUSE_RECRUITER_OAUTH_GOOGLE_CLIENT_SECRET: "google-client-secret-value",
     GREENHOUSE_RECRUITER_OAUTH_SUPABASE_URL: "https://ibxvxmfhovmththllwoi.supabase.co",
     GREENHOUSE_RECRUITER_OAUTH_SUPABASE_KEY: "oauth-grants-key-value",
+    // The refresh leg re-checks enrollment (CLO-272); the outstanding grant's recruiter is enrolled.
+    GREENHOUSE_RECRUITER_IDENTITY_JSON: JSON.stringify([{ email: "recruiter@example.com", status: "resolved", greenhouseUserId: 4242 }]),
   } as NodeJS.ProcessEnv;
 }
+
+// The refresh leg peeks at the presented row before the rotation; these fakes answer from their
+// own rows and never revoke on their own (the atomicity contract under test is the rotation's).
+function peekFrom(rows: Map<string, { input: OauthGrantRecordInput; consumedAt?: string; revokedAt?: string }>): OauthGrantStore["peekRefresh"] {
+  return async (secret) => {
+    const entry = rows.get(hashOauthGrantSecret(secret));
+    if (!entry || entry.input.kind !== "refresh") return { status: "not_found" };
+    return {
+      status: "found",
+      email: entry.input.email,
+      familyId: entry.input.familyId,
+      clientId: entry.input.clientId,
+      surface: entry.input.surface,
+      client: entry.input.client,
+      consumed: entry.consumedAt !== undefined,
+      revoked: entry.revokedAt !== undefined,
+    };
+  };
+}
+const NO_REVOCATION: Pick<OauthGrantStore, "revokeFamily" | "revokeGrantsForEmail"> = {
+  async revokeFamily() { throw new Error("revokeFamily not expected in the atomicity contract"); },
+  async revokeGrantsForEmail() { throw new Error("revokeGrantsForEmail not expected in the atomicity contract"); },
+};
 
 function requireConfig() {
   const result = readOauthAuthorizationConfig(oauthEnv());
@@ -101,6 +126,8 @@ function lockedStore() {
   };
 
   const store: OauthGrantStore = {
+    ...NO_REVOCATION,
+    peekRefresh: peekFrom(rows),
     async insertGrant(input) { rows.set(hashOauthGrantSecret(input.secret), { input }); },
     async consumeGrant() { throw new Error("consumeGrant not used on the refresh leg"); },
     async redeemRefresh(input): Promise<OauthRefreshRedeemResult> {
@@ -173,6 +200,8 @@ describe("OAuth refresh rotation atomicity (R1-A)", () => {
     // presented token is never left consumed-without-a-successor, so the honest client retry is a
     // clean rotation, not a mis-read theft signal that destroys the family.
     const store: OauthGrantStore = {
+      ...NO_REVOCATION,
+      peekRefresh: peekFrom(rows),
       async insertGrant(input) { rows.set(hashOauthGrantSecret(input.secret), { input }); },
       async consumeGrant() { throw new Error("not used"); },
       async redeemRefresh(input): Promise<OauthRefreshRedeemResult> {
@@ -228,5 +257,54 @@ describe("OAuth refresh rotation atomicity (R1-A)", () => {
     assert.match(sql, /insert into recruiter_mcp_session_revocation/);
     assert.match(sql, /from recruiter_mcp_oauth_grants\s*\n\s*where family_id = v_family and access_jti is not null/);
     assert.match(sql, /on conflict \(token_id\) do nothing/);
+  });
+});
+
+describe("migration 0007 — session termination reaches the refresh family (CLO-272, documented DB contract)", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const sql = readFileSync(join(here, "..", "supabase", "migrations", "0007_oauth_session_termination.sql"), "utf8");
+
+  it("re-declares redeem_oauth_refresh with the revoked-jti guard BETWEEN the family lock and the consume", () => {
+    const fn = sql.slice(sql.indexOf("create or replace function redeem_oauth_refresh("));
+    const lockIdx = fn.indexOf("pg_advisory_xact_lock(hashtext(v_family))");
+    const joinIdx = fn.indexOf("join recruiter_mcp_session_revocation r on r.token_id = g.access_jti");
+    const sweepIdx = fn.indexOf("perform revoke_oauth_family_locked(v_family, p_now, 'session_revoked'");
+    const consumeIdx = fn.indexOf("update recruiter_mcp_oauth_grants set consumed_at = p_now");
+    assert.ok(lockIdx >= 0 && joinIdx > lockIdx, "the revoked-jti join must run under the family lock");
+    assert.ok(sweepIdx > joinIdx && sweepIdx < consumeIdx, "a revoked family is swept and refused BEFORE the presented token is consumed");
+    assert.match(fn, /return jsonb_build_object\('status', 'family_revoked'\)/);
+    // The predicate itself, not just its position: bounded to THIS family, revoked rows only, and
+    // actually consulted (a neutered `if false` or an unbounded join would keep the positions intact).
+    assert.match(fn, /where g\.family_id = v_family and r\.status = 'revoked'/);
+    assert.match(fn, /if v_jti_revoked then/);
+    // 0006's own branches survive verbatim.
+    assert.match(fn, /v_row\.grant_kind <> 'refresh'/);
+    assert.match(fn, /return jsonb_build_object\('status', 'reuse_revoked'\)/);
+  });
+
+  it("the operator RPCs take the same per-family advisory lock BEFORE sweeping, in family_id order", () => {
+    const byEmail = sql.slice(sql.indexOf("create or replace function revoke_oauth_grants_for_email("), sql.indexOf("create or replace function redeem_oauth_refresh("));
+    assert.match(byEmail, /order by family_id/);
+    // An email with no live family is reported not_found, never as a successful revocation.
+    assert.match(byEmail, /case when v_families = 0 then 'not_found' else 'revoked' end/);
+    const lockIdx = byEmail.indexOf("pg_advisory_xact_lock(hashtext(v_family))");
+    const sweepIdx = byEmail.indexOf("revoke_oauth_family_locked(v_family");
+    assert.ok(lockIdx >= 0 && sweepIdx > lockIdx, "each family is locked before it is swept");
+    const oneFamily = sql.slice(sql.indexOf("create or replace function revoke_oauth_family("), sql.indexOf("create or replace function revoke_oauth_grants_for_email("));
+    const oneLockIdx = oneFamily.indexOf("pg_advisory_xact_lock(hashtext(p_family_id))");
+    const oneSweepIdx = oneFamily.indexOf("revoke_oauth_family_locked(p_family_id");
+    assert.ok(oneLockIdx >= 0 && oneSweepIdx > oneLockIdx, "the single-family RPC locks before it sweeps");
+  });
+
+  it("the shared sweep revokes rows, records the family as dead, and copies EVERY jti idempotently; the cache reload is requested", () => {
+    const locked = sql.slice(sql.indexOf("create or replace function revoke_oauth_family_locked("), sql.indexOf("create or replace function revoke_oauth_family("));
+    assert.match(locked, /set revoked_at = coalesce\(revoked_at, p_now\)/);
+    assert.match(locked, /insert into recruiter_mcp_oauth_revoked_families/);
+    assert.match(locked, /insert into recruiter_mcp_session_revocation \(token_id, status, revoked_at, revoked_by, reason\)/);
+    assert.match(locked, /where family_id = p_family and access_jti is not null/);
+    assert.match(locked, /on conflict \(token_id\) do nothing/);
+    assert.match(sql, /notify pgrst, 'reload schema'/);
+    // Rollback is documented with exact signatures, code-first.
+    assert.match(sql, /drop function if exists revoke_oauth_grants_for_email\(text, timestamptz, text, text\)/);
   });
 });

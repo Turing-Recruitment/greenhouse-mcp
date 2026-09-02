@@ -560,7 +560,7 @@ export function isClientSurfaceCompatible(client: RecruiterClient, surface: Recr
 // union as string literals (action-entitlement.ts `parseLookupCacheKey`), so a new client would have
 // compiled clean and thrown at runtime — the exact drift the `Record` gate below exists to prevent,
 // reintroduced two files away. That parser now calls the guard instead.
-export const ACTION_CLIENT_NAMES = ["codex", "claude_code"] as const;
+export const ACTION_CLIENT_NAMES = ["codex", "claude_code", "claude_desktop_chat"] as const;
 export type ActionClientName = (typeof ACTION_CLIENT_NAMES)[number];
 
 const ACTION_CLIENT_NAME_SET: ReadonlySet<string> = new Set(ACTION_CLIENT_NAMES);
@@ -571,15 +571,19 @@ export function isActionClientName(value: unknown): value is ActionClientName {
 
 // Record<RecruiterClient, ...> is the exhaustiveness gate: a fourth RecruiterClient fails the build
 // here until someone decides whether it can write, rather than silently falling through to `null`.
+//
+// This map is NOT on the production mount path. The hosted server bridges a session to the action
+// plane through `deriveActionSession` (action-session.ts, its own CLIENT_MAP) — this copy exists
+// for `resolveActionCatalogVisibility` and its tests, and it MUST agree with that one. It did not
+// between 2026-07-27 and 2026-09-02: `claude_desktop_chat: null` here, with a comment saying the
+// desktop surface "loads a packaged .mcpb rather than this remote server", outlived the OAuth
+// connector by two weeks and sent two independent reviewers to a false "hosted Claude can never
+// write" verdict (CLO-270, refuted by a live probe). The connector's hosted-Claude client resolves
+// to `claude_desktop_chat` (oauth-clients.ts) and the action plane has entitled it since 2026-07-30.
 const ACTION_CLIENT_BY_RECRUITER_CLIENT: Record<RecruiterClient, ActionClientName | null> = {
   chatgpt_codex_host: "codex",
   claude_code: "claude_code",
-  // The action plane has no word for Claude Desktop chat, which follows from how that surface is
-  // reached: it loads a packaged .mcpb rather than this remote server. Nothing downstream could use
-  // a name for it even if one existed — the entitlement lookup filters on the client
-  // (action-mcp/src/store.ts:110-118, `client: eq.${client}`) and the provisioning CLI grants only
-  // codex or claude_code (`parseClients`, action-mcp/src/access-cli.ts:477-485).
-  claude_desktop_chat: null,
+  claude_desktop_chat: "claude_desktop_chat",
 };
 
 // `null` means write-ineligible, and every caller must handle it — never substitute a default.

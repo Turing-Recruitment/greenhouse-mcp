@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { extractRows, isInactiveUser, parsePositiveId } from "./identity-bootstrap.js";
+import { revokeOauthGrants } from "./oauth-grant-store.js";
 import {
   assertCanonicalSupabaseProjectRef,
   normalizeOptionalSupabaseIdentifier,
@@ -39,6 +40,8 @@ export interface IdentityDirectoryRow {
   greenhouseUserId: number;
   primaryEmail: string;
   status: string;
+  /** ISO; when present, a row newer than the roster is never tombstoned (see rosterAsOf). */
+  lastVerifiedAt?: string;
 }
 
 export type ReconciliationAction = "keep" | "revoke" | "tombstone" | "skip";
@@ -73,6 +76,12 @@ export interface BuildIdentityReconciliationPlanOptions {
   greenhouseUsers: unknown;
   rosterComplete: boolean;
   generatedAt?: string;
+  // When the roster was read (ISO). Since first-sign-in enrollment (CLO-271) rows appear without an
+  // operator, a row whose last_verified_at is NEWER than the roster cannot be "absent from the
+  // roster" — it simply postdates it — and is skipped instead of tombstoned. Without this a stale
+  // file export would deprovision everyone who enrolled after it was taken, and enrollment refuses
+  // to re-create a row it finds in any status, so the lockout would not self-heal.
+  rosterAsOf?: string;
   // Override the blast-radius floor for a genuine large offboarding. Does NOT override the
   // empty-roster floor — an empty roster is never a legitimate "deprovision everyone".
   confirmMassDeprovision?: boolean;
@@ -105,6 +114,13 @@ export function buildIdentityReconciliationPlan(
       } else {
         kept.push({ ...base, action: "keep", reason: "Greenhouse user is present and active in the roster." });
       }
+      continue;
+    }
+    if (
+      options.rosterAsOf !== undefined && row.lastVerifiedAt !== undefined &&
+      Date.parse(row.lastVerifiedAt) > Date.parse(options.rosterAsOf)
+    ) {
+      skipped.push({ ...base, action: "skip", reason: `Absent from the roster, but the directory row (${row.lastVerifiedAt}) is newer than the roster (${options.rosterAsOf}); re-run with a fresher roster.` });
       continue;
     }
     absent.push({ ...base, action: "tombstone", reason: "Greenhouse user is absent from the latest complete roster." });
@@ -196,6 +212,8 @@ export interface IdentityReconciliationApplyReport {
   table: string;
   revokedCount: number;
   tombstonedCount: number;
+  /** Per deprovisioned row: whether its OAuth refresh families were swept (CLO-272). */
+  oauthRevocations: Array<{ greenhouseUserId: number; primaryEmail: string } & ReconciliationOauthRevocation>;
   containsTokens: false;
 }
 
@@ -207,7 +225,7 @@ export async function fetchResolvedDirectoryRows(
   const table = normalizeOptionalSupabaseIdentifier(config.table, "recruiter_identity_directory", "Supabase identity directory table");
 
   const url = new URL(`${baseUrl}/rest/v1/${encodeURIComponent(table)}`);
-  url.searchParams.set("select", "greenhouse_user_id,primary_email,status");
+  url.searchParams.set("select", "greenhouse_user_id,primary_email,status,last_verified_at");
   url.searchParams.set("status", `eq.${DIRECTORY_RESOLVED_STATUS}`);
 
   const response = await (config.fetchImpl ?? fetch)(url, {
@@ -233,7 +251,8 @@ export async function fetchResolvedDirectoryRows(
     const primaryEmail = typeof row.primary_email === "string" ? row.primary_email : undefined;
     const status = typeof row.status === "string" ? row.status : undefined;
     if (greenhouseUserId === undefined || primaryEmail === undefined || status === undefined) continue;
-    rows.push({ greenhouseUserId, primaryEmail, status });
+    const lastVerifiedAt = typeof row.last_verified_at === "string" ? row.last_verified_at : undefined;
+    rows.push({ greenhouseUserId, primaryEmail, status, ...(lastVerifiedAt !== undefined ? { lastVerifiedAt } : {}) });
   }
   return rows;
 }
@@ -254,6 +273,7 @@ export async function applyIdentityReconciliationPlan(
   const table = normalizeOptionalSupabaseIdentifier(config.table, "recruiter_identity_directory", "Supabase identity directory table");
   const appliedAt = config.appliedAt ?? new Date().toISOString();
   const fetchImpl = config.fetchImpl ?? fetch;
+  const oauthRevocations: IdentityReconciliationApplyReport["oauthRevocations"] = [];
 
   // Apply revokes and tombstones only. Each is a status flip to 'deactivated' — never a grant — so
   // partial application (if a later row fails) is fail-safe: nothing gains access, and a re-run
@@ -289,6 +309,22 @@ export async function applyIdentityReconciliationPlan(
         `Identity reconciliation update failed for greenhouse_user_id ${entry.greenhouseUserId} with status ${response.status}.`
       );
     }
+    // The directory flip denies every future tool call; the OAuth sweep ends the hosted-Claude
+    // session itself (CLO-272): every live refresh family of the email is revoked under its lock
+    // and every access-token jti it minted lands on the revocation list. Best effort, and visibly
+    // so — a failure here is reported per row and never un-flips the directory. The RPCs live in
+    // the same canonical project as the directory, so the identity pair reaches them.
+    let oauthRevocation: ReconciliationOauthRevocation;
+    try {
+      const outcome = await revokeOauthGrants(
+        { supabaseUrl: baseUrl, apiKey, fetchImpl },
+        { email: entry.primaryEmail, reason: `identity_directory_reconciliation:${entry.action}`, revokedBy: "identity_reconciliation" }
+      );
+      oauthRevocation = { status: outcome.status === "revoked" ? "revoked" : "skipped", familiesRevoked: outcome.familiesRevoked, jtisRevoked: outcome.jtisRevoked };
+    } catch (error) {
+      oauthRevocation = { status: "failed", familiesRevoked: 0, jtisRevoked: 0, message: error instanceof Error ? error.message : String(error) };
+    }
+    oauthRevocations.push({ greenhouseUserId: entry.greenhouseUserId, primaryEmail: entry.primaryEmail, ...oauthRevocation });
   }
 
   return {
@@ -297,13 +333,22 @@ export async function applyIdentityReconciliationPlan(
     table,
     revokedCount: plan.revoked.length,
     tombstonedCount: plan.tombstoned.length,
+    oauthRevocations,
     containsTokens: false,
   };
+}
+
+export interface ReconciliationOauthRevocation {
+  status: "revoked" | "skipped" | "failed";
+  familiesRevoked: number;
+  jtisRevoked: number;
+  message?: string;
 }
 
 interface ReconciliationCliArgs {
   greenhouseUsersFile?: string;
   fetchRoster: boolean;
+  rosterAsOf?: string;
   out?: string;
   apply: boolean;
   rosterComplete: boolean;
@@ -328,19 +373,27 @@ export async function startIdentityReconciliationCli(
     // completeness, never asserted by hand: an incomplete fetch can only under-deprovision.
     let greenhouseUsers: unknown;
     let rosterComplete = parsed.rosterComplete;
+    // The roster's age bounds what "absent" can mean: a live fetch is as-of the moment it started;
+    // a file is as-of its modification time unless --roster-as-of says otherwise.
+    let rosterAsOf: string;
     if (parsed.fetchRoster) {
+      rosterAsOf = parsed.rosterAsOf ?? new Date().toISOString();
       const { readFullGreenhouseUsersRoster } = await import("./scoped-reader.js");
       const roster = await readFullGreenhouseUsersRoster(env);
       greenhouseUsers = roster.users;
       rosterComplete = roster.complete;
     } else {
-      greenhouseUsers = JSON.parse(await readFile(parsed.greenhouseUsersFile as string, "utf8")) as unknown;
+      const file = parsed.greenhouseUsersFile as string;
+      const { stat } = await import("node:fs/promises");
+      rosterAsOf = parsed.rosterAsOf ?? (await stat(file)).mtime.toISOString();
+      greenhouseUsers = JSON.parse(await readFile(file, "utf8")) as unknown;
     }
     const directoryRows = await fetchResolvedDirectoryRows(accessConfig);
     const plan = buildIdentityReconciliationPlan({
       directoryRows,
       greenhouseUsers,
       rosterComplete,
+      rosterAsOf,
       confirmMassDeprovision: parsed.confirmMassDeprovision,
     });
 
@@ -392,13 +445,18 @@ function parseReconciliationArgs(args: string[]): ReconciliationCliArgs {
   const greenhouseUsersFile = values.get("greenhouse-users-file");
   if (!fetchRoster && !greenhouseUsersFile) {
     throw new Error(
-      "Usage: greenhouse-recruiter-reconcile-identity (--fetch-roster | --greenhouse-users-file greenhouse-users.json) [--out plan.json] [--roster-complete] [--confirm-mass-deprovision] [--apply]. " +
+      "Usage: greenhouse-recruiter-reconcile-identity (--fetch-roster | --greenhouse-users-file greenhouse-users.json) [--roster-as-of ISO] [--out plan.json] [--roster-complete] [--confirm-mass-deprovision] [--apply]. " +
+        "A directory row newer than the roster (its file mtime, or --roster-as-of) is never tombstoned — first sign-in enrollment creates rows without an operator. " +
         "--fetch-roster reads the live COMPLETE /v3/users roster itself (roster completeness derived from pagination, never asserted). " +
         "With a file, it must be the COMPLETE /v3/users export; pass --roster-complete to allow deprovisioning recruiters who are absent from it. " +
         "If a complete roster would deprovision more than half the directory, pass --confirm-mass-deprovision to override the blast-radius floor."
     );
   }
-  return { greenhouseUsersFile, fetchRoster, out: values.get("out"), apply, rosterComplete, confirmMassDeprovision };
+  const rosterAsOf = values.get("roster-as-of");
+  if (rosterAsOf !== undefined && Number.isNaN(Date.parse(rosterAsOf))) {
+    throw new Error("--roster-as-of must be an ISO timestamp.");
+  }
+  return { greenhouseUsersFile, fetchRoster, rosterAsOf, out: values.get("out"), apply, rosterComplete, confirmMassDeprovision };
 }
 
 function requireEnv(env: NodeJS.ProcessEnv, name: string): string {

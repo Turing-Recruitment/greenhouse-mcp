@@ -8,6 +8,7 @@ import {
 } from "./oauth-config.js";
 import { createOauthGrantStore, type OauthGrantStore } from "./oauth-grant-store.js";
 import { isRecruiterClient, normalizeSessionTokenId } from "./auth.js";
+import { createIdentityDirectoryFromEnv, isSafePositiveGreenhouseUserId, type IdentityDirectory } from "./identity.js";
 import { writeJson } from "./remote.js";
 
 // /token: the machine half of the OAuth layer (RFC 6749 §3.2 + PKCE §4.6 + RFC 8707).
@@ -22,6 +23,8 @@ const CODE_VERIFIER_PATTERN = /^[A-Za-z0-9._~-]{43,128}$/;
 export interface OauthTokenHandlerDeps {
   fetchImpl?: typeof fetch;
   grantStore?: OauthGrantStore;
+  /** The recruiter identity directory the refresh leg re-checks; defaults to the env-configured one. */
+  identityDirectory?: IdentityDirectory;
   now?: () => number;
   generateSecret?: () => string;
   generateJti?: () => string;
@@ -41,6 +44,7 @@ export function createOauthTokenHandler(
   const grantStore = deps.grantStore ?? createOauthGrantStore(config, { fetchImpl, now });
   const generateSecret = deps.generateSecret ?? (() => randomBytes(32).toString("base64url"));
   const generateJti = deps.generateJti ?? (() => normalizeSessionTokenId(randomUUID()));
+  const resolveIdentityDirectory = () => deps.identityDirectory ?? createIdentityDirectoryFromEnv(env);
 
   const tokenError = (res: ServerResponse, error: string, description: string): void => {
     logTokenDenial(error);
@@ -189,6 +193,50 @@ export function createOauthTokenHandler(
       tokenError(res, "invalid_request", "refresh_token and client_id are required.");
       return;
     }
+    // The identity gate, BEFORE the token is consumed (CLO-272): a refresh is the one moment a
+    // hosted-Claude session re-enters the server without a tool call, so it is where a de-enrolled
+    // recruiter is caught. Peek at the row the token names, ask the directory about that email,
+    // and on a DEFINITIVE "no longer enrolled" revoke the whole family with the presented token
+    // still intact (no successor is ever seated). A directory outage is not a verdict: nothing is
+    // consumed, nothing is revoked, and the client retries later — a transient blip must never
+    // read as reuse and kill the session.
+    let peek;
+    try {
+      peek = await grantStore.peekRefresh(refreshToken);
+    } catch {
+      logTokenDenial("refresh_peek_unavailable");
+      writeJson(res, 503, { error: "temporarily_unavailable", error_description: "The refresh token could not be checked; retry shortly." });
+      return;
+    }
+    if (peek.status === "found" && !peek.consumed && !peek.revoked) {
+      let verdict: "enrolled" | "not_enrolled";
+      try {
+        const resolution = await resolveIdentityDirectory().resolve({
+          subject: `email:${peek.email}`,
+          email: peek.email,
+          ...(peek.surface === "claude_desktop" || peek.surface === "chatgpt_desktop" ? { surface: peek.surface } : {}),
+          ...(isRecruiterClient(peek.client) ? { client: peek.client } : {}),
+        } as Parameters<IdentityDirectory["resolve"]>[0]);
+        verdict = resolution.status === "resolved" && isSafePositiveGreenhouseUserId(resolution.greenhouseUserId)
+          ? "enrolled"
+          : "not_enrolled";
+      } catch {
+        logTokenDenial("refresh_identity_lookup_failed");
+        writeJson(res, 503, { error: "temporarily_unavailable", error_description: "The recruiter directory could not be reached; retry shortly." });
+        return;
+      }
+      if (verdict === "not_enrolled") {
+        try {
+          await grantStore.revokeFamily(peek.familyId, { reason: "identity_unresolved", revokedBy: "oauth_refresh_identity_gate" });
+        } catch {
+          // Fail closed either way: the token is refused now; the family sweep is retried on the
+          // next presentation, and the per-request directory check already denies every tool call.
+          logTokenDenial("refresh_family_revoke_failed");
+        }
+        tokenError(res, "invalid_grant", "The refresh token is not redeemable.");
+        return;
+      }
+    }
     // One atomic rotation: consume the presented token, detect reuse, revoke the family, and seat
     // the successor all inside the store's per-family-locked transaction. The successor secret is
     // minted here but only becomes live if the RPC reports a clean rotation — a reuse or any
@@ -207,6 +255,13 @@ export function createOauthTokenHandler(
       // A replayed (already-rotated) refresh token is the stolen-token signal; the family was
       // revoked FIRST as a durable property (RFC 6749 §10.4), before the caller learns anything.
       logTokenDenial("refresh_reuse_family_revoked");
+      tokenError(res, "invalid_grant", "The refresh token is not redeemable.");
+      return;
+    }
+    if (result.status === "family_revoked") {
+      // The session kill switch reached this lineage (an operator revoked one of its jtis); the
+      // RPC swept the family under its lock and refused. Same wire answer as a reuse.
+      logTokenDenial("refresh_family_revoked");
       tokenError(res, "invalid_grant", "The refresh token is not redeemable.");
       return;
     }

@@ -112,6 +112,15 @@ function grantStoreFake(): GrantStoreFake {
     async redeemRefresh() {
       throw new Error("redeemRefresh not expected in slice 6");
     },
+    async peekRefresh() {
+      throw new Error("peekRefresh not expected in slice 6");
+    },
+    async revokeFamily() {
+      throw new Error("revokeFamily not expected in slice 6");
+    },
+    async revokeGrantsForEmail() {
+      throw new Error("revokeGrantsForEmail not expected in slice 6");
+    },
   };
 }
 
@@ -764,5 +773,130 @@ describe("OAuth security-check locks (R1-D)", () => {
     const codeB = second.store.inserts[0]!.secret;
     assert.notEqual(codeA, codeB, "two sign-ins must mint different codes");
     assert.ok(codeA.length >= 32 && codeB.length >= 32, "codes must be at least 32 characters");
+  });
+});
+
+// CLO-271: a first sign-in whose email the directory has never seen is enrolled from the
+// Greenhouse roster; every other non-resolution is a denial that names the cause and the fixer.
+describe("first-sign-in enrollment at the callback (CLO-271)", () => {
+  function claimsFor(email: string): (nonce: string | undefined) => Record<string, unknown> {
+    return (nonce) => ({
+      iss: "https://accounts.google.com",
+      aud: "google-client-id-value.apps.googleusercontent.com",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+      nonce,
+      email,
+      email_verified: true,
+      sub: "google-subject-9",
+    });
+  }
+
+  // A directory that answers "unresolved" until an enrollment happens, then "resolved".
+  function enrollingWorld(enrollOutcome: import("../src/oauth-enroll.js").OauthEnrollmentResult | Error) {
+    let enrolled = false;
+    const enrollCalls: string[] = [];
+    const directory: IdentityDirectory = {
+      async resolve() {
+        return enrolled
+          ? { status: "resolved", greenhouseUserId: 5182584004 }
+          : { status: "unresolved", reason: "Recruiter identity mapping is not resolved." };
+      },
+    };
+    const enrollIdentity = {
+      async enroll(email: string) {
+        enrollCalls.push(email);
+        if (enrollOutcome instanceof Error) throw enrollOutcome;
+        if (enrollOutcome.status === "enrolled") enrolled = true;
+        return enrollOutcome;
+      },
+    };
+    return { directory, enrollIdentity, enrollCalls };
+  }
+
+  async function signIn(world: ReturnType<typeof enrollingWorld>, email: string, store = grantStoreFake()) {
+    let issuedNonce: string | undefined;
+    const { fetchImpl } = googleExchangeFetch((nonce) => claimsFor(email)(nonce ?? issuedNonce));
+    const handlers = createOauthAuthorizeHandlers(requireConfig(), oauthEnv(), {
+      grantStore: store,
+      identityDirectory: world.directory,
+      enrollIdentity: world.enrollIdentity,
+      fetchImpl,
+    });
+    const authorize = await driveAuthorize(handlers, defaultAuthorizeParams());
+    const googleParams = locationParams(authorize).params;
+    issuedNonce = googleParams.get("nonce") ?? undefined;
+    const pendingState = googleParams.get("state")!;
+    const res = new FakeResponse();
+    await handlers.handleCallback({
+      method: "GET",
+      url: `/oauth/callback?code=google-authorization-code&state=${encodeURIComponent(pendingState)}`,
+    }, asServerResponse(res));
+    return { res, store, params: locationParams(res).params };
+  }
+
+  it("enrolls an unknown work email from the Greenhouse roster and completes the sign-in with a code grant", async () => {
+    const world = enrollingWorld({ status: "enrolled", greenhouseUserId: 5182584004, alreadyEnrolled: false });
+    const { res, store, params } = await signIn(world, "newhire@example.com");
+    assert.equal(res.statusCode, 302);
+    assert.deepEqual(world.enrollCalls, ["newhire@example.com"]);
+    assert.ok(params.get("code"), "a code grant is issued after enrollment");
+    assert.equal(params.get("error"), null);
+    assert.equal(store.inserts.length, 1);
+    assert.equal(store.inserts[0]!.email, "newhire@example.com");
+  });
+
+  it("a denied enrollment is access_denied with copy that names the cause and the fixer, and ZERO grant writes", async () => {
+    const cases: Array<[import("../src/oauth-enroll.js").OauthEnrollmentDenialCode, RegExp]> = [
+      ["email_missing", /does not match an active Greenhouse user.*Ask #ta-ops \(Sam Vangelos\)/],
+      ["deactivated", /deactivated.*Ask #ta-ops/],
+      ["ambiguous", /more than one Greenhouse user/],
+      ["directory_row_exists", /not currently enabled.*re-enable/],
+      ["email_mismatch", /registered under a different email/],
+      ["enrollment_disabled", /not enrolled.*add you/],
+    ];
+    for (const [code, copy] of cases) {
+      const world = enrollingWorld({ status: "denied", code, reason: "test" });
+      const { res, store, params } = await signIn(world, "newhire@example.com");
+      assert.equal(params.get("error"), "access_denied", code);
+      assert.match(params.get("error_description") ?? "", copy, code);
+      assert.doesNotMatch(res.headers["location"] ?? "", /newhire(%40|@)example\.com/i, "the email never rides in the redirect URL");
+      assert.equal(store.inserts.length, 0, `${code} must write ZERO grants`);
+    }
+  });
+
+  it("enrollment does not vouch for itself: if the directory still cannot resolve the email afterwards, the sign-in is denied", async () => {
+    const world = enrollingWorld({ status: "enrolled", greenhouseUserId: 5182584004, alreadyEnrolled: false });
+    // The directory never flips to resolved (a row the resolver cannot see), even though enrollment said "enrolled".
+    world.directory.resolve = async () => ({ status: "unresolved", reason: "Recruiter identity mapping is not resolved." });
+    const { store, params } = await signIn(world, "newhire@example.com");
+    assert.deepEqual(world.enrollCalls, ["newhire@example.com"]);
+    assert.equal(params.get("error"), "access_denied", "the directory's verdict wins over the enrollment's claim");
+    assert.equal(store.inserts.length, 0);
+  });
+
+  it("an enrollment outage is server_error (retry), not a denial, and writes ZERO grants", async () => {
+    const world = enrollingWorld({ status: "error", reason: "Greenhouse API error: 503" });
+    const { store, params } = await signIn(world, "newhire@example.com");
+    assert.equal(params.get("error"), "server_error");
+    assert.match(params.get("error_description") ?? "", /Try again in a minute/);
+    assert.equal(store.inserts.length, 0);
+  });
+
+  it("an ambiguous directory row is a hard denial that never reaches enrollment", async () => {
+    const world = enrollingWorld({ status: "enrolled", greenhouseUserId: 1, alreadyEnrolled: false });
+    world.directory.resolve = async () => ({ status: "ambiguous", greenhouseUserIds: [1, 2], reason: "two rows" });
+    const { store, params } = await signIn(world, "newhire@example.com");
+    assert.equal(params.get("error"), "access_denied");
+    assert.match(params.get("error_description") ?? "", /more than one Greenhouse user/);
+    assert.deepEqual(world.enrollCalls, []);
+    assert.equal(store.inserts.length, 0);
+  });
+
+  it("the personal-address denial tells the recruiter which account to use", async () => {
+    const world = enrollingWorld({ status: "enrolled", greenhouseUserId: 1, alreadyEnrolled: false });
+    const { params } = await signIn(world, "someone@gmail.com");
+    assert.equal(params.get("error"), "access_denied");
+    assert.match(params.get("error_description") ?? "", /Sign in with your @example\.com Google account/);
+    assert.deepEqual(world.enrollCalls, [], "the domain gate runs before enrollment");
   });
 });

@@ -310,7 +310,6 @@ const GLOBAL_HIDDEN_MODEL_PARAMS: Record<string, string> = {
 
 const PATH_HIDDEN_MODEL_PARAMS: Record<string, Record<string, string>> = {
   "/v3/candidates": {
-    email: "Candidate email is contact PII and is not exposed on the default recruiter evidence surface.",
     private: "Private-candidate visibility is a role gate, not a default model filter.",
     custom_field_option_id: "Candidate custom-field filtering is deferred to role-aware projection profiles.",
   },
