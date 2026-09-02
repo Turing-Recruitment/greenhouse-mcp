@@ -125,6 +125,22 @@ export async function readFullGreenhouseUsersRoster(
 }
 
 /**
+ * Read the Greenhouse users whose PRIMARY email is the given address, for first-sign-in
+ * enrollment (CLO-271). Chokepoint-resident for the same guard reason as the roster reader.
+ * `primary_email` is a documented /v3/users filter; a colleague whose Google address is only a
+ * SECONDARY Greenhouse email matches nothing here, which is why the enrollment falls back to the
+ * full roster before it decides "no such user".
+ */
+export async function readGreenhouseUsersByPrimaryEmail(
+  email: string,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<unknown[]> {
+  configureGreenhouseFromEnv(env);
+  const response: { data: unknown[] } = await apiGet<unknown[]>("/users", { primary_email: email, per_page: 50 });
+  return Array.isArray(response.data) ? response.data : [];
+}
+
+/**
  * Read the COMPLETE /v3/applications set for the weekly pipeline-state snapshot (the logbook's
  * scheduled service-actor sweep). Chokepoint-resident for the same guard reason as the roster
  * reader above. The caller (pipeline-snapshot-cli) refuses to WRITE from an incomplete read.
