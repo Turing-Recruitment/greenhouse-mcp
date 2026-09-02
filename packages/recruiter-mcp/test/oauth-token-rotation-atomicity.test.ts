@@ -273,6 +273,10 @@ describe("migration 0007 — session termination reaches the refresh family (CLO
     assert.ok(lockIdx >= 0 && joinIdx > lockIdx, "the revoked-jti join must run under the family lock");
     assert.ok(sweepIdx > joinIdx && sweepIdx < consumeIdx, "a revoked family is swept and refused BEFORE the presented token is consumed");
     assert.match(fn, /return jsonb_build_object\('status', 'family_revoked'\)/);
+    // The predicate itself, not just its position: bounded to THIS family, revoked rows only, and
+    // actually consulted (a neutered `if false` or an unbounded join would keep the positions intact).
+    assert.match(fn, /where g\.family_id = v_family and r\.status = 'revoked'/);
+    assert.match(fn, /if v_jti_revoked then/);
     // 0006's own branches survive verbatim.
     assert.match(fn, /v_row\.grant_kind <> 'refresh'/);
     assert.match(fn, /return jsonb_build_object\('status', 'reuse_revoked'\)/);
@@ -285,7 +289,9 @@ describe("migration 0007 — session termination reaches the refresh family (CLO
     const sweepIdx = byEmail.indexOf("revoke_oauth_family_locked(v_family");
     assert.ok(lockIdx >= 0 && sweepIdx > lockIdx, "each family is locked before it is swept");
     const oneFamily = sql.slice(sql.indexOf("create or replace function revoke_oauth_family("), sql.indexOf("create or replace function revoke_oauth_grants_for_email("));
-    assert.ok(oneFamily.indexOf("pg_advisory_xact_lock(hashtext(p_family_id))") < oneFamily.indexOf("revoke_oauth_family_locked(p_family_id"));
+    const oneLockIdx = oneFamily.indexOf("pg_advisory_xact_lock(hashtext(p_family_id))");
+    const oneSweepIdx = oneFamily.indexOf("revoke_oauth_family_locked(p_family_id");
+    assert.ok(oneLockIdx >= 0 && oneSweepIdx > oneLockIdx, "the single-family RPC locks before it sweeps");
   });
 
   it("the shared sweep revokes rows, records the family as dead, and copies EVERY jti idempotently; the cache reload is requested", () => {

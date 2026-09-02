@@ -786,6 +786,18 @@ describe("OAuth refresh identity gate and family termination (CLO-272)", () => {
     assert.equal(rotate.statusCode, 200, rotate.body);
   });
 
+  it("a grants-store outage on the peek is 503 temporarily_unavailable — never invalid_grant, which would make the client drop the session", async () => {
+    const store = memoryGrantStore();
+    const { refresh } = await exchangedRefresh(store);
+    const peekBroken: MemoryGrantStore = { ...store, async peekRefresh() { throw new Error("OAuth refresh peek failed with status 503."); } };
+    const handler = createOauthTokenHandler(requireConfig(), oauthEnv(), { grantStore: peekBroken });
+    const blip = await driveToken(handler, { grant_type: "refresh_token", refresh_token: refresh, client_id: CLAUDE_CODE_CIMD_URL });
+    assert.equal(blip.statusCode, 503, blip.body);
+    assert.equal(blip.json()["error"], "temporarily_unavailable");
+    assert.equal(store.rows.get(hashOauthGrantSecret(refresh))!.consumedAt, undefined);
+    assert.deepEqual(store.revocationRequests, []);
+  });
+
   it("an operator's jti revocation (greenhouse-recruiter-revoke-session) reaches the family: the next refresh is refused and every jti the family minted is revoked", async () => {
     const store = memoryGrantStore();
     const { refresh, jti } = await exchangedRefresh(store);

@@ -255,6 +255,13 @@ describe("reconciliation ends the OAuth sessions it deprovisions (CLO-272)", () 
     assert.deepEqual(sweptEmails, rpcCalls.map((c) => String(c.body["p_email"])).sort());
   });
 
+  it("a sweep that finds no live families is reported as skipped, not revoked", async () => {
+    const plan = buildIdentityReconciliationPlan({ directoryRows: DIRECTORY, greenhouseUsers: ROSTER, rosterComplete: true });
+    const { fetchImpl } = fetchAnswering(() => new Response(JSON.stringify({ status: "not_found" }), { status: 200 }));
+    const report = await applyIdentityReconciliationPlan(plan, { supabaseUrl: CANONICAL, apiKey: "sb_secret_service_role_key", fetchImpl });
+    assert.ok(report.oauthRevocations.every((entry) => entry.status === "skipped" && entry.familiesRevoked === 0));
+  });
+
   it("a failed sweep never un-flips the directory: the row stays deactivated, the report says failed, apply still succeeds", async () => {
     const plan = buildIdentityReconciliationPlan({ directoryRows: DIRECTORY, greenhouseUsers: ROSTER, rosterComplete: true });
     const { fetchImpl, requests } = fetchAnswering(() => new Response("boom", { status: 500 }));

@@ -856,12 +856,22 @@ describe("first-sign-in enrollment at the callback (CLO-271)", () => {
     ];
     for (const [code, copy] of cases) {
       const world = enrollingWorld({ status: "denied", code, reason: "test" });
-      const { store, params } = await signIn(world, "newhire@example.com");
+      const { res, store, params } = await signIn(world, "newhire@example.com");
       assert.equal(params.get("error"), "access_denied", code);
       assert.match(params.get("error_description") ?? "", copy, code);
-      assert.doesNotMatch(params.get("error_description") ?? "", /newhire@example\.com/, "the email never rides in the redirect URL");
+      assert.doesNotMatch(res.headers["location"] ?? "", /newhire(%40|@)example\.com/i, "the email never rides in the redirect URL");
       assert.equal(store.inserts.length, 0, `${code} must write ZERO grants`);
     }
+  });
+
+  it("enrollment does not vouch for itself: if the directory still cannot resolve the email afterwards, the sign-in is denied", async () => {
+    const world = enrollingWorld({ status: "enrolled", greenhouseUserId: 5182584004, alreadyEnrolled: false });
+    // The directory never flips to resolved (a row the resolver cannot see), even though enrollment said "enrolled".
+    world.directory.resolve = async () => ({ status: "unresolved", reason: "Recruiter identity mapping is not resolved." });
+    const { store, params } = await signIn(world, "newhire@example.com");
+    assert.deepEqual(world.enrollCalls, ["newhire@example.com"]);
+    assert.equal(params.get("error"), "access_denied", "the directory's verdict wins over the enrollment's claim");
+    assert.equal(store.inserts.length, 0);
   });
 
   it("an enrollment outage is server_error (retry), not a denial, and writes ZERO grants", async () => {

@@ -150,7 +150,7 @@ describe("evidence tools", () => {
           custom_fields: { business_unit: { name: "Business Unit", value: "Platform" } },
           answers: [{ question: "Why this role?", answer: "Excited about the mission." }],
           // candidate contact PII bleeding onto the application — must be stripped
-          candidate: { id: 55, first_name: "Private", raw_profile: { source: "do not return" } },
+          candidate: { id: 55, first_name: "Private", last_name: "Candidate", email: "candidate@example.com", email_addresses: [{ value: "candidate@example.com" }], phone_numbers: [{ value: "555-0100" }], raw_profile: { source: "do not return" } },
           candidate_email: "candidate@example.com",
           candidate_name: "Private Candidate",
         }]);
@@ -226,7 +226,7 @@ describe("evidence tools", () => {
       current_stage: { id: 7, name: "Recruiter Screen" },
       custom_fields: { business_unit: { name: "Business Unit", value: "Platform" } },
       answers: [{ question: "Why this role?", answer: "Excited about the mission." }],
-      candidate: { id: 55, first_name: "Private" },
+      candidate: { id: 55, first_name: "Private", last_name: "Candidate" },
     }]);
 
     // Candidate: documented operational fields surface; undocumented inline resume/attachments fail

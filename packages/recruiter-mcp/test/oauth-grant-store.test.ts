@@ -275,6 +275,12 @@ describe("OAuth grant store — peek and family revocation (CLO-272)", () => {
     assert.deepEqual(result, { status: "family_revoked" });
   });
 
+  it("an RPC answer the store does not recognise is reported as invalid, never as revoked", async () => {
+    const { fetchImpl } = capturingFetch(() => new Response(JSON.stringify({ status: "invalid_email" }), { status: 200 }));
+    const store = createOauthGrantStore(requireConfig(), { fetchImpl });
+    assert.deepEqual(await store.revokeGrantsForEmail("someone@example.com"), { status: "invalid", familiesRevoked: 0, grantsRevoked: 0, jtisRevoked: 0 });
+  });
+
   it("revokeFamily and revokeGrantsForEmail call their RPCs with reason and revoked_by, and report counts", async () => {
     const { fetchImpl, requests } = capturingFetch((request) =>
       new Response(JSON.stringify(request.url.endsWith("revoke_oauth_family")
