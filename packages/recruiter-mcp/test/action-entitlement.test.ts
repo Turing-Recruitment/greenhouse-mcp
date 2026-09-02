@@ -822,11 +822,13 @@ describe("action catalog visibility composition", () => {
     assert.deepEqual(calls, [`${IDENTITY_ID}|claude_code`]);
   });
 
-  it("hides the write plane, without any lookup, for a client the action plane cannot entitle", async () => {
+  it("hides the write plane, without any lookup, for a session that cannot prove which client it is", async () => {
     const calls: string[] = [];
 
+    // Every RecruiterClient now has an action-plane name (the hosted-Claude client included), so the
+    // ineligible case is a session with no client claim at all — a pre-v2 legacy shape.
     const visibility = await resolveActionCatalogVisibility({
-      session: writeCapableSession({ client: "claude_desktop_chat" }),
+      session: writeCapableSession({ client: undefined }),
       directory: directoryFor(IDENTITY_ID),
       resolver: alwaysEntitledResolver(calls),
     });

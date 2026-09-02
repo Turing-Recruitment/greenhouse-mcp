@@ -36,7 +36,7 @@ export type ActionCatalogVisibilityReason =
    * folded into `client_not_write_capable` and read later as a client problem.
    */
   | "session_actor_not_bound"
-  /** The session's client has no action-plane name (Claude Desktop chat, or an unproven client). */
+  /** The session's client has no action-plane name (a missing or unproven client claim). */
   | "client_not_write_capable"
   /**
    * A custom identity relation/column is configured, so the read plane and the action plane could

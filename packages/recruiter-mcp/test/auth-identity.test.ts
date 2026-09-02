@@ -1437,11 +1437,12 @@ describe("action client vocabulary map", () => {
     assert.equal(actionClientForRecruiterSession({ ...baseSession, client: "claude_code" }), "claude_code");
   });
 
-  it("returns no action client for Claude Desktop chat, which the action plane cannot entitle", () => {
-    // Not an omission: the entitlement lookup filters on the client (action-mcp/src/store.ts:110-118)
-    // and provisioning grants only codex or claude_code (access-cli.ts:477-485), so there is no row
-    // this client could ever match.
-    assert.equal(actionClientForRecruiterSession({ ...baseSession, client: "claude_desktop_chat" }), null);
+  it("names Claude Desktop chat — the org connector's hosted-Claude client — exactly as the runtime bridge does", () => {
+    // The action plane has carried this client since 2026-07-30 (types.ts, store.ts, access-cli.ts,
+    // the entitlement CHECK constraint), and action-session.ts's CLIENT_MAP — the map the hosted
+    // server actually mounts through — maps it 1:1. A `null` here (2026-07-27 → 2026-09-02) was a
+    // stale copy that misled two reviewers into "hosted Claude can never write" (CLO-270, refuted).
+    assert.equal(actionClientForRecruiterSession({ ...baseSession, client: "claude_desktop_chat" }), "claude_desktop_chat");
   });
 
   it("maps every client a token can carry to a legal action name or null, never to anything else", () => {
@@ -1453,7 +1454,7 @@ describe("action client vocabulary map", () => {
       claude_code: true,
       chatgpt_codex_host: true,
     };
-    const legalActionNames = new Set(["codex", "claude_code", null]);
+    const legalActionNames = new Set(["codex", "claude_code", "claude_desktop_chat", null]);
     for (const client of Object.keys(everyRecruiterClient) as RecruiterClient[]) {
       const mapped = actionClientForRecruiterSession({ ...baseSession, client });
       assert.notEqual(mapped, undefined, `${client} has no action-plane mapping`);
