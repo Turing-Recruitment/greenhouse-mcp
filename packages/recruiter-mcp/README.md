@@ -61,8 +61,9 @@ Returned records pass through two filters:
 1. `scoped-core` removes rows the current Greenhouse user cannot access.
 2. The individual tool projection removes fields outside that tool's contract.
 
-General evidence tools do not return candidate contact fields, resume contents,
-signed attachment URLs, or raw rows. Audit events contain bounded operational
+Candidate tools return the candidate's name, email addresses and phone numbers
+(what a Job Admin sees in Greenhouse); no tool returns home addresses, raw
+profiles, resume contents, signed attachment URLs, or raw rows. Audit events contain bounded operational
 metadata rather than candidate content.
 
 Audit is fail-closed when required. If the configured sink cannot accept the

@@ -171,6 +171,7 @@ describe("evidence tools", () => {
           email: "candidate@example.com",
           email_addresses: [{ value: "candidate@example.com" }],
           phone: "555-0100",
+          phone_numbers: [{ value: "555-0100", type: "mobile" }],
           addresses: [{ value: "123 Private St", type: "home" }],
           social_media_addresses: [{ value: "https://linkedin.com/in/candidate" }],
           website_addresses: [{ value: "https://portfolio.example.com" }],
@@ -215,7 +216,8 @@ describe("evidence tools", () => {
     assert.equal(notes.ok, true);
 
     // Application: operational fields (custom_fields, answers) surface; current_stage is pruned to a
-    // bare reference; the candidate PII embed and bleed fields are stripped.
+    // bare reference; the candidate embed is pruned to a NAME reference (id + first/last name — never
+    // raw_profile, email or phone) and the flat bleed fields (candidate_email/candidate_name) are stripped.
     assert.deepStrictEqual(applications.ok && applications.data, [{
       id: 101,
       job_id: 10,
@@ -224,6 +226,7 @@ describe("evidence tools", () => {
       current_stage: { id: 7, name: "Recruiter Screen" },
       custom_fields: { business_unit: { name: "Business Unit", value: "Platform" } },
       answers: [{ question: "Why this role?", answer: "Excited about the mission." }],
+      candidate: { id: 55, first_name: "Private" },
     }]);
 
     // Candidate: documented operational fields surface; undocumented inline resume/attachments fail
@@ -237,14 +240,20 @@ describe("evidence tools", () => {
     assert.equal(candidate.resume, undefined);
     assert.equal(candidate.attachments, undefined);
     assert.deepStrictEqual(candidate.application_ids, [101]);
-    assert.equal(candidate.first_name, undefined);
-    assert.equal(candidate.last_name, undefined);
+    // CLO-269 (Sam, 2026-09-02): the candidate's own row carries name, email and phone — what a Job
+    // Admin sees in Greenhouse — so a recruiter can ask "where is Jane Doe" and act on the answer.
+    assert.equal(candidate.first_name, "Private");
+    assert.equal(candidate.last_name, "Candidate");
+    assert.deepStrictEqual(candidate.email_addresses, [{ value: "candidate@example.com" }]);
+    assert.deepStrictEqual(candidate.phone_numbers, [{ value: "555-0100", type: "mobile" }]);
+    // Bare `email` / `phone` are not v3 candidate response fields; the contract allowlist still
+    // fails them closed — contact lives in email_addresses / phone_numbers.
     assert.equal(candidate.email, undefined);
     assert.equal(candidate.phone, undefined);
-    assert.equal(candidate.raw_profile, undefined);
-    // T2.3 PII policy split: physical/mailing address is contact PII and drops...
+    assert.equal(candidate.raw_profile, undefined, "raw_profile stays withheld");
+    // Home/mailing address is location PII the analysis surface does not need and still drops...
     // (see also the Tier-3.4 exposure e2e below)
-    assert.equal(candidate.addresses, undefined, "physical/mailing address is contact PII — must drop");
+    assert.equal(candidate.addresses, undefined, "physical/mailing address must drop");
     // ...but professional-discovery URLs (LinkedIn, portfolio) pass through — a recruiter uses these
     // and already sees them in Greenhouse; dropping them would be timidity, not privacy.
     assert.deepStrictEqual(candidate.social_media_addresses, [{ value: "https://linkedin.com/in/candidate" }]);
@@ -272,17 +281,24 @@ describe("evidence tools", () => {
     assert.equal(applications.ok && applications.projection?.profile, "recruiter_default");
     assert.equal(applications.ok && applications.projection?.incompleteProjection, false);
     assert.deepStrictEqual(applications.ok && applications.projection?.requiredFieldOmissions, []);
-    assert.ok(candidates.ok && candidates.projection?.omittedFields.some((field) => field.field === "email_addresses" && field.reason === "privacy"));
+    assert.ok(candidates.ok && candidates.projection?.omittedFields.some((field) => field.field === "addresses" && field.reason === "privacy"));
+    assert.ok(candidates.ok && !candidates.projection?.omittedFields.some((field) => field.field === "email_addresses"), "email_addresses is no longer an omission on the candidate row");
     assert.ok(scorecards.ok && scorecards.projection?.omittedFields.some((field) => field.field === "private_notes" && field.reason === "privacy"));
 
-    // No contact PII anywhere in the projected payloads.
+    // The still-withheld sentinels (raw_profile, home address, private notes, unscoped ids, the
+    // nested interviewer inside current_stage) appear nowhere in the projected payloads.
     const projectedData = {
       applications: applications.ok && applications.data,
       candidates: candidates.ok && candidates.data,
       scorecards: scorecards.ok && scorecards.data,
       notes: notes.ok && notes.data,
     };
-    assert.doesNotMatch(JSON.stringify(projectedData), /candidate@example\.com|555-0100|Private|Candidate|do not return|Do Not Return|909090|909091/);
+    assert.doesNotMatch(JSON.stringify(projectedData), /123 Private St|do not return|Do Not Return|909090|909091/);
+    // The flat bleed fields on the application row stay stripped even though the candidate row passes them.
+    const projectedApplication = (applications.ok ? (applications.data as any[])[0] : {}) as any;
+    assert.equal(projectedApplication.candidate_email, undefined);
+    assert.equal(projectedApplication.candidate_name, undefined);
+    assert.equal(projectedApplication.candidate?.raw_profile, undefined);
   });
 
   it("strips candidate PII bleeding through nested/denormalized embeds and fails closed on note visibility", async () => {
@@ -550,7 +566,7 @@ describe("evidence tools", () => {
 
   it("applies role-aware projection profiles: operator_site_admin restores work emails, hygiene holds (T3.3)", async () => {
     const userRow = { id: 900, name: "Ops Admin", primary_email: "admin@example.com", site_admin: true };
-    const candidateRow = { id: 55, company: "Acme", email: "candidate@example.com", phone: "555-0100" };
+    const candidateRow = { id: 55, company: "Acme", email_addresses: [{ value: "candidate@example.com" }], phone_numbers: [{ value: "555-0100" }] };
     const operatorReader = fakeScopedReader((toolName) => {
       if (toolName === "list_users") return scopedSuccess(toolName, [userRow], null, { permissionScope: { kind: "operator", permittedJobCount: null } });
       if (toolName === "list_candidates") return scopedSuccess(toolName, [candidateRow], null, { permissionScope: { kind: "operator", permittedJobCount: null } });
@@ -569,10 +585,11 @@ describe("evidence tools", () => {
     const opUser = (operatorUsers.ok ? (operatorUsers.data as any[])[0] : {}) as any;
     assert.equal(opUser.primary_email, "admin@example.com");
     assert.equal((operatorUsers.ok && (operatorUsers as any).projection?.profile), "operator_site_admin");
-    // ...but candidate contact PII stays dropped on EVERY profile (LLM-context hygiene, not role).
+    // ...and candidate email/phone pass on the candidate's own row for every profile (CLO-269) —
+    // the profile changes nothing here, which is the point: identity is not a role-gated field.
     const opCandidate = (operatorCandidates.ok ? (operatorCandidates.data as any[])[0] : {}) as any;
-    assert.equal(opCandidate.email, undefined, "candidate contact PII must drop even for operators");
-    assert.equal(opCandidate.phone, undefined);
+    assert.deepStrictEqual(opCandidate.email_addresses, [{ value: "candidate@example.com" }]);
+    assert.deepStrictEqual(opCandidate.phone_numbers, [{ value: "555-0100" }]);
     assert.equal(opCandidate.company, "Acme");
     // Line recruiter: the default profile still drops colleagues' emails.
     const recUser = (recruiterUsers.ok ? (recruiterUsers.data as any[])[0] : {}) as any;

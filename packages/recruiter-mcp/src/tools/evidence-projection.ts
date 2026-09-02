@@ -168,21 +168,20 @@ const DEFAULT_OMISSION_POLICIES_BY_ENDPOINT = new Map<string, FieldOmissionPolic
     { field: "stage_rank", reason: "not_material" },
   ]],
   ["/v3/candidates", [
-    { field: "first_name", reason: "privacy" },
-    { field: "last_name", reason: "privacy" },
-    { field: "preferred_name", reason: "privacy" },
-    { field: "email", reason: "privacy" },
-    { field: "email_addresses", reason: "privacy" },
-    { field: "phone", reason: "privacy" },
-    { field: "phone_numbers", reason: "privacy" },
-    // Physical/mailing addresses are contact PII (home location) — dropped for LLM-context hygiene,
-    // consistent with email/phone. Endpoint-scoped (NOT global) so office/job-post location addresses
-    // on other endpoints, which are operational not personal, still pass through.
+    // Candidate name, email addresses and phone numbers PASS on the candidate's own row (Sam's call,
+    // 2026-09-02, CLO-269): Greenhouse shows all of them to every Job Admin on the job, and a
+    // recruiter who cannot see a name cannot act on "where is Jane Doe in process". They stay in the
+    // GLOBAL list (a name must never bleed through a nested embed on another endpoint); the
+    // endpoint-scoped pass-through set below re-admits them on /v3/candidates only.
+    //
+    // Physical/mailing addresses are home-location PII the analysis surface does not need — dropped.
+    // Endpoint-scoped (NOT global) so office/job-post location addresses on other endpoints, which are
+    // operational not personal, still pass through.
     { field: "addresses", reason: "privacy" },
     // Deliberately NOT dropped: social_media_addresses + website_addresses are professional-discovery
     // URLs (LinkedIn, portfolio) a recruiter legitimately uses and already sees in Greenhouse — passing
-    // them is capability, not a leak. The policy split (drop contact PII, pass professional URLs) is
-    // locked in evidence-projection.test.ts so neither half drifts.
+    // them is capability, not a leak. The policy split (pass identity/contact + professional URLs,
+    // drop home address + raw profile) is locked in test/evidence.test.ts so neither half drifts.
     { field: "raw_profile", reason: "privacy" },
     { field: "message", reason: "privacy" },
   ]],
@@ -486,6 +485,28 @@ function isRestoredForActiveProfile(endpointPath: string, key: string): boolean 
   return PROFILE_FIELD_RESTORES.get(activeProjectionProfile)?.get(endpointPath)?.has(key) ?? false;
 }
 
+// Identity and contact fields that pass on the candidate's OWN row for every profile. These names
+// are also in GLOBAL_PII_FIELD_NAMES so they still drop at any depth on any other endpoint (a
+// nested `candidate` embed, a custom field named first_name); this set re-admits them only where
+// the row IS the candidate. Home addresses and raw_profile are not in it on purpose.
+// (Only documented /v3/candidates response fields — the contract allowlist runs first, so a bare
+// `email`/`phone` key, which v3 never emits on a candidate row, could not pass even if listed.)
+export const CANDIDATE_IDENTITY_FIELD_NAMES: ReadonlySet<string> = new Set([
+  "first_name",
+  "last_name",
+  "preferred_name",
+  "email_addresses",
+  "phone_numbers",
+]);
+
+const ENDPOINT_PII_PASSTHROUGH: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["/v3/candidates", CANDIDATE_IDENTITY_FIELD_NAMES],
+]);
+
+function isEndpointPassthrough(endpointPath: string, key: string): boolean {
+  return ENDPOINT_PII_PASSTHROUGH.get(endpointPath)?.has(key) ?? false;
+}
+
 function projectRowWithDenylist(
   row: Record<string, unknown>,
   endpointPath: string
@@ -499,7 +520,7 @@ function projectRowWithDenylist(
     // The generated Harvest contract is the projection allowlist. Endpoint-specific projectors
     // below may add deliberate derived aliases, but an unknown future top-level field fails closed.
     if (!documentedFields.has(key)) continue;
-    const restored = isRestoredForActiveProfile(endpointPath, key);
+    const restored = isRestoredForActiveProfile(endpointPath, key) || isEndpointPassthrough(endpointPath, key);
     if (denylist?.has(key) && !restored) continue;
     if (isGlobalPiiFieldName(key) && !restored) continue;
     if (isForbiddenEvidencePayloadKey(key)) continue;
@@ -531,7 +552,27 @@ function projectApplicationRow(row: Record<string, unknown>): Record<string, unk
   const stage = projectStageReference(row.current_stage);
   if (stage) projected.current_stage = stage;
   else delete projected.current_stage;
+  // The denormalized `candidate` embed is dropped by the denylist AND the global list before this
+  // runs, so the reference is hand-built from the raw row, exactly like current_stage above: id +
+  // name only, never email/phone/raw_profile, so "who are the stalest candidates on this req" can
+  // answer with a name without a second lookup. The generic sanitizer would strip the name at depth.
+  const candidate = projectCandidateReference(row.candidate);
+  if (candidate) projected.candidate = candidate;
   return projected;
+}
+
+function projectCandidateReference(value: unknown): Record<string, unknown> | null {
+  if (!isRecord(value)) return null;
+  const reference: Record<string, unknown> = {};
+  const id = projectNumericId(value.id);
+  if (typeof id === "number") reference.id = id;
+  for (const key of ["first_name", "last_name"] as const) {
+    if (typeof value[key] === "string") {
+      const name = sanitizeProjectedString(value[key] as string);
+      if (name !== undefined) reference[key] = name;
+    }
+  }
+  return typeof reference.id === "number" ? reference : null;
 }
 
 function projectStageReference(value: unknown): Record<string, unknown> | null {
