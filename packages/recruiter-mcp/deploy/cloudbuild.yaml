@@ -1,0 +1,36 @@
+# Cloud Build recipe for the recruiter MCP image (Turing-Recruitment/greenhouse-mcp layout).
+#
+# The Dockerfile uses a BuildKit secret mount, which needs DOCKER_BUILDKIT=1; Cloud Build's docker
+# builder supports it. Build from the WORKSPACE ROOT so the workspace packages are in context, and
+# tag with the short git SHA so /version (GREENHOUSE_RECRUITER_BUILD_SHA) and the Artifact Registry
+# tag agree — the CLO-119 preflight (cloud-run-deploy.mjs) refuses a SHA that is not on origin/main.
+#
+#   cd <workspace root> && git checkout <merge sha>
+#   node packages/recruiter-mcp/deploy/cloud-run-deploy.mjs <merge sha>
+#   gcloud builds submit --project turing-recruiting --config packages/recruiter-mcp/deploy/cloudbuild.yaml \
+#     --substitutions _SHORT_SHA=$(git rev-parse --short=8 HEAD) .
+#   gcloud run deploy greenhouse-recruiter-mcp-prod --region us-west1 --project turing-recruiting \
+#     --image us-west1-docker.pkg.dev/turing-recruiting/recruiting/greenhouse-recruiter-mcp:<short sha> \
+#     --update-env-vars GREENHOUSE_RECRUITER_BUILD_SHA=<full sha>
+steps:
+  - name: gcr.io/cloud-builders/docker
+    env:
+      - DOCKER_BUILDKIT=1
+    args:
+      - build
+      - -f
+      - packages/recruiter-mcp/deploy/Dockerfile
+      - -t
+      - us-west1-docker.pkg.dev/turing-recruiting/recruiting/greenhouse-recruiter-mcp:${_SHORT_SHA}
+      - -t
+      - us-west1-docker.pkg.dev/turing-recruiting/recruiting/greenhouse-recruiter-mcp:latest
+      - .
+images:
+  - us-west1-docker.pkg.dev/turing-recruiting/recruiting/greenhouse-recruiter-mcp:${_SHORT_SHA}
+  - us-west1-docker.pkg.dev/turing-recruiting/recruiting/greenhouse-recruiter-mcp:latest
+substitutions:
+  _SHORT_SHA: manual
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1800s
