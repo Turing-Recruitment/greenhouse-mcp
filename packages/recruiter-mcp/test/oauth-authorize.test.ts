@@ -112,6 +112,15 @@ function grantStoreFake(): GrantStoreFake {
     async redeemRefresh() {
       throw new Error("redeemRefresh not expected in slice 6");
     },
+    async peekRefresh() {
+      throw new Error("peekRefresh not expected in slice 6");
+    },
+    async revokeFamily() {
+      throw new Error("revokeFamily not expected in slice 6");
+    },
+    async revokeGrantsForEmail() {
+      throw new Error("revokeGrantsForEmail not expected in slice 6");
+    },
   };
 }
 

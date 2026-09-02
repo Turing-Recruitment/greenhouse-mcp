@@ -29,6 +29,7 @@
     "greenhouse-recruiter-preflight-roster": "bin/greenhouse-recruiter-preflight-roster.mjs",
     "greenhouse-recruiter-issue-session": "bin/greenhouse-recruiter-issue-session.mjs",
     "greenhouse-recruiter-revoke-session": "bin/greenhouse-recruiter-revoke-session.mjs",
+    "greenhouse-recruiter-revoke-oauth": "bin/greenhouse-recruiter-revoke-oauth.mjs",
     "greenhouse-recruiter-revocation-drill": "bin/greenhouse-recruiter-revocation-drill.mjs",
     "greenhouse-recruiter-reconcile-identity": "bin/greenhouse-recruiter-reconcile-identity.mjs",
     "greenhouse-recruiter-snapshot": "bin/greenhouse-recruiter-snapshot.mjs"

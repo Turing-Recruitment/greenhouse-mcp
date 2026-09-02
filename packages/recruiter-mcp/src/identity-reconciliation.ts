@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { extractRows, isInactiveUser, parsePositiveId } from "./identity-bootstrap.js";
+import { revokeOauthGrants } from "./oauth-grant-store.js";
 import {
   assertCanonicalSupabaseProjectRef,
   normalizeOptionalSupabaseIdentifier,
@@ -196,6 +197,8 @@ export interface IdentityReconciliationApplyReport {
   table: string;
   revokedCount: number;
   tombstonedCount: number;
+  /** Per deprovisioned row: whether its OAuth refresh families were swept (CLO-272). */
+  oauthRevocations: Array<{ greenhouseUserId: number; primaryEmail: string } & ReconciliationOauthRevocation>;
   containsTokens: false;
 }
 
@@ -254,6 +257,7 @@ export async function applyIdentityReconciliationPlan(
   const table = normalizeOptionalSupabaseIdentifier(config.table, "recruiter_identity_directory", "Supabase identity directory table");
   const appliedAt = config.appliedAt ?? new Date().toISOString();
   const fetchImpl = config.fetchImpl ?? fetch;
+  const oauthRevocations: IdentityReconciliationApplyReport["oauthRevocations"] = [];
 
   // Apply revokes and tombstones only. Each is a status flip to 'deactivated' — never a grant — so
   // partial application (if a later row fails) is fail-safe: nothing gains access, and a re-run
@@ -289,6 +293,22 @@ export async function applyIdentityReconciliationPlan(
         `Identity reconciliation update failed for greenhouse_user_id ${entry.greenhouseUserId} with status ${response.status}.`
       );
     }
+    // The directory flip denies every future tool call; the OAuth sweep ends the hosted-Claude
+    // session itself (CLO-272): every live refresh family of the email is revoked under its lock
+    // and every access-token jti it minted lands on the revocation list. Best effort, and visibly
+    // so — a failure here is reported per row and never un-flips the directory. The RPCs live in
+    // the same canonical project as the directory, so the identity pair reaches them.
+    let oauthRevocation: ReconciliationOauthRevocation;
+    try {
+      const outcome = await revokeOauthGrants(
+        { supabaseUrl: baseUrl, apiKey, fetchImpl },
+        { email: entry.primaryEmail, reason: `identity_directory_reconciliation:${entry.action}`, revokedBy: "identity_reconciliation" }
+      );
+      oauthRevocation = { status: outcome.status === "revoked" ? "revoked" : "skipped", familiesRevoked: outcome.familiesRevoked, jtisRevoked: outcome.jtisRevoked };
+    } catch (error) {
+      oauthRevocation = { status: "failed", familiesRevoked: 0, jtisRevoked: 0, message: error instanceof Error ? error.message : String(error) };
+    }
+    oauthRevocations.push({ greenhouseUserId: entry.greenhouseUserId, primaryEmail: entry.primaryEmail, ...oauthRevocation });
   }
 
   return {
@@ -297,8 +317,16 @@ export async function applyIdentityReconciliationPlan(
     table,
     revokedCount: plan.revoked.length,
     tombstonedCount: plan.tombstoned.length,
+    oauthRevocations,
     containsTokens: false,
   };
+}
+
+export interface ReconciliationOauthRevocation {
+  status: "revoked" | "skipped" | "failed";
+  familiesRevoked: number;
+  jtisRevoked: number;
+  message?: string;
 }
 
 interface ReconciliationCliArgs {
