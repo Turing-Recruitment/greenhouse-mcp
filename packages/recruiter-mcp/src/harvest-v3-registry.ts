@@ -308,30 +308,74 @@ const GLOBAL_HIDDEN_MODEL_PARAMS: Record<string, string> = {
   fields: "Projection fields are governed by registry projection profiles, not model-supplied raw field selectors.",
 };
 
+/**
+ * Filters withheld from the model. Every entry cites an EXTERNAL constraint — a Greenhouse permission
+ * the org already enforces, or a live-API fact — because "to be safe" is not a reason and a filter
+ * hidden for one is a defect (R2a removed four that were).
+ *
+ * What R2a un-hid, and why the reasons that covered them cited nothing:
+ *   /v3/users.primary_email      — filtering by an address you already hold discloses nothing. Sam's
+ *                                  teammate-email ruling is enforced by the PROJECTION (site admins
+ *                                  and operators only, evidence-projection.ts PROFILE_FIELD_RESTORES),
+ *                                  which is unchanged; hiding the filter as well protected nothing.
+ *   /v3/users.show_service_accounts — a recruiter computing interviewer load needs service accounts
+ *                                  OUT of the denominator, which means being able to ask about them.
+ *   /v3/tracking_links.token     — the public attribution slug that IS the row. It was dropped because
+ *                                  its key name trips the credential-hygiene substring rule, not
+ *                                  because anything gates it; the projector now exempts this one
+ *                                  endpoint+field pair explicitly.
+ *   /v3/jobs.is_template         — never hidden here because /v3/jobs documents no such PARAMETER; see
+ *                                  LIVE_REJECTED_PARAMS below.
+ */
 const PATH_HIDDEN_MODEL_PARAMS: Record<string, Record<string, string>> = {
   "/v3/candidates": {
-    private: "Private-candidate visibility is a role gate, not a default model filter.",
-    custom_field_option_id: "Candidate custom-field filtering is deferred to role-aware projection profiles.",
+    // For an actor without the private-candidate permission a `private=true` read returns [] with a
+    // privacy_withheld count — i.e. a query interface over exactly the population the week-one gate
+    // withholds, since list reads skip existence suppression. Greenhouse's own private-candidate
+    // permission is the citation.
+    private: "Greenhouse's private-candidate permission gates these rows; as a filter this is a query interface over exactly the withheld population (a list read returns [] with a privacy_withheld count), so it stays hidden.",
+    // Filtering by a private option INFERS the value that stripPrivateCustomFields removed: an empty
+    // result and a non-empty result are different answers about a field the actor may not see.
+    custom_field_option_id: "Greenhouse's private custom-field permission strips these values (private-custom-fields.ts); filtering by an option id infers the stripped value from the result size, so the filter stays hidden with the values.",
   },
-  // custom_field_option_id is exposed as a FILTER on openings, rejection_details, and users (Rank 23):
-  // it lets a recruiter narrow those reads to a custom-field value, which the recruiter's own
-  // Greenhouse entitlement already permits — the former "role-aware projection decision" reason cited
-  // no external constraint. It stays hidden on /v3/offers (offer custom fields are compensation-
-  // sensitive) and /v3/candidates (candidate-attribute filtering is a separate, more sensitive call).
+  // custom_field_option_id IS exposed as a filter on openings, rejection_details, and users: those
+  // reads carry no privately-flagged option values, so narrowing by one infers nothing.
   "/v3/offers": {
-    custom_field_option_id: "Offer custom fields can include compensation-sensitive facts and require a role profile.",
-  },
-  "/v3/tracking_links": {
-    token: "Tracking-link tokens are intentionally omitted from default recruiter evidence.",
-  },
-  "/v3/users": {
-    primary_email: "User email is contact data and is hidden from the default user reference profile.",
-    show_service_accounts: "Service-account enumeration is an admin diagnostic control.",
+    custom_field_option_id: "Greenhouse's private custom-field permission strips these values (private-custom-fields.ts); filtering by an option id infers the stripped compensation value from the result size, so the filter stays hidden with the values.",
   },
   "/v3/user_emails": {
-    email: "User email inventory is sensitive personal data and is not exposed by default.",
-    verification_token_sent_at: "Email verification timing is sensitive account metadata.",
+    email: "Greenhouse gates the staff email directory; filtering by an address is only meaningful to an actor who may read it, and the projection restores these rows to site admins and operators only.",
+    verification_token_sent_at: "Greenhouse gates the staff email directory; account-verification timing is administration metadata for the same permission.",
   },
+};
+
+/**
+ * LIVE_REJECTED_PARAMS — filters the vendored contract advertises that the LIVE tenant refuses.
+ *
+ * The generated registry is derived from Greenhouse's published reference docs, and the docs and the
+ * live API disagree per-endpoint. Two divergences are recorded so far:
+ *
+ *   /v3/offers  — EVERY date filter the contract advertises 422s (resolved_at, sent_on, starts_on,
+ *                 created_at, updated_at); applications' bracket ranges work fine, so this is
+ *                 docs-vs-live divergence, not an encoding bug. Reproduced by live probe and locked
+ *                 in test/evidence-read.test.ts:854-858. Handled at RUNTIME rather than by hiding the
+ *                 params: runEvidenceListRead retries without the brackets and windows locally with a
+ *                 `window_applied_locally` disclosure, so the capability survives the divergence.
+ *   /v3/jobs    — `is_template=true` returns 422 `Invalid query params: is_template` (probed
+ *                 2026-09-03 with the service token). NOTHING IS HIDDEN FOR IT, and the brief that
+ *                 asked for a PATH_HIDDEN_MODEL_PARAMS entry was wrong about the code: the generated
+ *                 contract documents `is_template` as a RESPONSE FIELD on the job row, not as a query
+ *                 parameter, so it was never in the exposed filter set and there is nothing to
+ *                 withhold. The field itself still passes through the projector, which is correct —
+ *                 the row says whether a req is a template; only the FILTER is unavailable upstream.
+ *
+ * A third divergence goes here, not into the hidden map: hiding a filter is a permission decision and
+ * must cite a permission. An upstream 422 is a reachability fact, and the honest handling is a runtime
+ * fallback with a disclosure.
+ */
+export const LIVE_REJECTED_PARAMS: Readonly<Record<string, readonly string[]>> = {
+  "/v3/offers": ["created_at", "updated_at", "resolved_at", "sent_on", "starts_on"],
+  "/v3/jobs": ["is_template"],
 };
 
 export const HARVEST_V3_ENDPOINT_REGISTRY: EndpointRegistryEntry[] = HARVEST_V3_ENDPOINT_DOC_FACTS.map((fact) => {

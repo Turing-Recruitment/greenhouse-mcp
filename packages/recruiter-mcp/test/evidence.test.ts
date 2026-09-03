@@ -3,7 +3,14 @@ import assert from "node:assert/strict";
 import { DEFAULT_LIMITS } from "../src/limits.js";
 import { createInMemoryRateLimiter } from "../src/rate-limit.js";
 import { EVIDENCE_DOMAIN_CLASSIFICATIONS, EVIDENCE_TOOL_DEFINITIONS, EVIDENCE_TOOL_MAP, runEvidenceTool } from "../src/tools/evidence.js";
-import { EVIDENCE_PROJECTOR_TOOL_NAMES } from "../src/tools/evidence-projection.js";
+import {
+  CANDIDATE_IDENTITY_FIELD_NAMES,
+  EVIDENCE_PROJECTOR_TOOL_NAMES,
+  GLOBAL_PII_FIELD_NAMES,
+  projectEvidenceResult,
+} from "../src/tools/evidence-projection.js";
+import { getEvidenceEndpointAdapter } from "../src/tools/scoped-endpoint-adapters.js";
+import { getHarvestEndpointByPath } from "../src/harvest-v3-registry.js";
 import { SCOPED_ENDPOINT_ADAPTERS_BY_EVIDENCE_TOOL } from "../src/tools/scoped-endpoint-adapters.js";
 import { fakeScopedReader, scopedSuccess, testRuntime } from "./test-helpers.js";
 import { nestedJobApplication, v3Offer } from "./fixtures-production-shapes.js";
@@ -440,10 +447,13 @@ describe("evidence tools", () => {
     assert.deepStrictEqual(owners.ok && owners.data, [{ id: 201, job_id: 10, user_id: 77, type: "recruiter", responsible: true }]);
     assert.deepStrictEqual(openings.ok && openings.data, [{ id: 301, job_id: 10, target_start_on: "2026-07-15", sort_order: 3, custom_fields: [{ name: "plan", value: "x" }] }]);
     assert.deepStrictEqual(jobInterviews.ok && jobInterviews.data, [{ id: 401, job_id: 10, sort_order: 2, require_scorecard: true, summary: "Panel overview", instructions: "private instructions" }]);
-    assert.deepStrictEqual(interviews.ok && interviews.data, [{ id: 501, application_id: 101, job_id: 10, scheduled_at: "2026-06-20T10:00:00.000Z", availability_received_at: "2026-06-19T10:00:00.000Z", location: "Zoom", all_day_start_on: "2026-06-20", all_day_end_on: "2026-06-20" }]);
+    // R2a: video_conferencing_url is the join link for an interview this recruiter coordinates, and
+    // no Greenhouse permission gates it — it now projects with the rest of the row.
+    assert.deepStrictEqual(interviews.ok && interviews.data, [{ id: 501, application_id: 101, job_id: 10, scheduled_at: "2026-06-20T10:00:00.000Z", availability_received_at: "2026-06-19T10:00:00.000Z", location: "Zoom", all_day_start_on: "2026-06-20", all_day_end_on: "2026-06-20", video_conferencing_url: "https://meet.example/private" }]);
     assert.deepStrictEqual(scorecards.ok && scorecards.data, [{ id: 601, application_id: 101, status: "submitted", interview_kit_id: 401, notes: "role gated" }]);
     assert.deepStrictEqual(notes.ok && notes.data, [{ id: 701, application_id: 101, type: "availability_request", visibility: "publicly_visible", body: "role gated body" }]);
-    assert.deepStrictEqual(tracking.ok && tracking.data, [{ id: 801, job_id: 10, related_post_id: 901, related_post_type: "job_post" }]);
+    // R2a: the tracking-link token is the public attribution slug the row exists to carry.
+    assert.deepStrictEqual(tracking.ok && tracking.data, [{ id: 801, job_id: 10, related_post_id: 901, related_post_type: "job_post", token: "secret-token" }]);
     assert.deepStrictEqual(offers.ok && offers.data, [{ id: 901, job_id: 10, starts_on: "2026-08-01", version: 2, custom_fields: [{ name: "comp", value: "private" }], start_date: "2026-08-01" }]);
     assert.deepStrictEqual(users.ok && users.data, [{ id: 77, name: "Recruiter One", job_title: "Senior Recruiter", deactivated: false, department_ids: [3], office_ids: [4] }]);
     // #10 + denylist flip: sources/referrers resolve ids to names. Source name + nested type survive,
@@ -457,7 +467,7 @@ describe("evidence tools", () => {
     assert.equal(applications.ok && applications.projection?.incompleteProjection, false);
     assert.deepStrictEqual(applications.ok && applications.projection?.requiredFieldOmissions, []);
     // Only true PII remains recorded as omitted, with its reason.
-    assert.ok(tracking.ok && tracking.projection?.omittedFields.some((field) => field.field === "token" && field.reason === "privacy"));
+    assert.equal(tracking.ok && tracking.projection?.omittedFields.some((field) => field.field === "token"), false, "R2a restored the attribution slug; it is no longer an omission");
     assert.ok(users.ok && users.projection?.omittedFields.some((field) => field.field === "primary_email" && field.reason === "privacy"));
     // Regression locks: custom_fields / scorecard notes / referrer user_id are NOT omitted anymore.
     assert.ok(applications.ok && !applications.projection?.omittedFields.some((field) => field.field === "custom_fields"));
@@ -530,7 +540,7 @@ describe("evidence tools", () => {
         return scopedSuccess(toolName, { id: 77, name: "Recruiter One", email: "recruiter@example.com" });
       }
       if (toolName === "list_tracking_links") {
-        return scopedSuccess(toolName, [{ id: 8, job_id: 10, source_id: 11, referrer_id: 12, token: "secret-token", url: "https://tracking.example" }]);
+        return scopedSuccess(toolName, [{ id: 8, job_id: 10, source_id: 11, referrer_id: 12, token: "public-attribution-slug", url: "https://tracking.example" }]);
       }
       throw new Error(`unexpected tool ${toolName}`);
     });
@@ -554,14 +564,16 @@ describe("evidence tools", () => {
     assert.deepStrictEqual(results.rejectionReasons.ok && results.rejectionReasons.data, [{ id: 9, name: "Skills mismatch", type: { id: 1, key: "we_rejected" } }]);
     assert.deepStrictEqual(results.users.ok && results.users.data, [{ id: 77, name: "Recruiter One", first_name: "Recruiter", last_name: "One" }]);
     assert.deepStrictEqual(results.user.ok && results.user.data, { id: 77, name: "Recruiter One" });
-    assert.deepStrictEqual(results.tracking.ok && results.tracking.data, [{ id: 8, job_id: 10, source_id: 11, referrer_id: 12 }]);
-    assert.ok(results.tracking.ok && results.tracking.projection?.omittedFields.some((field) => field.field === "token" && field.reason === "privacy"));
+    assert.deepStrictEqual(results.tracking.ok && results.tracking.data, [{ id: 8, job_id: 10, source_id: 11, referrer_id: 12, token: "public-attribution-slug" }]);
+    // `url` is still dropped: /v3/tracking_links documents no url response field, so a url key is an
+    // undocumented shape and the contract allowlist rejects it.
+    assert.ok(results.tracking.ok && results.tracking.projection?.omittedFields.some((field) => field.field === "url"));
     const projectedData = Object.fromEntries(
       Object.entries(results).map(([key, result]) => [key, result.ok ? result.data : result])
     );
     // Only true PII must be absent. instructions / close_reason / candidate_feedback are operational
     // analytics that now project through, so they are NOT canaried here.
-    assert.doesNotMatch(JSON.stringify(projectedData), /owner@example\.com|recruiter@example\.com|555-0100|secret-token|tracking\.example|Private Candidate|private@example\.com/i);
+    assert.doesNotMatch(JSON.stringify(projectedData), /owner@example\.com|recruiter@example\.com|555-0100|tracking\.example|Private Candidate|private@example\.com/i);
   });
 
   it("applies role-aware projection profiles: operator_site_admin restores work emails, hygiene holds (T3.3)", async () => {
@@ -1052,5 +1064,75 @@ describe("evidence tools", () => {
     assert.equal(scopedReader.calls.length, 1);
     assert.equal(auditSink.events[1]!.denialCode, "RATE_LIMITED");
     assert.equal(auditSink.events[1]!.rowsRead, null);
+  });
+});
+
+/**
+ * R2a lock. The historical finding behind exposing the withheld readers was "none of them carries
+ * personal data" — a finding recorded once, in a commit body, and never asserted anywhere. This turns
+ * it into a test that runs on every projector, every time, so exposing a reader can never again rest
+ * on a claim nobody re-checks.
+ *
+ * The claim is deliberately NARROW and stated as such: no DIRECT CONTACT field reaches any projected
+ * contract, with two documented exceptions. It is NOT a claim that free text is PII-free — a job
+ * note, an email template body or a scorecard comment can contain anything a colleague typed, and
+ * that is inherent to the artifact, not a projection defect.
+ */
+describe("R2a no direct contact PII on any projected contract", () => {
+  const DOCUMENTED_EXCEPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+    // The candidate's OWN row. Greenhouse shows all of these to every Job Admin on the job, and a
+    // recruiter who cannot see a name cannot act on "where is Jane Doe in process" (Sam, 2026-09-02).
+    ["/v3/candidates", CANDIDATE_IDENTITY_FIELD_NAMES],
+    // The staff directory a site admin or operator administers. The names are restored on EVERY
+    // profile (a teammate's name is operational); the addresses only under operator_site_admin.
+    // NOTE: `preferred_name` and a bare `email` are deliberately absent. projectUserRow re-adds the
+    // former and PROFILE_FIELD_RESTORES lists the latter defensively, but /v3/users documents neither
+    // as a response field — claiming an exception for a shape the contract does not have would make
+    // this lock assert fiction.
+    ["/v3/users", new Set(["first_name", "last_name", "primary_email", "emails"])],
+  ]);
+
+  it("keeps every contact field off every projector's contract except the two documented rows", () => {
+    const violations: string[] = [];
+    for (const toolName of EVIDENCE_PROJECTOR_TOOL_NAMES) {
+      const adapter = getEvidenceEndpointAdapter(toolName);
+      assert.ok(adapter, `${toolName} has a projector but no endpoint adapter`);
+      const endpointPath = adapter.endpointPath;
+      const allowed = DOCUMENTED_EXCEPTIONS.get(endpointPath) ?? new Set<string>();
+      // The generated Harvest contract is what a row can actually carry, so this walks the real
+      // response shape rather than a fixture someone remembered to write.
+      const documented = getHarvestEndpointByPath(endpointPath)?.responseFields ?? [];
+      const row: Record<string, unknown> = {};
+      for (const field of documented) row[field.name] = `value-for-${field.name}`;
+      row.id = 1;
+      row.job_id = 10;
+
+      const projected = projectEvidenceResult(
+        { ok: true, toolName, scoped: true, nextCursor: null, data: [row] } as never,
+        adapter
+      );
+      const keys = Object.keys(((projected.ok ? projected.data : []) as Array<Record<string, unknown>>)[0] ?? {});
+      for (const key of keys) {
+        if (GLOBAL_PII_FIELD_NAMES.has(key) && !allowed.has(key)) {
+          violations.push(`${toolName} (${endpointPath}) projects contact field ${key}`);
+        }
+      }
+    }
+    assert.deepEqual(violations, [], violations.join("\n"));
+  });
+
+  it("names both documented exceptions against a real contract, so neither can be deleted silently", () => {
+    for (const [endpointPath, fields] of DOCUMENTED_EXCEPTIONS) {
+      const documented = new Set(
+        (getHarvestEndpointByPath(endpointPath)?.responseFields ?? []).map((field) => field.name)
+      );
+      for (const field of fields) {
+        assert.equal(
+          documented.has(field),
+          true,
+          `${endpointPath} claims a PII exception for ${field}, which the v3 contract does not document`
+        );
+      }
+    }
   });
 });

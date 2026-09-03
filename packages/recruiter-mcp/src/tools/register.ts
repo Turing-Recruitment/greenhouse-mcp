@@ -25,7 +25,8 @@ import {
   SCORECARD_WINDOW_END_PARAM,
   SCORECARD_WINDOW_START_PARAM,
 } from "./analysis-window-copy.js";
-import { isActionToolGranted, isToolEnabled, validateRecruiterToolConfig } from "../limits.js";
+import { isActionToolGranted, isToolEnabled } from "../limits.js";
+import { RECRUITER_READ_TOOL_ORDER } from "./catalog-order.js";
 import { mcpTextResult, runActionTool, type RecruiterToolRuntime } from "../runtime.js";
 import { ACTION_DEFINITIONS } from "../../../action-mcp/dist/index.js";
 import type { RecruiterToolDefinition } from "../types.js";
@@ -46,62 +47,16 @@ export const RECRUITER_TOOL_DEFINITIONS: RecruiterToolDefinition[] = [
   READ_MY_RESUME_TOOL,
 ];
 
-/** Canonical curated model-facing catalog. The remaining 22 source readers stay hidden. */
-export const PILOT_TOOL_NAMES = [
-  "answer_my_recruiting_question",
-  "analyze_scorecard_accountability",
-  "analyze_interview_feedback_drag",
-  "analyze_stage_latency",
-  "analyze_pipeline_quality",
-  "analyze_source_quality",
-  "analyze_rejection_reason_drift",
-  "resolve_job_scope",
-  "confirm_job_scope",
-  "get_job_scope",
-  "get_recruiting_capabilities",
-  "read_my_resume",
-  "search_my_jobs",
-  "get_my_job",
-  "search_my_applications",
-  "get_my_application",
-  "search_my_interviews",
-  "search_my_offers",
-  "search_my_openings",
-  "search_my_users",
-  "search_my_job_owners",
-  "search_my_job_interview_stages",
-  "search_my_application_stages",
-  "search_my_job_hiring_managers",
-  "search_my_job_posts",
-  "search_my_candidates",
-  "get_my_candidate",
-  "search_my_scorecards",
-  "search_my_rejection_details",
-  "search_my_rejection_reasons",
-  "search_my_notes",
-  "search_my_attachments",
-  "search_my_interviewers",
-  "search_my_scorecard_question_answers",
-  "search_my_candidate_educations",
-  "search_my_candidate_employments",
-  "get_my_user",
-  "search_my_sources",
-  "search_my_referrers",
-  "search_my_custom_field_options",
-  "search_my_custom_fields",
-  // Exposed because catalog tools already emit ids only these dictionaries can decode, and hiding
-  // them left the model holding undecodable numbers: search_my_jobs returns department_id/office_ids,
-  // search_my_openings returns close_reason_id, and resolve_job_scope accepts free-text department
-  // and office NAMES the model otherwise has no way to enumerate. All three are global_reference
-  // id->name dictionaries with zero PII, so exposing them widens no permission boundary.
-  "search_my_departments",
-  "search_my_offices",
-  "search_my_close_reasons",
-] as const;
+/**
+ * The order the registrar emits the read catalog in. ALL registered recruiter read tools are
+ * exposed; hide one by denylist only (`GREENHOUSE_RECRUITER_DISABLE_TOOLS`), with a cited reason.
+ * Kept under this name because a dozen deploy/readiness/distribution call sites import it.
+ */
+export const PILOT_TOOL_NAMES = RECRUITER_READ_TOOL_ORDER;
 
 const MODEL_TOOL_ORDER = new Map<string, number>(PILOT_TOOL_NAMES.map((name, index) => [name, index]));
 
-/** Match the order emitted by registerRecruiterTools: curated tools first, then source order. */
+/** Match the order emitted by registerRecruiterTools: catalog order first, then source order. */
 export function compareRecruiterToolNames(left: string, right: string): number {
   const leftModelIndex = MODEL_TOOL_ORDER.get(left);
   const rightModelIndex = MODEL_TOOL_ORDER.get(right);
@@ -255,7 +210,6 @@ function actionParamsShape(schema: z.ZodTypeAny): Record<string, z.ZodTypeAny> {
 }
 
 export function registerRecruiterTools(server: McpToolRegistrar, runtime: RecruiterToolRuntime): string[] {
-  validateRecruiterToolConfig(runtime.toolConfig, RECRUITER_TOOL_DEFINITIONS.map((tool) => tool.name));
   const pending: PendingToolRegistration[] = [];
   // Action tools carry the title their own definition declares; every read tool derives one from its
   // name at emit time.
@@ -462,9 +416,10 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
       async (params) => mcpTextResult(await runReadMyResume(runtime, params))
     );
   }
-  // Buffer raw evidence tools with the analytical handlers, then emit the exact curated catalog
-  // order below. Any non-curated source readers remain after the model-facing set in local/all-tool
-  // runtimes; production's allowlist excludes them entirely.
+  // Buffer raw evidence tools with the analytical handlers, then emit them in catalog order below.
+  // Every registered read tool reaches this loop on every runtime, hosted included: the only gate is
+  // `isToolEnabled`, i.e. the server kill switch, the operator denylist, the surface switch and the
+  // evidence/analysis category switches. There is no allowlist to exclude a reader silently.
   for (const definition of EVIDENCE_TOOL_DEFINITIONS) {
     if (!isToolEnabled(runtime.toolConfig, runtime.session.surface, definition.name, definition.kind)) {
       continue;

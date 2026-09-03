@@ -4,6 +4,7 @@ import { isClientSurfaceCompatible, isRecruiterClient, normalizeSessionIssuedAt,
 import { containsTokenOrConfigPayload } from "./evidence-hygiene.js";
 import type { DesktopConfigFileManifest } from "./desktop-config.js";
 import type { IssuedEmailSessionFileManifest } from "./email-session.js";
+import { ACTION_DEFINITIONS } from "../../action-mcp/dist/index.js";
 import { PILOT_TOOL_NAMES, RECRUITER_TOOL_DEFINITIONS } from "./tools/register.js";
 import type { RecruiterClient } from "./types.js";
 
@@ -310,11 +311,26 @@ export interface BuildDesktopUserTestEvidenceOptions {
 /**
  * The dual-catalog contract (CLO-83). The old attestation — "no write/admin tools visible" — made a
  * correct write-entitled deployment fail its own release process once the write plane shipped. What
- * a tester attests now is WHICH exact catalog they saw: a read-only identity sees exactly the 44
- * curated read tools, a write-entitled identity sees exactly 66 — the same 44 plus the 22
- * preview and apply pairs. Anything else on either side of the entitlement is a defect.
+ * a tester attests is WHICH exact catalog they saw: a read-only identity sees the full read catalog,
+ * a write-entitled identity sees that catalog plus every preview/apply pair. Anything else on either
+ * side of the entitlement is a defect.
+ *
+ * The tokens carry no COUNT. They used to (`read_only_44` / `write_entitled_66`), which meant every
+ * change to the catalog silently invalidated evidence a tester had already recorded and forced a
+ * rename across nine files. The counts still get checked — `EXPECTED_CATALOG_TOOL_COUNTS` below
+ * derives them from `PILOT_TOOL_NAMES` and `ACTION_DEFINITIONS`, so the runbook tells the tester the
+ * live numbers to look for — but they are no longer baked into the evidence's vocabulary.
  */
-export type DesktopCatalogAttestation = "read_only_44" | "write_entitled_66";
+export type DesktopCatalogAttestation = "read_only_full_catalog" | "write_entitled_full_catalog";
+
+/**
+ * The tool counts a tester must actually see for each attestation, derived from the registrar rather
+ * than restated. Exported so the runbook generator and the rollout gate quote one number.
+ */
+export const EXPECTED_CATALOG_TOOL_COUNTS: Readonly<Record<DesktopCatalogAttestation, number>> = {
+  read_only_full_catalog: PILOT_TOOL_NAMES.length,
+  write_entitled_full_catalog: PILOT_TOOL_NAMES.length + ACTION_DEFINITIONS.length * 2,
+};
 
 export interface DesktopUserTestReport {
   status: "pass";
@@ -370,9 +386,10 @@ export async function buildDesktopUserTestEvidenceFromManifests(
     throw new Error("--attest-no-routine-reverification is required.");
   }
   const catalogAttestation = options.catalogAttestation;
-  if (catalogAttestation !== "read_only_44" && catalogAttestation !== "write_entitled_66") {
+  if (catalogAttestation !== "read_only_full_catalog" && catalogAttestation !== "write_entitled_full_catalog") {
     throw new Error(
-      "--attest-catalog is required: read_only_44 (a read-only identity saw exactly the 44 read tools) or write_entitled_66 (a write-entitled identity saw exactly 66 — the 44 plus 22 preview_*/apply_*)."
+      `--attest-catalog is required: read_only_full_catalog (a read-only identity saw exactly the ${EXPECTED_CATALOG_TOOL_COUNTS.read_only_full_catalog} read tools) `
+      + `or write_entitled_full_catalog (a write-entitled identity saw exactly ${EXPECTED_CATALOG_TOOL_COUNTS.write_entitled_full_catalog} — those plus every preview_*/apply_* pair).`
     );
   }
 

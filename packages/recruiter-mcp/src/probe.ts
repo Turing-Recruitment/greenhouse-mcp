@@ -109,10 +109,9 @@ export async function runRecruiterReadinessProbe(
     scopedReader: options.scopedReader,
     auditSink,
     limits: createRecruiterToolLimits(env),
-    // The allowlist controls model registration, not recipe/probe internals. Keep every other kill
-    // switch (including per-tool containment) while allowing this operator-run probe to exercise the
-    // hidden scoped readers that the visible analyzers depend on.
-    toolConfig: { ...configuredTools, allowedTools: undefined },
+    // R2a: there is no allowlist to erase any more — every registered reader is mounted, so the probe
+    // reaches the same readers the model does. The kill switches and the denylist still apply.
+    toolConfig: configuredTools,
     now,
   });
   const checks: ProbeCheck[] = [];

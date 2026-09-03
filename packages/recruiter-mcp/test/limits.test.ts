@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_LIMITS, createRecruiterToolConfig, createRecruiterToolLimits, isActionToolGranted, isToolEnabled, readNonNegativeFiniteNumber, resolveAnalysisWindow, sanitizeReadParams, validateRecruiterToolConfig } from "../src/limits.js";
+import { DEFAULT_LIMITS, createRecruiterToolConfig, createRecruiterToolLimits, isActionToolGranted, isToolEnabled, readNonNegativeFiniteNumber, resolveAnalysisWindow, sanitizeReadParams } from "../src/limits.js";
 import type { RecruiterToolConfig } from "../src/limits.js";
 import { createActionToolGrant, isActionToolName, type ActionToolName } from "../src/action-tools.js";
 import { PILOT_TOOL_NAMES, RECRUITER_TOOL_DEFINITIONS } from "../src/tools/register.js";
@@ -80,25 +80,23 @@ describe("recruiter tool parameter limits", () => {
     );
   });
 
-  it("parses a fail-closed allowlist and applies it before the denylist/category switches", () => {
+  // R2a: the denylist is the ONLY per-tool removal. The allowlist that used to sit in front of it is
+  // deleted, so a read tool is visible unless someone named it here.
+  it("removes a tool by denylist and leaves every other tool mounted", () => {
     const config = createRecruiterToolConfig({
-      GREENHOUSE_RECRUITER_ALLOWED_TOOLS: "search_my_jobs,analyze_pipeline_quality",
       GREENHOUSE_RECRUITER_DISABLE_TOOLS: "search_my_jobs",
-    } as NodeJS.ProcessEnv, ["search_my_jobs", "analyze_pipeline_quality"]);
+    } as NodeJS.ProcessEnv);
 
-    assert.equal(isToolEnabled(config, "test", "search_my_jobs", "evidence"), false, "denylist wins after allowlist admission");
+    assert.equal(isToolEnabled(config, "test", "search_my_jobs", "evidence"), false, "the denylist removes what it names");
     assert.equal(isToolEnabled(config, "test", "analyze_pipeline_quality", "analysis"), true);
-    assert.equal(isToolEnabled(config, "test", "get_my_job", "evidence"), false, "not allowlisted");
+    assert.equal(isToolEnabled(config, "test", "get_my_job", "evidence"), true, "an unnamed tool is not removed");
   });
 
-  it("rejects empty, duplicated, malformed, and unknown allowlist entries", () => {
-    assert.throws(() => createRecruiterToolConfig({ GREENHOUSE_RECRUITER_ALLOWED_TOOLS: "" } as NodeJS.ProcessEnv), /non-empty/);
-    assert.throws(() => createRecruiterToolConfig({ GREENHOUSE_RECRUITER_ALLOWED_TOOLS: "search_my_jobs,search_my_jobs" } as NodeJS.ProcessEnv), /duplicate/);
-    assert.throws(() => createRecruiterToolConfig({ GREENHOUSE_RECRUITER_ALLOWED_TOOLS: "search_my_jobs," } as NodeJS.ProcessEnv), /non-empty/);
-    assert.throws(
-      () => createRecruiterToolConfig({ GREENHOUSE_RECRUITER_ALLOWED_TOOLS: "not_a_tool" } as NodeJS.ProcessEnv, ["search_my_jobs"]),
-      /unknown tool name/
-    );
+  it("ignores the deleted allowlist variable entirely, whatever it contains", () => {
+    for (const raw of ["", "search_my_jobs", "search_my_jobs,search_my_jobs", "search_my_jobs,", "not_a_tool"]) {
+      const config = createRecruiterToolConfig({ GREENHOUSE_RECRUITER_ALLOWED_TOOLS: raw } as NodeJS.ProcessEnv);
+      assert.equal(isToolEnabled(config, "test", "get_my_job", "evidence"), true, `allowlist value ${JSON.stringify(raw)} must not gate anything`);
+    }
   });
 
   it("does not honor unsafe model-supplied positive integers", () => {
@@ -308,31 +306,23 @@ describe("cursor pagination parameter handling", () => {
 // readiness.ts:530-563 and container-self-check.ts:71-80 both fail the service if it drifts. Grants are
 // the seam, and "additive only" is the property that lets both be true at once. These lock it.
 describe("per-session tool grants", () => {
-  const KNOWN_READ_TOOLS = RECRUITER_TOOL_DEFINITIONS.map((tool) => tool.name);
+  const READ_TOOL_NAMES = RECRUITER_TOOL_DEFINITIONS.map((tool) => tool.name);
   // A real action-plane name, not a placeholder: action-mcp/src/actions/application-stage-move.ts:74 on
   // branch codex/greenhouse-action-mcp. It is deliberately absent from RECRUITER_TOOL_DEFINITIONS — that
   // absence is the whole point, since it is what the allowlist and the validator would each reject.
   const ACTION_TOOL = "preview_application_stage_move";
-  // One of the 22 source readers the curated catalog withholds (register.ts:42). Computed, not spelled,
-  // so the test follows the catalog if a reader is promoted into PILOT_TOOL_NAMES — and fails loudly with
-  // a reason if the catalog ever stops withholding one, since that would silently gut these assertions.
-  const PILOT_NAME_SET = new Set<string>(PILOT_TOOL_NAMES);
-  const WITHHELD_READ = ((): string => {
-    const name = KNOWN_READ_TOOLS.find((toolName) => !PILOT_NAME_SET.has(toolName));
-    if (!name) throw new Error("catalog no longer withholds a source reader; pick another name the allowlist excludes");
-    return name;
-  })();
+  // A READ tool, named here only so the forged-grant tests can prove a read can never ride a grant onto
+  // the write path. R2a exposes every reader, so this is no longer "a withheld tool" — the point of the
+  // assertions below is the SHAPE check in isGrantedActionTool, not the tool's visibility.
+  const READ_TOOL_NAME = PILOT_TOOL_NAMES[PILOT_TOOL_NAMES.length - 1]!;
 
   function pilotConfig(overrides: Record<string, string> = {}): RecruiterToolConfig {
-    return createRecruiterToolConfig(
-      { GREENHOUSE_RECRUITER_ALLOWED_TOOLS: PILOT_TOOL_NAMES.join(","), ...overrides } as NodeJS.ProcessEnv,
-      KNOWN_READ_TOOLS
-    );
+    return createRecruiterToolConfig({ ...overrides } as NodeJS.ProcessEnv);
   }
 
   /**
    * A FORGED grant, carrying names the type forbids. `grantedTools` is `ReadonlySet<ActionToolName>`,
-   * so `WITHHELD_READ` cannot be put in one without this cast — which is exactly why the cast belongs
+   * so `READ_TOOL_NAME` cannot be put in one without this cast — which is exactly why the cast belongs
    * here. The type stops an honest mistake at compile time; these tests prove the RUNTIME guard also
    * holds for the paths a type cannot reach: a Phase-2 `as`, a JS caller, a grant rehydrated from JSON.
    */
@@ -344,10 +334,10 @@ describe("per-session tool grants", () => {
     // The property that makes "grants admit only action names" equivalent to "grants cannot expose a
     // withheld read". If a read tool were ever named preview_*/apply_*, the shape constraint would stop
     // being a boundary and this would fail rather than silently weaken every assertion below.
-    const shapedLikeAnAction = KNOWN_READ_TOOLS.filter((name) => isActionToolName(name));
+    const shapedLikeAnAction = READ_TOOL_NAMES.filter((name) => isActionToolName(name));
     assert.deepStrictEqual(shapedLikeAnAction, [], "a read tool now collides with the write plane's naming shape");
     assert.equal(isActionToolName(ACTION_TOOL), true);
-    assert.equal(isActionToolName(WITHHELD_READ), false);
+    assert.equal(isActionToolName(READ_TOOL_NAME), false);
   });
 
   it("refuses to build a grant out of anything but action tools", () => {
@@ -355,32 +345,33 @@ describe("per-session tool grants", () => {
       [...createActionToolGrant([ACTION_TOOL, "apply_offer_create"])],
       [ACTION_TOOL, "apply_offer_create"]
     );
-    assert.throws(() => createActionToolGrant([ACTION_TOOL, WITHHELD_READ]), /admit write-plane action tools only/);
+    assert.throws(() => createActionToolGrant([ACTION_TOOL, READ_TOOL_NAME]), /admit write-plane action tools only/);
     // Neither a bare verb nor a shouted name is something the action package can emit.
     assert.throws(() => createActionToolGrant(["preview_"]), /action tools only/);
     assert.throws(() => createActionToolGrant(["apply_Offer_Create"]), /action tools only/);
   });
 
-  it("admits an action name the allowlist rejects, and never a withheld read", () => {
+  // R2a moved the load-bearing assertion onto isActionToolGranted, which is the gate register.ts
+  // ACTUALLY applies to an action tool (registerRecruiterTools calls it, never isToolEnabled). With the
+  // allowlist deleted, isToolEnabled admits any name an operator has not switched off — for reads that
+  // is the whole point, and for writes it was never the control.
+  it("admits an action name only on a grant, and never a read name at all", () => {
     const base = pilotConfig();
 
-    assert.equal(isToolEnabled(base, "claude_desktop", ACTION_TOOL, "analysis"), false, "an unentitled session must not see an action tool");
-    assert.equal(isToolEnabled(base, "claude_desktop", WITHHELD_READ, "evidence"), false, "a withheld source reader stays withheld without a grant");
+    assert.equal(isActionToolGranted(base, "claude_desktop", ACTION_TOOL), false, "an unentitled session must not see an action tool");
 
     const granted: RecruiterToolConfig = { ...base, grantedTools: createActionToolGrant([ACTION_TOOL]) };
-    assert.equal(isToolEnabled(granted, "claude_desktop", ACTION_TOOL, "analysis"), true, "a grant must admit its action tool");
-    assert.equal(isActionToolGranted(granted, "claude_desktop", ACTION_TOOL), true);
+    assert.equal(isActionToolGranted(granted, "claude_desktop", ACTION_TOOL), true, "a grant must admit its action tool");
 
-    // The property the previous version of this test had backwards. A grant is not a key to the 22
-    // withheld readers, and forging one to name a read must change nothing.
-    const forged: RecruiterToolConfig = { ...base, grantedTools: forgedGrant(ACTION_TOOL, WITHHELD_READ) };
-    assert.equal(isToolEnabled(forged, "claude_desktop", WITHHELD_READ, "evidence"), false, "a grant must NOT expose a withheld read");
-    assert.equal(isActionToolGranted(forged, "claude_desktop", WITHHELD_READ), false, "the direct gate must NOT admit a withheld read either");
+    // A grant is not a key to anything but the write plane; forging one to name a READ must change
+    // nothing, because the shape check in isGrantedActionTool rejects the name before the set is read.
+    const forged: RecruiterToolConfig = { ...base, grantedTools: forgedGrant(ACTION_TOOL, READ_TOOL_NAME) };
+    assert.equal(isActionToolGranted(forged, "claude_desktop", READ_TOOL_NAME), false, "the write gate must NOT admit a read name");
   });
 
-  it("never withdraws a name the allowlist already admitted, and adds none to the read catalog", () => {
+  it("never withdraws a read the catalog already mounted, and adds none to it", () => {
     const base = pilotConfig();
-    const granted: RecruiterToolConfig = { ...base, grantedTools: forgedGrant(ACTION_TOOL, WITHHELD_READ) };
+    const granted: RecruiterToolConfig = { ...base, grantedTools: forgedGrant(ACTION_TOOL, READ_TOOL_NAME) };
 
     for (const surface of ["claude_desktop", "chatgpt_desktop", "test"] as const) {
       const before = RECRUITER_TOOL_DEFINITIONS.filter((tool) => isToolEnabled(base, surface, tool.name, tool.kind)).map((tool) => tool.name);
@@ -414,50 +405,24 @@ describe("per-session tool grants", () => {
     );
   });
 
-  it("does not throw when an allowlist carries a granted name outside the read catalog", () => {
-    const base = pilotConfig();
-    // What Phase 2 does when it merges a session's entitlement into the visible set. Unhandled, this
-    // throws on the request path (register.ts:197) and the caller gets an opaque 500 (http-server.ts:90-99).
-    const composed: RecruiterToolConfig = {
-      ...base,
-      allowedTools: new Set([...base.allowedTools!, ACTION_TOOL]),
-      grantedTools: createActionToolGrant([ACTION_TOOL]),
-    };
-    assert.doesNotThrow(() => validateRecruiterToolConfig(composed, KNOWN_READ_TOOLS));
+  // Characterization, NOT an endorsement: isToolEnabled answers "did an operator switch this off",
+  // nothing more. Every name that is not switched off enables — correct for reads, useless as a write
+  // gate. If someone later makes it fail closed, this test fails and points at that decision.
+  it("enables any name an operator has not switched off, granted or not", () => {
+    const noAllowlist = createRecruiterToolConfig({} as NodeJS.ProcessEnv);
 
-    // Still loud for a name that is neither known nor granted — this tolerance is for entitlement, not
-    // for typos in GREENHOUSE_RECRUITER_ALLOWED_TOOLS.
-    assert.throws(
-      () => validateRecruiterToolConfig(
-        { ...composed, allowedTools: new Set([...composed.allowedTools!, "apply_offer_create"]) },
-        KNOWN_READ_TOOLS
-      ),
-      /unknown tool name\(s\): apply_offer_create/
-    );
-  });
-
-  // Characterization, NOT an endorsement: this is the trap documented on isToolEnabled. With no allowlist
-  // configured the membership test short-circuits and every name enables, entitlement or none — so Phase 2
-  // must gate action-tool registration on grantedTools itself rather than trusting this predicate. If
-  // someone later makes it fail closed, this test fails and points at that decision.
-  it("enables any name at all when no allowlist is configured, granted or not", () => {
-    const noAllowlist = createRecruiterToolConfig({} as NodeJS.ProcessEnv, KNOWN_READ_TOOLS);
-
-    assert.equal(noAllowlist.allowedTools, undefined);
-    assert.equal(isToolEnabled(noAllowlist, "claude_desktop", ACTION_TOOL, "analysis"), true, "fail-open: an unentitled session already passes this gate");
+    assert.equal(isToolEnabled(noAllowlist, "claude_desktop", ACTION_TOOL, "analysis"), true, "an unentitled session already passes this gate");
     assert.equal(isToolEnabled(noAllowlist, "claude_desktop", "not_a_tool_anywhere", "evidence"), true);
   });
 
-  // The counterpart to the characterization above, and the reason it is safe to leave that fail-open
-  // in place: action registration does NOT go through isToolEnabled. runtime.ts:93 (`createRecruiterToolConfig({})`)
-  // and probe.ts:115 (`allowedTools: undefined`) both produce exactly the config the previous test
-  // describes, and this gate denies in it.
+  // The counterpart to the characterization above, and the reason that permissiveness is safe: action
+  // registration does NOT go through isToolEnabled. runtime.ts (`createRecruiterToolConfig({})`) and
+  // probe.ts both produce exactly the config the previous test describes, and this gate denies in it.
   it("gives action registration a direct-membership gate that does not fail open", () => {
-    const noAllowlist = createRecruiterToolConfig({} as NodeJS.ProcessEnv, KNOWN_READ_TOOLS);
+    const noAllowlist = createRecruiterToolConfig({} as NodeJS.ProcessEnv);
 
-    assert.equal(noAllowlist.allowedTools, undefined);
     assert.equal(isActionToolGranted(noAllowlist, "claude_desktop", ACTION_TOOL), false, "no grant, no write plane — allowlist or not");
-    assert.equal(isActionToolGranted(noAllowlist, "claude_desktop", WITHHELD_READ), false);
+    assert.equal(isActionToolGranted(noAllowlist, "claude_desktop", READ_TOOL_NAME), false);
     assert.equal(isActionToolGranted(noAllowlist, "claude_desktop", "not_a_tool_anywhere"), false);
 
     const granted: RecruiterToolConfig = { ...noAllowlist, grantedTools: createActionToolGrant([ACTION_TOOL]) };

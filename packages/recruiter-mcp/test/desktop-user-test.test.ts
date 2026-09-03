@@ -49,7 +49,7 @@ describe("desktop user-test evidence", () => {
       durableSessionAccess: true,
       sessionPersistedAcrossRestart: true,
       routineReverificationPrompted: false,
-      catalogAttestation: "read_only_44",
+      catalogAttestation: "read_only_full_catalog",
       taskOutcome: "useful",
       taskOutcomeReason: "answer_received",
       ...ROUTING_ATTESTATION,
@@ -110,7 +110,7 @@ describe("desktop user-test evidence", () => {
       durableSessionAccess: true,
       sessionPersistedAcrossRestart: true,
       routineReverificationPrompted: false,
-      catalogAttestation: "read_only_44",
+      catalogAttestation: "read_only_full_catalog",
       taskOutcome: "useful",
       taskOutcomeReason: "answer_received",
       ...ROUTING_ATTESTATION,
@@ -122,7 +122,7 @@ describe("desktop user-test evidence", () => {
 
   it("accepts a write-entitled catalog attestation — the inversion CLO-83 exists for", async () => {
     // The old contract required attesting that NO write tools were visible, so a correct
-    // write-entitled deployment failed its own release process. write_entitled_66 is a
+    // write-entitled deployment failed its own release process. write_entitled_full_catalog is a
     // first-class pass; reverting the recorder to the old flag must fail this test.
     const tmp = await mkdtemp(join(tmpdir(), "greenhouse-desktop-user-test-"));
     const sessionManifestPath = join(tmp, "issued-sessions-manifest.json");
@@ -148,13 +148,13 @@ describe("desktop user-test evidence", () => {
       durableSessionAccess: true,
       sessionPersistedAcrossRestart: true,
       routineReverificationPrompted: false,
-      catalogAttestation: "write_entitled_66",
+      catalogAttestation: "write_entitled_full_catalog",
       taskOutcome: "useful",
       taskOutcomeReason: "answer_received",
       ...ROUTING_ATTESTATION,
     });
 
-    assert.equal(report.catalogAttestation, "write_entitled_66");
+    assert.equal(report.catalogAttestation, "write_entitled_full_catalog");
   });
 
   it("rejects a missing or unknown catalog attestation", async () => {
@@ -213,7 +213,7 @@ describe("desktop user-test evidence", () => {
         durableSessionAccess: true,
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
-        catalogAttestation: "read_only_44",
+        catalogAttestation: "read_only_full_catalog",
       }),
       /Post-restart token id must match/
     );
@@ -240,7 +240,7 @@ describe("desktop user-test evidence", () => {
         durableSessionAccess: true,
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
-        catalogAttestation: "read_only_44",
+        catalogAttestation: "read_only_full_catalog",
       }),
       /sessionTokenIdAfterRestart.*token id/
     );
@@ -259,7 +259,7 @@ describe("desktop user-test evidence", () => {
         durableSessionAccess: true,
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
-        catalogAttestation: "read_only_44",
+        catalogAttestation: "read_only_full_catalog",
       }),
       /sessionIssuedAtAfterRestart.*issued-at/
     );
@@ -290,7 +290,7 @@ describe("desktop user-test evidence", () => {
         durableSessionAccess: true,
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
-        catalogAttestation: "read_only_44",
+        catalogAttestation: "read_only_full_catalog",
       }),
       /session issuance manifest tokenId.*token id/
     );
@@ -309,7 +309,7 @@ describe("desktop user-test evidence", () => {
         durableSessionAccess: true,
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
-        catalogAttestation: "read_only_44",
+        catalogAttestation: "read_only_full_catalog",
       }),
       /desktop config manifest issuedAt.*issued-at/
     );
@@ -349,7 +349,7 @@ describe("desktop user-test evidence", () => {
           durableSessionAccess: true,
           sessionPersistedAcrossRestart: true,
           routineReverificationPrompted: false,
-          catalogAttestation: "read_only_44",
+          catalogAttestation: "read_only_full_catalog",
         }),
         error
       );
@@ -387,7 +387,7 @@ describe("desktop user-test evidence", () => {
         durableSessionAccess: true,
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
-        catalogAttestation: "read_only_44",
+        catalogAttestation: "read_only_full_catalog",
       }),
       /portable relative path/
     );
@@ -406,7 +406,7 @@ describe("desktop user-test evidence", () => {
         durableSessionAccess: true,
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
-        catalogAttestation: "read_only_44",
+        catalogAttestation: "read_only_full_catalog",
       }),
       /portable relative path/
     );
@@ -433,7 +433,7 @@ describe("desktop user-test evidence", () => {
         durableSessionAccess: true,
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: true,
-        catalogAttestation: "read_only_44",
+        catalogAttestation: "read_only_full_catalog",
       }),
       /no-routine-reverification/
     );
@@ -460,7 +460,7 @@ describe("desktop user-test evidence", () => {
         durableSessionAccess: true,
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
-        catalogAttestation: "read_only_44",
+        catalogAttestation: "read_only_full_catalog",
       }),
       /analytical tool/
     );
@@ -487,7 +487,7 @@ describe("desktop user-test evidence", () => {
         durableSessionAccess: true,
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
-        catalogAttestation: "read_only_44",
+        catalogAttestation: "read_only_full_catalog",
       }),
       /evidence tool/
     );
@@ -513,7 +513,7 @@ describe("desktop user-test evidence", () => {
       durableSessionAccess: true,
       sessionPersistedAcrossRestart: true,
       routineReverificationPrompted: false,
-      catalogAttestation: "read_only_44",
+      catalogAttestation: "read_only_full_catalog",
     };
     await assert.rejects(buildDesktopUserTestEvidenceFromManifests(base), /taskOutcome and taskOutcomeReason are required/);
     await assert.rejects(buildDesktopUserTestEvidenceFromManifests({ ...base, taskOutcome: "useful" }), /taskOutcomeReason is invalid/);
@@ -538,7 +538,7 @@ describe("desktop user-test evidence", () => {
       durableSessionAccess: true,
       sessionPersistedAcrossRestart: true,
       routineReverificationPrompted: false,
-      catalogAttestation: "read_only_44",
+      catalogAttestation: "read_only_full_catalog",
       taskOutcome: "useful" as const,
       taskOutcomeReason: "answer_received" as const,
       ...ROUTING_ATTESTATION,
@@ -656,8 +656,10 @@ describe("desktop user-test evidence", () => {
       /Unknown routing case\(s\): unknown_case/
     );
     await assert.rejects(
-      buildDesktopUserTestEvidenceFromManifests({ ...base, exercisedTools: [...ROUTING_TOOLS, "search_my_job_notes"] }),
-      /Unknown recruiter tool\(s\) in exercised tools: search_my_job_notes/
+      // R2a exposed search_my_job_notes, so a name that is genuinely outside the catalog is needed:
+      // the property under test is "unknown tool", not "withheld tool".
+      buildDesktopUserTestEvidenceFromManifests({ ...base, exercisedTools: [...ROUTING_TOOLS, "search_my_interview_questions"] }),
+      /Unknown recruiter tool\(s\) in exercised tools: search_my_interview_questions/
     );
     const wrongOrders = [
       ["open_resume_summary", ["read_my_resume", "search_my_attachments"], /requires search_my_attachments before read_my_resume/],
@@ -715,7 +717,7 @@ describe("desktop user-test evidence", () => {
       durableSessionAccess: true,
       sessionPersistedAcrossRestart: true,
       routineReverificationPrompted: false,
-      catalogAttestation: "read_only_44",
+      catalogAttestation: "read_only_full_catalog",
       taskOutcome: "useful",
       taskOutcomeReason: "answer_received",
       ...ROUTING_ATTESTATION,

@@ -190,9 +190,11 @@ const DEFAULT_OMISSION_POLICIES_BY_ENDPOINT = new Map<string, FieldOmissionPolic
     // read_my_resume obtains a fresh URL after a new permission-scoped lookup.
     { field: "url", reason: "privacy" },
   ]],
-  ["/v3/interviews", [
-    { field: "video_conferencing_url", reason: "privacy" },
-  ]],
+  // /v3/interviews drops nothing. `video_conferencing_url` is the JOIN LINK for an interview this
+  // recruiter coordinates — the same link Greenhouse shows them on the interview record and the same
+  // one their calendar invite carries. It was dropped as "privacy" with no permission behind it:
+  // there is no Greenhouse gate on the meeting URL of an interview you can already see, and without
+  // it "send me the link for tomorrow's onsite" is unanswerable from the tool.
   ["/v3/scorecards", [
     { field: "private_notes", reason: "privacy" },
     { field: "private_notes_with_tags", reason: "privacy" },
@@ -204,12 +206,16 @@ const DEFAULT_OMISSION_POLICIES_BY_ENDPOINT = new Map<string, FieldOmissionPolic
     { field: "email_to", reason: "privacy" },
   ]],
   ["/v3/tracking_links", [
-    // `token` is the public attribution slug, but its key name trips the centralized evidence
-    // payload-hygiene boundary (no key ending in "token" may reach a projected payload), so it is
-    // dropped to satisfy that guard — a real external constraint, not a richness clamp. `url` is not
-    // a v3 tracking-link field and can embed the same token in a query string, so it is dropped too.
-    { field: "token", reason: "privacy" },
-    { field: "url", reason: "privacy" },
+    // `token` is RESTORED (R2a) — see EVIDENCE_HYGIENE_EXEMPTIONS below. A tracking-link token is a
+    // public attribution slug that appears in the job-board URL a candidate clicks; it is not a
+    // credential, and dropping it left the row unable to answer the one question it exists for
+    // ("which link did this application come from"). It was only ever dropped because its KEY NAME
+    // ends in "token" and trips the credential-hygiene substring rule.
+    //
+    // `url` stays dropped, and for a reason that survives: /v3/tracking_links documents no `url`
+    // response field at all, so a `url` key on a row is an undocumented shape the contract allowlist
+    // would reject anyway.
+    { field: "url", reason: "not_material" },
   ]],
   ["/v3/job_owners", [
     { field: "email", reason: "privacy" },
@@ -220,6 +226,8 @@ const DEFAULT_OMISSION_POLICIES_BY_ENDPOINT = new Map<string, FieldOmissionPolic
     { field: "private_note", reason: "privacy" },
   ]],
   ["/v3/users", [
+    // Restored for site admins and operators by PROFILE_FIELD_RESTORES below — they administer the
+    // staff directory. A job-scoped line recruiter gets names and ids. (Sam's ruling, 2026-09-02.)
     { field: "primary_email", reason: "privacy" },
     { field: "emails", reason: "privacy" },
     { field: "email", reason: "privacy" },
@@ -256,7 +264,7 @@ const ADMIN_NOTE_VISIBILITY = "admin_only_visible";
 // through a nested embed — and are re-allowed ONLY on /v3/users (projectUserRow), where a teammate's
 // name is operational. The bare `candidate` embed key is dropped everywhere: the row's own candidate
 // projection is canonical, the embed is denormalized PII-bearing noise.
-const GLOBAL_PII_FIELD_NAMES = new Set([
+export const GLOBAL_PII_FIELD_NAMES: ReadonlySet<string> = new Set([
   "email",
   "emails",
   "email_addresses",
@@ -507,6 +515,26 @@ function isEndpointPassthrough(endpointPath: string, key: string): boolean {
   return ENDPOINT_PII_PASSTHROUGH.get(endpointPath)?.has(key) ?? false;
 }
 
+/**
+ * The ONE endpoint+field pair exempt from the credential-hygiene key rule.
+ *
+ * `isForbiddenEvidencePayloadKey` (evidence-hygiene.ts) drops any key ending in "token" — a
+ * substring rule, deliberately blunt, because it guards against a Bearer credential or a session
+ * token reaching a model payload from anywhere. `/v3/tracking_links.token` is not one: it is the
+ * public attribution slug that appears in the job-board URL a candidate clicks, and it is the field
+ * the endpoint exists to return. The guard itself is NOT relaxed — it still runs on every other key,
+ * at every nesting depth, on every endpoint including this one — because a nested `token` on a
+ * tracking-link row would not be a slug. Only this exact top-level pair is exempt, so a future
+ * endpoint whose row carries a real token cannot inherit the exemption by accident.
+ */
+const EVIDENCE_HYGIENE_EXEMPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["/v3/tracking_links", new Set(["token"])],
+]);
+
+function isHygieneExempt(endpointPath: string, key: string): boolean {
+  return EVIDENCE_HYGIENE_EXEMPTIONS.get(endpointPath)?.has(key) ?? false;
+}
+
 function projectRowWithDenylist(
   row: Record<string, unknown>,
   endpointPath: string
@@ -523,7 +551,7 @@ function projectRowWithDenylist(
     const restored = isRestoredForActiveProfile(endpointPath, key) || isEndpointPassthrough(endpointPath, key);
     if (denylist?.has(key) && !restored) continue;
     if (isGlobalPiiFieldName(key) && !restored) continue;
-    if (isForbiddenEvidencePayloadKey(key)) continue;
+    if (isForbiddenEvidencePayloadKey(key) && !isHygieneExempt(endpointPath, key)) continue;
     const projectedValue = NUMERIC_ID_FIELD_NAMES.has(key)
       ? projectNumericId(value)
       : NUMERIC_ID_ARRAY_FIELD_NAMES.has(key)

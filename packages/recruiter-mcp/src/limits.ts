@@ -20,26 +20,21 @@ export interface RecruiterToolLimits {
 
 export interface RecruiterToolConfig {
   serverDisabled: boolean;
-  /** Undefined means no allowlist; a configured allowlist is always non-empty and validated. */
-  allowedTools?: Set<string>;
   /**
-   * Names THIS SESSION is entitled to beyond the env allowlist — in Phase 2, the write plane's paired
-   * `preview_…` / `apply_…` action tools for a recruiter who holds an entitlement. Grants are per session and
-   * arrive from the entitlement store, so they are attached to an already-built config
-   * (`{ ...toolConfig, grantedTools }`) rather than read from env here.
+   * The WRITE-PLANE names this session is entitled to — the paired `preview_…` / `apply_…` action tools
+   * for a recruiter who holds an entitlement. Grants are per session and arrive from the entitlement
+   * store, so they are attached to an already-built config (`{ ...toolConfig, grantedTools }`) rather
+   * than read from env here.
    *
-   * ACTION TOOLS ONLY, and the type says so. A grant is not a general reopen-the-allowlist key: the 22
-   * withheld source readers stay withheld for an entitled recruiter exactly as they do for everyone else.
-   * `ActionToolName` (action-tools.ts) makes naming a read here a compile error, and both gates below
-   * re-test the name at runtime, so a cast or a JSON-rehydrated grant cannot smuggle one through either.
+   * ACTION TOOLS ONLY, and the type says so. `ActionToolName` (action-tools.ts) makes naming a read here
+   * a compile error, and `isActionToolGranted` re-tests the name's shape at runtime, so a cast or a
+   * JSON-rehydrated grant cannot smuggle a read tool onto the write path. (Reads need no grant at all:
+   * every registered reader mounts for every session — see tools/catalog-order.ts.)
    *
-   * Strictly ADDITIVE by construction: a grant can only admit a name the allowlist would have rejected,
-   * and every other gate — denylist, surface, kind — runs unchanged over it. That is what keeps the base
-   * catalog byte-identical for a session with no grants, which two separate gates demand:
-   * `toolCatalogCheck` 503s the whole service unless the env catalog resolves to the exact ordered base
-   * list (readiness.ts:530-563), and `assertExactCatalog` fails the container self-check unless a
-   * synthetic session holding no entitlement at all sees exactly that same list
-   * (container-self-check.ts:71-80).
+   * Strictly ADDITIVE: the read catalog of a session with no grants is byte-identical to before, which
+   * two gates demand — `toolCatalogCheck` 503s the service unless the mounted catalog is the exact
+   * ordered read list (readiness.ts), and `assertExactCatalog` fails the container self-check unless a
+   * synthetic session holding no entitlement sees exactly that same list (container-self-check.ts).
    */
   grantedTools?: ReadonlySet<ActionToolName>;
   disabledTools: Set<string>;
@@ -226,13 +221,18 @@ const LIMIT_ENV_NAMES = {
   maxAnalysisDurationMs: "GREENHOUSE_RECRUITER_MAX_ANALYSIS_DURATION_MS",
 } as const satisfies Record<keyof RecruiterToolLimits, string>;
 
+/**
+ * R2a deleted `GREENHOUSE_RECRUITER_ALLOWED_TOOLS`. It was never a control — it failed OPEN when
+ * unset — and it was the only thing hiding 22 built, tested readers behind a count with no reason.
+ * What remains are gates that name what they remove: the server kill switch, the per-tool denylist
+ * `GREENHOUSE_RECRUITER_DISABLE_TOOLS`, the two surface switches and the two category switches.
+ * Setting the old variable now does nothing; it is not read anywhere.
+ */
 export function createRecruiterToolConfig(
-  env: NodeJS.ProcessEnv = process.env,
-  knownToolNames?: Iterable<string>
+  env: NodeJS.ProcessEnv = process.env
 ): RecruiterToolConfig {
   const config: RecruiterToolConfig = {
     serverDisabled: readBooleanEnvFlag(env, "GREENHOUSE_RECRUITER_MCP_DISABLED"),
-    allowedTools: parseAllowedNameList(env.GREENHOUSE_RECRUITER_ALLOWED_TOOLS),
     disabledTools: parseNameList(env.GREENHOUSE_RECRUITER_DISABLE_TOOLS),
     evidenceToolsEnabled: !readBooleanEnvFlag(env, "GREENHOUSE_RECRUITER_DISABLE_EVIDENCE"),
     analyticalToolsEnabled: !readBooleanEnvFlag(env, "GREENHOUSE_RECRUITER_DISABLE_ANALYTICS"),
@@ -240,33 +240,7 @@ export function createRecruiterToolConfig(
     chatgptDesktopEnabled: !readBooleanEnvFlag(env, "GREENHOUSE_RECRUITER_DISABLE_CHATGPT_DESKTOP"),
     operatorUnscopedEnabled: !readBooleanEnvFlag(env, "GREENHOUSE_RECRUITER_DISABLE_OPERATOR_UNSCOPED"),
   };
-  if (knownToolNames) validateRecruiterToolConfig(config, knownToolNames);
   return config;
-}
-
-export function validateRecruiterToolConfig(
-  config: RecruiterToolConfig,
-  knownToolNames: Iterable<string>
-): void {
-  if (!config.allowedTools) return;
-  const known = new Set(knownToolNames);
-  // A granted name counts as known. Every caller passes the READ catalog (server.ts:100 and
-  // register.ts:197 both pass RECRUITER_TOOL_DEFINITIONS), so once a session's action grants are merged
-  // into its allowlist, an unmodified check here would reject every one of them as an unknown tool. This
-  // runs on the request path — twice per request, at server.ts:100 via createRecruiterToolConfig and
-  // again at register.ts:197 — and a throw there is caught by the outer handler and returned as an opaque
-  // 500 "Internal server error" (http-server.ts:90-99), i.e. the write plane would take down the read
-  // plane with an unreadable error. Env misconfiguration must still fail loudly; a name this session was
-  // actually granted is not misconfiguration.
-  //
-  // Note the ordering constraint this does NOT solve: grants are attached after the config is built, so
-  // the validation inside createRecruiterToolConfig (:230) sees `grantedTools` undefined. An action name
-  // routed through GREENHOUSE_RECRUITER_ALLOWED_TOOLS therefore still throws there, by design — the env
-  // allowlist governs the base catalog, and per-session entitlement belongs on the config object.
-  const unknown = [...config.allowedTools].filter((name) => !known.has(name) && !isGrantedActionTool(config, name));
-  if (unknown.length > 0) {
-    throw new Error(`GREENHOUSE_RECRUITER_ALLOWED_TOOLS contains unknown tool name(s): ${unknown.join(", ")}.`);
-  }
 }
 
 export function createRecruiterToolLimits(
@@ -311,17 +285,13 @@ function isGrantedActionTool(config: RecruiterToolConfig, name: string): boolean
 }
 
 /**
- * NOT AN ENTITLEMENT CHECK, and Phase 2 must not use it as one. This predicate FAILS OPEN when no
- * allowlist is configured: `config.allowedTools` being undefined short-circuits the only name-membership
- * test below, so every name reaching it enables — including a name that no catalog defines and that this
- * session was never granted. Production always configures the allowlist (`toolCatalogCheck` 503s the
- * service otherwise, readiness.ts:530-563), but nothing else has to: runtime.ts:93 builds a config from
- * `{}` for every runtime assembled without one, and probe.ts:115 erases the allowlist it just parsed.
+ * NOT AN ENTITLEMENT CHECK, and nothing may use it as one. It answers a narrower question: has an
+ * operator switched this READ tool, this surface, or this category off? Every name that reaches it and
+ * is not switched off enables — including a name no catalog defines. That is correct for reads (the
+ * catalog is the registrar's own definition list, tools/catalog-order.ts) and useless as a write gate.
  *
- * So an action tool's REGISTRATION must go through `isActionToolGranted` below, which tests grant
- * membership directly and can therefore never inherit this fail-open. The grant lookup here only reopens
- * the allowlist door for a name it would otherwise have closed; it proves nothing about whether the
- * caller may write.
+ * So an action tool's REGISTRATION goes through `isActionToolGranted` below, which tests grant
+ * membership directly and therefore cannot inherit this permissiveness.
  */
 export function isToolEnabled(
   config: RecruiterToolConfig,
@@ -330,11 +300,6 @@ export function isToolEnabled(
   kind: RecruiterToolKind
 ): boolean {
   if (config.serverDisabled) return false;
-  // A grant admits an ACTION name past the allowlist and does nothing else — it is consulted here and by
-  // no gate after it, so the denylist immediately below still wins over a grant, and a granted name is
-  // filtered by surface and kind exactly like an allowlisted one. A withheld read is not admissible on
-  // this path at all: `isGrantedActionTool` rejects the name's shape before the set is ever consulted.
-  if (config.allowedTools && !config.allowedTools.has(name) && !isGrantedActionTool(config, name)) return false;
   if (config.disabledTools.has(name)) return false;
   if (surface === "claude_desktop" && !config.claudeDesktopEnabled) {
     return false;
@@ -353,9 +318,10 @@ export function isToolEnabled(
 
 /**
  * THE gate for registering a write-plane tool. Deliberately not implemented in terms of
- * `isToolEnabled`, and deliberately sitting next to it so the contrast is unmissable: this one has no
- * allowlist branch to short-circuit, so there is no configuration — hosted, local, probe, or a runtime
- * assembled from `{}` — in which a session without a grant sees an action tool.
+ * `isToolEnabled`, and deliberately sitting next to it so the contrast is unmissable: reads mount
+ * unless an operator removed them, writes mount only on an explicit grant. There is no configuration —
+ * hosted, local, probe, or a runtime assembled from `{}` — in which a session without a grant sees an
+ * action tool.
  *
  * Reading the gates in order: an explicit grant is REQUIRED (never optional, never inferred), the
  * server kill switch and the operator denylist both still win, and a surface an operator has switched
@@ -530,19 +496,6 @@ export function resolveAnalysisWindow(
 function parseNameList(raw: string | undefined): Set<string> {
   if (!raw) return new Set<string>();
   return new Set(raw.split(",").map((token) => token.trim()).filter(Boolean));
-}
-
-function parseAllowedNameList(raw: string | undefined): Set<string> | undefined {
-  if (raw === undefined) return undefined;
-  const tokens = raw.split(",").map((token) => token.trim());
-  if (tokens.length === 0 || tokens.some((token) => token.length === 0 || !/^[a-z][a-z0-9_]*$/.test(token))) {
-    throw new Error("GREENHOUSE_RECRUITER_ALLOWED_TOOLS must be a non-empty comma-separated list of tool names.");
-  }
-  const allowed = new Set(tokens);
-  if (allowed.size !== tokens.length) {
-    throw new Error("GREENHOUSE_RECRUITER_ALLOWED_TOOLS must not contain duplicate tool names.");
-  }
-  return allowed;
 }
 
 export function readPositiveInt(value: unknown): number | null {

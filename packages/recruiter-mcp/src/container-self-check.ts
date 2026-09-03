@@ -11,8 +11,10 @@ const PDF_FIXTURE = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiA
 const DOCX_FIXTURE = "UEsDBAoAAAAIADCf9Fx5bjPX6AAAAK0BAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbH1QyU7DMBD9FWuuKHHggBCK0wPLETiUDxjZk8SqN3nc0v49Tlt6QIXjzFv1+tXeO7GjzDYGBbdtB4KCjsaGScHn+rV5AMEFg0EXAyk4EMNq6NeHRCyqNrCCuZT0KCXrmTxyGxOFiowxeyz1zJNMqDc4kbzrunupYygUSlMWDxj6Zxpx64p42df3qUcmxyCeTsQlSwGm5KzGUnG5C+ZXSnNOaKvyyOHZJr6pBJBXExbk74Cz7r0Ok60h8YG5vKGvLPkVs5Em6q2vyvZ/mys94zhaTRf94pZy1MRcF/euvSAebfjpL49zD99QSwMECgAAAAAAMJ/0XAAAAAAAAAAAAAAAAAYAAABfcmVscy9QSwMECgAAAAgAMJ/0XJv9N+qtAAAAKQEAAAsAAABfcmVscy8ucmVsc43POw7CMAwG4KtE3mlaBoRQ0y4IqSsqB7ASN61oHkrCo7cnAwNFDIy2f3+W6/ZpZnanECdnBVRFCYysdGqyWsClP232wGJCq3B2lgQsFKFt6jPNmPJKHCcfWTZsFDCm5A+cRzmSwVg4TzZPBhcMplwGzT3KK2ri27Lc8fBpwNpknRIQOlUB6xdP/9huGCZJRydvhmz6ceIrkWUMmpKAhwuKq3e7yCzwpuarF5sXUEsDBAoAAAAAADCf9FwAAAAAAAAAAAAAAAAFAAAAd29yZC9QSwMECgAAAAgAMJ/0XJS4I1i7AAAA/QAAABEAAAB3b3JkL2RvY3VtZW50LnhtbEWOu27DMAxFf0XQ3sjtEASG7QwpujZDA3RVJNYRYJEGydTx30dyhy6H4AOHtzs+8mR+gSUR9vZ111gDGCgmHHt7+fp4OVgj6jH6iRB6u4LY49AtbaRwz4BqigClXXp7U51b5yTcIHvZ0QxYdj/E2WtpeXQLcZyZAogUf57cW9PsXfYJbVVeKa61zhVcocP75+nbMEj51ZqYRDld7wrRyCoKWUraMSEAd66eV/LGTSIQ9MxuG/zZ3X/y4QlQSwECFAAKAAAACAAwn/RceW4z1+gAAACtAQAAEwAAAAAAAAAAAAAAAAAAAAAAW0NvbnRlbnRfVHlwZXNdLnhtbFBLAQIUAAoAAAAAADCf9FwAAAAAAAAAAAAAAAAGAAAAAAAAAAAAEAAAABkBAABfcmVscy9QSwECFAAKAAAACAAwn/Rcm/036q0AAAApAQAACwAAAAAAAAAAAAAAAAA9AQAAX3JlbHMvLnJlbHNQSwECFAAKAAAAAAAwn/RcAAAAAAAAAAAAAAAABQAAAAAAAAAAABAAAAATAgAAd29yZC9QSwECFAAKAAAACAAwn/RclLgjWLsAAAD9AAAAEQAAAAAAAAAAAAAAAAA2AgAAd29yZC9kb2N1bWVudC54bWxQSwUGAAAAAAUABQAgAQAAIAMAAAAA";
 
 export async function runContainerSelfCheck(): Promise<Record<string, unknown>> {
+  // No catalog control at all: R2a made the registrar the catalog, so a bare env must already mount
+  // exactly PILOT_TOOL_NAMES. That is precisely what assertExactCatalog below now proves at boot —
+  // seeding an allowlist here would have made the check assert its own input.
   const env = {
-    GREENHOUSE_RECRUITER_ALLOWED_TOOLS: PILOT_TOOL_NAMES.join(","),
     GREENHOUSE_RECRUITER_SCOPE_SIGNING_SECRET: "container-self-check-scope-secret-32-characters",
   } as NodeJS.ProcessEnv;
   const { server, registeredTools } = createRecruiterMcpServer({
@@ -51,10 +53,10 @@ export async function runContainerSelfCheck(): Promise<Record<string, unknown>> 
   }
 
   // The entitled half of the catalog contract (CLO-83). The assertions above prove an unentitled
-  // session sees exactly the curated 44 — but a healthy-looking server whose write plane never
+  // session sees exactly the full read catalog — but a healthy-looking server whose write plane never
   // mounts passed every check here, which is how "deployed but unreachable" survived three weeks.
   // This proves the other side at boot: a session holding a full grant registers exactly the base
-  // catalog plus all 22 preview/apply tools, appended after it, never interleaved. The mount is
+  // catalog plus every preview/apply pair, appended after it, never interleaved. The mount is
   // INJECTED — entitlement lookup is a network concern the self-check must not have — so this
   // checks registration (the CLO-183 failure class), not the entitlement store.
   const actionTools = ACTION_DEFINITIONS.flatMap((definition) => [definition.previewTool, definition.applyTool]);

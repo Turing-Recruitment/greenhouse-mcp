@@ -585,7 +585,7 @@ function runtimeLimitCheck(env: NodeJS.ProcessEnv): ReadinessCheck {
 
 function toolCatalogCheck(env: NodeJS.ProcessEnv): ReadinessCheck {
   try {
-    const config = createRecruiterToolConfig(env, RECRUITER_TOOL_DEFINITIONS.map((tool) => tool.name));
+    const config = createRecruiterToolConfig(env);
     const expected: readonly string[] = PILOT_TOOL_NAMES;
     const activeBySurface = (["claude_desktop", "chatgpt_desktop"] as const).map((surface) => ({
       surface,
@@ -601,13 +601,13 @@ function toolCatalogCheck(env: NodeJS.ProcessEnv): ReadinessCheck {
       return {
         name: "tool_catalog",
         status: "fail",
-        summary: `Hosted recruiter MCP must expose the exact ordered ${expected.length}-tool production allowlist on every desktop surface.`,
+        summary: `Hosted recruiter MCP must expose the exact ordered ${expected.length}-tool production catalog on every desktop surface.`,
       };
     }
     return {
       name: "tool_catalog",
       status: "pass",
-      summary: `Recruiter MCP tool controls resolve to the exact ordered ${expected.length}-tool production allowlist on every desktop surface.`,
+      summary: `Recruiter MCP tool controls resolve to the exact ordered ${expected.length}-tool production catalog on every desktop surface.`,
     };
   } catch (error) {
     return {

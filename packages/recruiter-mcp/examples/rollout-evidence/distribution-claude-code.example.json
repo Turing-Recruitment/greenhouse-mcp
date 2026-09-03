@@ -23,7 +23,7 @@
     { "name": "mcp_tools_list", "status": "pass", "summary": "MCP tools/list succeeded" },
     { "name": "expected_tool_catalog", "status": "pass", "summary": "expected recruiter tools were present" },
     { "name": "no_unexpected_tools", "status": "pass", "summary": "catalog contained no unexpected tools" },
-    { "name": "exact_tool_catalog", "status": "pass", "summary": "catalog exactly matched 44 unique approved tools" },
+    { "name": "exact_tool_catalog", "status": "pass", "summary": "catalog exactly matched 66 unique approved tools" },
     { "name": "no_write_tools", "status": "pass", "summary": "catalog contained no write/admin tools" },
     { "name": "read_only_tool_annotations", "status": "pass", "summary": "all tools were read-only, non-destructive, and idempotent" }
   ],
@@ -71,6 +71,28 @@
     "search_my_custom_fields",
     "search_my_departments",
     "search_my_offices",
-    "search_my_close_reasons"
+    "search_my_close_reasons",
+    "search_my_job_interviews",
+    "search_my_tracking_links",
+    "search_my_job_notes",
+    "search_my_pay_inputs",
+    "search_my_approval_flows",
+    "search_my_approvers",
+    "search_my_approver_groups",
+    "search_my_scorecard_questions",
+    "search_my_scorecard_question_options",
+    "search_my_scorecard_question_answer_options",
+    "search_my_interview_kits",
+    "search_my_default_interviewers",
+    "search_my_job_post_locations",
+    "search_my_pay_input_ranges",
+    "search_my_interviewer_tags",
+    "search_my_candidate_tags",
+    "search_my_prospect_pools",
+    "search_my_prospect_pool_stages",
+    "search_my_prospect_details",
+    "search_my_job_boards",
+    "search_my_custom_field_departments",
+    "search_my_custom_field_offices"
   ]
 }

@@ -140,7 +140,10 @@ describe("recruiter MCP readiness", () => {
     assert.equal(report.status, "not_ready");
     assert.deepEqual(
       report.checks.filter((check) => check.status === "fail").map((check) => check.name),
-      ["greenhouse_client_id", "greenhouse_client_secret", "session_secret", "scope_signing_secret", "detailed_readiness_auth", "state_backend", "token_revocation_source", "identity_directory", "audit_sink", "tool_catalog", "cors_origin_allowlist"]
+      // tool_catalog is absent on purpose: R2a made the registrar the catalog, so an env with NO tool
+      // configuration at all already mounts exactly PILOT_TOOL_NAMES. The check now catches operator
+      // switches (denylist / category / surface), which the test below exercises one by one.
+      ["greenhouse_client_id", "greenhouse_client_secret", "session_secret", "scope_signing_secret", "detailed_readiness_auth", "state_backend", "token_revocation_source", "identity_directory", "audit_sink", "cors_origin_allowlist"]
     );
   });
 
@@ -469,32 +472,36 @@ describe("recruiter MCP readiness", () => {
     assert.match(check?.summary ?? "", /MAX_TOOL_DURATION_MS/);
   });
 
-  it("fails readiness for an empty, duplicated, or unknown tool allowlist", () => {
-    for (const value of ["", "search_my_jobs,search_my_jobs", "search_my_jobs,unknown_tool"]) {
-      const report = buildRecruiterMcpReadinessReport({
-        ...completeEnv(),
-        GREENHOUSE_RECRUITER_ALLOWED_TOOLS: value,
-      } as NodeJS.ProcessEnv);
-      assert.equal(report.ok, false);
-      assert.equal(report.checks.find((entry) => entry.name === "tool_catalog")?.status, "fail");
+  // R2a deleted GREENHOUSE_RECRUITER_ALLOWED_TOOLS, and with it the three cases this test used to
+  // cover (empty / duplicated / unknown entries). What is left is the guard that actually matters:
+  // /readyz must refuse to serve a production surface whose mounted catalog is not the full ordered
+  // read catalog. Every surviving control that can shrink it is exercised here, one per case, because
+  // deleting the negative test would have left toolCatalogCheck with nothing proving it can fail.
+  it("fails readiness when any operator control shrinks the mounted catalog on a hosted surface", () => {
+    const cases: Array<[string, NodeJS.ProcessEnv]> = [
+      ["a denylisted reader", { GREENHOUSE_RECRUITER_DISABLE_TOOLS: "search_my_jobs" } as NodeJS.ProcessEnv],
+      ["a denylisted analyzer", { GREENHOUSE_RECRUITER_DISABLE_TOOLS: "answer_my_recruiting_question" } as NodeJS.ProcessEnv],
+      ["the evidence category switch", { GREENHOUSE_RECRUITER_DISABLE_EVIDENCE: "true" } as NodeJS.ProcessEnv],
+      ["the analytics category switch", { GREENHOUSE_RECRUITER_DISABLE_ANALYTICS: "true" } as NodeJS.ProcessEnv],
+      ["the Claude Desktop surface switch", { GREENHOUSE_RECRUITER_DISABLE_CLAUDE_DESKTOP: "true" } as NodeJS.ProcessEnv],
+      ["the ChatGPT Desktop surface switch", { GREENHOUSE_RECRUITER_DISABLE_CHATGPT_DESKTOP: "true" } as NodeJS.ProcessEnv],
+      ["the whole-server kill switch", { GREENHOUSE_RECRUITER_MCP_DISABLED: "true" } as NodeJS.ProcessEnv],
+    ];
+    for (const [label, overrides] of cases) {
+      const report = buildRecruiterMcpReadinessReport({ ...completeEnv(), ...overrides } as NodeJS.ProcessEnv);
+      assert.equal(report.ok, false, label);
+      assert.equal(report.checks.find((entry) => entry.name === "tool_catalog")?.status, "fail", label);
     }
   });
 
-  it("fails readiness unless every hosted desktop surface has the exact 44-tool allowlist", () => {
-    const cases = [
-      undefined,
-      "search_my_jobs",
-      PILOT_TOOL_NAMES.slice(0, -1).join(","),
-      [...PILOT_TOOL_NAMES, "search_my_interview_questions"].join(","),
-    ];
-    for (const value of cases) {
-      const report = buildRecruiterMcpReadinessReport({
-        ...completeEnv(),
-        GREENHOUSE_RECRUITER_ALLOWED_TOOLS: value,
-      } as NodeJS.ProcessEnv);
-      assert.equal(report.ok, false);
-      assert.equal(report.checks.find((entry) => entry.name === "tool_catalog")?.status, "fail");
-    }
+  it("passes the catalog check with no tool configuration at all, because the registrar is the catalog", () => {
+    const report = buildRecruiterMcpReadinessReport(completeEnv());
+
+    assert.equal(report.checks.find((entry) => entry.name === "tool_catalog")?.status, "pass");
+    assert.match(
+      report.checks.find((entry) => entry.name === "tool_catalog")?.summary ?? "",
+      new RegExp(`exact ordered ${PILOT_TOOL_NAMES.length}-tool production catalog`)
+    );
   });
 
   it("fails readiness when the hosted CORS origin allowlist is missing", () => {
@@ -1088,7 +1095,6 @@ function completeEnv(): NodeJS.ProcessEnv {
     GREENHOUSE_RECRUITER_AUDIT_JSONL_PATH: "/secure/greenhouse-recruiter-audit.jsonl",
     GREENHOUSE_RECRUITER_AUDIT_DURABLE_MOUNT_PATH: "/secure",
     GREENHOUSE_RECRUITER_CORS_ORIGIN: "https://chatgpt.com,https://claude.ai",
-    GREENHOUSE_RECRUITER_ALLOWED_TOOLS: PILOT_TOOL_NAMES.join(","),
     GREENHOUSE_RECRUITER_FORCE_PERMISSION_TTL_ZERO: "true",
     GREENHOUSE_RECRUITER_RATE_LIMIT_DISABLED: "false",
   } as NodeJS.ProcessEnv;

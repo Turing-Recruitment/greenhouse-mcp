@@ -134,8 +134,9 @@ export async function runRemoteDistributionValidationFromEnv(
 function expectedToolNamesFromEnv(env: NodeJS.ProcessEnv, token: string | undefined): string[] {
   const explicit = parseNameList(env.GREENHOUSE_RECRUITER_VALIDATE_EXPECT_TOOLS);
   if (explicit) return explicit;
+  // GREENHOUSE_RECRUITER_ALLOWED_TOOLS is deliberately absent: R2a deleted it, so its presence in an
+  // env says nothing about the catalog and must not send this function down the derive path.
   const hasRuntimeCatalogControls = [
-    "GREENHOUSE_RECRUITER_ALLOWED_TOOLS",
     "GREENHOUSE_RECRUITER_DISABLE_TOOLS",
     "GREENHOUSE_RECRUITER_DISABLE_EVIDENCE",
     "GREENHOUSE_RECRUITER_DISABLE_ANALYTICS",
@@ -144,7 +145,7 @@ function expectedToolNamesFromEnv(env: NodeJS.ProcessEnv, token: string | undefi
     "GREENHOUSE_RECRUITER_MCP_DISABLED",
   ].some((name) => env[name] !== undefined);
   if (!hasRuntimeCatalogControls) return DEFAULT_EXPECTED_TOOL_NAMES;
-  const config = createRecruiterToolConfig(env, RECRUITER_TOOL_DEFINITIONS.map((tool) => tool.name));
+  const config = createRecruiterToolConfig(env);
   const surface = readSessionMetadataFromToken(token).surface ?? "claude_desktop";
   return RECRUITER_TOOL_DEFINITIONS
     .filter((tool) => isToolEnabled(config, surface, tool.name, tool.kind))

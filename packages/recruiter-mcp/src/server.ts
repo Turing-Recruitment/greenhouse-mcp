@@ -107,7 +107,7 @@ export function createRecruiterRuntimeForServer(
     // strictly additive: `isToolEnabled` consults `grantedTools` only to admit an ACTION name past
     // the allowlist, and every other gate — denylist, surface, kind — still runs over it.
     toolConfig: {
-      ...createRecruiterToolConfig(env, RECRUITER_TOOL_DEFINITIONS.map((tool) => tool.name)),
+      ...createRecruiterToolConfig(env),
       ...(options.actionPlane ? { grantedTools: options.actionPlane.grantedTools } : {}),
     },
     rateLimiter: createRateLimiterFromEnv(env),

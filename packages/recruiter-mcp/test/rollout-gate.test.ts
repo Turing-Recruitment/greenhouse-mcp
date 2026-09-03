@@ -1307,13 +1307,15 @@ describe("rollout evidence gate", () => {
     assert.equal(report.checks.find((entry) => entry.name === "manifest_shape")?.status, "fail");
   });
 
-  it("re-derives the exact 44-tool catalog instead of trusting stale passing labels", async () => {
+  it("re-derives the exact mounted catalog instead of trusting stale passing labels", async () => {
     const dir = await mkdtemp(join(tmpdir(), "greenhouse-rollout-gate-"));
     await writeCompleteEvidence(dir);
     const staleReport = distributionReport("chatgpt_codex_host");
+    // A name outside the catalog entirely. This used to be `search_my_job_interviews`, which R2a
+    // exposed — leaving it here would have made the test pass by asserting nothing.
     await writeJson(join(dir, "distribution-chatgpt.json"), {
       ...staleReport,
-      toolNames: [...staleReport.toolNames, "search_my_job_interviews"],
+      toolNames: [...staleReport.toolNames, "search_my_interview_questions"],
     });
 
     const report = await runRolloutGate({ manifestPath: join(dir, "manifest.json") });
@@ -1321,7 +1323,7 @@ describe("rollout evidence gate", () => {
     assert.equal(report.ok, false);
     const check = report.checks.find((entry) => entry.name === "distribution_chatgpt_codex_host_exact_catalog");
     assert.equal(check?.status, "fail");
-    assert.deepEqual(check?.details?.unexpected, ["search_my_job_interviews"]);
+    assert.deepEqual(check?.details?.unexpected, ["search_my_interview_questions"]);
   });
 
   it("re-derives a duplicate-free remote catalog instead of trusting passing labels", async () => {
@@ -1472,14 +1474,14 @@ describe("rollout evidence gate", () => {
     }
   });
 
-  it("passes a write-entitled 66-tool attestation — the inversion CLO-83 exists for", async () => {
+  it("passes a write-entitled full-catalog attestation — the inversion CLO-83 exists for", async () => {
     // The retired contract counted visible write tools as a FAILURE, so a correct write-entitled
     // deployment could never pass its own release gate. Reverting the gate to that rule, or to a
     // blanket no-write check, must fail here.
     const dir = await mkdtemp(join(tmpdir(), "greenhouse-rollout-gate-"));
     await writeCompleteEvidence(dir, {
       desktopOverrides: {
-        chatgpt_desktop: { catalogAttestation: "write_entitled_66" },
+        chatgpt_desktop: { catalogAttestation: "write_entitled_full_catalog" },
       },
     });
 
@@ -2885,7 +2887,7 @@ function desktopReport(client: RecruiterClient, overrides: Partial<DesktopReport
     routineReverificationPrompted: false,
     attachmentMethod: client === "claude_desktop_chat" ? "claude_desktop_mcpb" : client === "claude_code" ? "claude_code_http_mcp" : "chatgpt_developer_mode_remote_mcp",
     exercisedTools: ROUTING_TOOLS,
-    catalogAttestation: "read_only_44",
+    catalogAttestation: "read_only_full_catalog",
     containsTokens: false,
     taskOutcome: "useful",
     taskOutcomeReason: "answer_received",
