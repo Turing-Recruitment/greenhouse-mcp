@@ -292,6 +292,9 @@ export async function readApplicationBackedRowsForJobScope<T extends Record<stri
   let rawRowsRead = apps.rawRowsRead;
   let rowsReturnedRead = apps.returnedRowsRead;
   let permissionExcluded = apps.permissionExcluded;
+  // The bridge read that produced `apps` reports no privacy count of its own (its result shape is
+  // the id bridge, not a row read), so this starts at zero and folds in the row reads below.
+  let privacyWithheld = 0;
   let unresolvedRows = apps.unresolvedRows;
   let cacheHits = apps.cacheHits;
   let pagesRead = apps.pagesRead;
@@ -331,6 +334,7 @@ export async function readApplicationBackedRowsForJobScope<T extends Record<stri
     rawRowsRead += read.rawRowsRead;
     rowsReturnedRead += read.rowsReturnedRead ?? read.rows.length;
     permissionExcluded += read.permissionExcluded;
+    privacyWithheld += read.privacyWithheld;
     unresolvedRows += read.unresolvedRows;
     cacheHits += read.cacheHits;
     pagesRead += read.pagesRead;
@@ -351,6 +355,7 @@ export async function readApplicationBackedRowsForJobScope<T extends Record<stri
     rawRowsRead,
     rowsReturnedRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     pagesRead,
     status,

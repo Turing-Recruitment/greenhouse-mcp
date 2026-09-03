@@ -424,6 +424,84 @@ describe("get_job_scope tool", () => {
   });
 });
 
+describe("B12: get_job_scope discloses whether private candidates are visible", () => {
+  // Through the LIVE inventory path, because that is where the scoped read's permissionScope —
+  // and its privateCandidatesWithheld disclosure — actually reaches the tool.
+  function liveInventoryRuntime(permissionScope: unknown) {
+    const scopedReader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") {
+        return scopedSuccess(
+          toolName,
+          [{ id: 9001006, name: "Frontier Data Engineer", status: "open" }],
+          null,
+          { permissionScope: permissionScope as never }
+        );
+      }
+      // Inventory enrichment (offices / departments / job posts / post locations).
+      return scopedSuccess(toolName, []);
+    });
+    return testRuntime(scopedReader, { scopeSigner: signer }).runtime;
+  }
+
+  async function inspect(permissionScope: unknown) {
+    const runtime = liveInventoryRuntime(permissionScope);
+    const handle = signer.signScopeHandle({
+      subject: runtime.session.subject, jobIds: [9001006], complete: true, label: "x", source: "exact_ids", issuedAtMs: NOW,
+    });
+    return data(await runGetJobScope(runtime, { scope_handle: handle }));
+  }
+
+  it("reports false for an unattested org-wide session", async () => {
+    const out = await inspect({ kind: "all", permittedJobCount: null, privateCandidatesWithheld: true });
+    assert.equal(out.valid, true);
+    assert.equal(out.private_candidates_visible, false,
+      "a session reading a deliberately short set must be told so, not left to infer it from row counts");
+  });
+
+  it("reports true for an attested org-wide session and for an operator", async () => {
+    assert.equal((await inspect({ kind: "all", permittedJobCount: null })).private_candidates_visible, true);
+    assert.equal((await inspect({ kind: "operator", permittedJobCount: null })).private_candidates_visible, true);
+    assert.equal(
+      (await inspect({ kind: "operator", permittedJobCount: null, privateCandidatesWithheld: true })).private_candidates_visible,
+      false
+    );
+  });
+
+  it("omits the field entirely for a job-scoped recruiter", async () => {
+    const out = await inspect({ kind: "jobs", permittedJobCount: 1 });
+    assert.ok(!("private_candidates_visible" in out),
+      "a job scope was never org-wide; private access there is decided per req and the flag would mislead");
+  });
+});
+
+describe("B12: confirm_job_scope carries the same disclosure", () => {
+  it("reports it on a confirmed scope for an unattested org-wide session", async () => {
+    const scopedReader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") {
+        return scopedSuccess(
+          toolName,
+          [
+            { id: 9001006, name: "Frontier Data Engineer", status: "open" },
+            { id: 9001007, name: "Frontier Data Scientist", status: "open" },
+          ],
+          null,
+          { permissionScope: { kind: "all", permittedJobCount: null, privateCandidatesWithheld: true } as never }
+        );
+      }
+      return scopedSuccess(toolName, []);
+    });
+    const { runtime } = testRuntime(scopedReader, { scopeSigner: signer });
+    const resolved = data(await runResolveJobScope(runtime, { query: "Frontier Data" })) as ResolveJobScopeOutput;
+    const confirmed = data(await runConfirmJobScope(runtime, {
+      resolution_id: resolved.resolution_id,
+      confirmation_token: resolved.confirmation.confirmation_token,
+      decision: "confirm_all",
+    }));
+    assert.equal(confirmed.scope_status, "confirmed");
+    assert.equal(confirmed.private_candidates_visible, false);
+  });
+});
+
 describe("get_recruiting_capabilities tool", () => {
   it("describes only the active pilot catalog and executable recipes when allowlisted", async () => {
     const { runtime } = fixtureRuntime("narrow_recruiter", {

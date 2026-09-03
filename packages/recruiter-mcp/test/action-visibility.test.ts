@@ -2,6 +2,7 @@ import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { createRecruiterVisibilityProbe } from "../src/action-visibility.js";
 import { _resetPrivateCustomFieldCache } from "../src/private-custom-fields.js";
+import { createScopedGreenhouseReader, type ApiResponse, type RawReadClient } from "../../scoped-core/src/index.js";
 import { fakeScopedReader, scopedDenial, scopedSuccess, testRuntime } from "./test-helpers.js";
 
 /**
@@ -109,5 +110,73 @@ describe("createRecruiterVisibilityProbe", () => {
     assert.equal(verdict.state, "visible");
     assert.equal((verdict as { redacted: boolean }).redacted, true,
       "projectJobNoteRow deletes the body on privately_visible — the probe must see that deletion");
+  });
+});
+
+/**
+ * B4 — the write plane inherits the attestation by construction.
+ *
+ * The fence asks the READ plane whether the acting human can see the target, and
+ * `action-mcp/src/service.ts:295-301` turns a `hidden` verdict into `TARGET_NOT_VISIBLE` for every
+ * action kind (locked in `action-mcp/test/all-capabilities-concurrency.test.ts`). So the thing that
+ * has to be proved here is the half that is new: that the REAL scoped pipeline — not a fake
+ * scopedRead — answers `hidden` for an unattested org-wide session and `visible` for an attested
+ * one. Nothing in `action-visibility.ts` changes; that is the point.
+ */
+describe("B4: the visibility fence inherits the private-candidate attestation", () => {
+  const PRIVATE_CANDIDATE_ID = 300;
+
+  function tenant(): RawReadClient {
+    return {
+      async read<T>(path: string, params?: Record<string, unknown>): Promise<ApiResponse<T>> {
+        const ids = String(params?.ids ?? "")
+          .split(",")
+          .map((value) => Number(value))
+          .filter((value) => Number.isInteger(value) && value > 0);
+        if (path === "/applications") {
+          return { data: [{ id: 100, job_id: 200, candidate_id: PRIVATE_CANDIDATE_ID, status: "in_process" }].filter((row) => ids.includes(row.id)) as T, nextCursor: null };
+        }
+        if (path === "/candidates") {
+          return { data: ids.map((id) => ({ id, private: id === PRIVATE_CANDIDATE_ID })) as T, nextCursor: null };
+        }
+        return { data: [] as T, nextCursor: null };
+      },
+    };
+  }
+
+  function probeOverRealPipeline(scope: unknown) {
+    const scopedReader = createScopedGreenhouseReader<unknown>({
+      actorResolver: { resolveActor: () => 100 },
+      permissionProvider: { async getPermittedJobIds() { return scope as never; } },
+      rawReader: tenant(),
+    });
+    const { runtime } = testRuntime(scopedReader as never);
+    return createRecruiterVisibilityProbe({ runtime });
+  }
+
+  it("hides a private candidate's application from an unattested org-wide session", async () => {
+    const verdict = await probeOverRealPipeline({ kind: "all" })
+      .probe({ kind: "application", id: 100, requiresUnredacted: false });
+    assert.deepEqual(verdict, { state: "hidden" },
+      "hidden is what action-mcp turns into TARGET_NOT_VISIBLE, for every action kind");
+  });
+
+  it("shows it to an attested org-wide session", async () => {
+    const verdict = await probeOverRealPipeline({ kind: "all", privateCandidatesAttested: true })
+      .probe({ kind: "application", id: 100, requiresUnredacted: false });
+    assert.deepEqual(verdict, { state: "visible", redacted: false });
+  });
+
+  it("hides it from an unattested session that holds no private-capable role on the target's job", async () => {
+    const verdict = await probeOverRealPipeline({ kind: "all", privateCapableJobIds: new Set([999]) })
+      .probe({ kind: "application", id: 100, requiresUnredacted: false });
+    assert.deepEqual(verdict, { state: "hidden" });
+  });
+
+  it("shows it when the unattested session holds a private-capable role on that job", async () => {
+    const verdict = await probeOverRealPipeline({ kind: "all", privateCapableJobIds: new Set([200]) })
+      .probe({ kind: "application", id: 100, requiresUnredacted: false });
+    assert.deepEqual(verdict, { state: "visible", redacted: false },
+      "Greenhouse itself grants private access on job 200; the fence must not deny what the org allowed");
   });
 });

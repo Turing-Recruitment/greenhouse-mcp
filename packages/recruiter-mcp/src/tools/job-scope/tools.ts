@@ -67,6 +67,14 @@ interface ConfirmJobScopeOutput {
   expires_at: string | null;
   permission_revalidated: boolean;
   warnings: string[];
+  /**
+   * Whether this session can see private candidates across the tenant. Present only for an org-wide
+   * or operator session — a job-scoped recruiter's private access is decided per req and a single
+   * boolean would misdescribe it. False means nobody has attested this actor's Greenhouse
+   * "Can create and view private candidates" permission, so their evidence reads are short by
+   * design; the model needs that to read an empty answer correctly.
+   */
+  private_candidates_visible?: boolean;
 }
 
 interface GetJobScopeOutput {
@@ -79,6 +87,8 @@ interface GetJobScopeOutput {
   permission_revalidated: boolean;
   inaccessible_job_ids: number[];
   warnings: string[];
+  /** See ConfirmJobScopeOutput.private_candidates_visible. */
+  private_candidates_visible?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -446,7 +456,7 @@ async function finishConfirm(
     effectiveActorId: inventory?.actorId ?? undefined,
     scoped: inventory ? inventory.scopeKind === "jobs" : true,
     permissionScope: inventory ? permissionScopeFor(inventory) : undefined,
-    data: output,
+    data: withPrivateCandidateDisclosure(output, inventory),
     nextCursor: null,
   };
   const audited = await emitRequiredToolAudit(
@@ -471,7 +481,7 @@ async function finishGet(
     effectiveActorId: inventory?.actorId ?? undefined,
     scoped: inventory ? inventory.scopeKind === "jobs" : true,
     permissionScope: inventory ? permissionScopeFor(inventory) : undefined,
-    data: output,
+    data: withPrivateCandidateDisclosure(output, inventory),
     nextCursor: null,
   };
   const audited = await emitRequiredToolAudit(
@@ -479,6 +489,25 @@ async function finishGet(
     { scopeAction: "get", scopeStatus: output.scope_status, scopeJobCount: output.job_count, resolvedJobIds: output.job_ids }
   );
   return audited ?? result;
+}
+
+/**
+ * Attach the private-candidate disclosure to a scope tool's output, for the two sessions it means
+ * anything to.
+ *
+ * Both scope tools already carry the applied `permissionScope`, so this is the one place the
+ * question "will my evidence reads be short?" can be answered before the recruiter runs one. It is
+ * OMITTED, not set false, for a job-scoped recruiter and for the no-inventory paths (an expired or
+ * forbidden handle resolves no scope at all) — an absent field is honestly silent where a false one
+ * would assert something the read plane never decided. `get_recruiting_capabilities` is
+ * deliberately untouched: it performs no scoped read and holds no scope to report.
+ */
+function withPrivateCandidateDisclosure<T extends { private_candidates_visible?: boolean }>(
+  output: T,
+  inventory: JobInventory | undefined
+): T {
+  const visible = inventory?.privateCandidatesVisible;
+  return visible === null || visible === undefined ? output : { ...output, private_candidates_visible: visible };
 }
 
 function rejectedConfirm(reason: string): ConfirmJobScopeOutput {

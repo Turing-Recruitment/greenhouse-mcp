@@ -326,6 +326,7 @@ async function readCurrentApplicationStages(
   let rawRowsRead = 0;
   let rowsReturnedRead = 0;
   let permissionExcluded = 0;
+  let privacyWithheld = 0;
   let unresolvedRows = 0;
   let cacheHits = 0;
   let pagesRead = 0;
@@ -376,6 +377,7 @@ async function readCurrentApplicationStages(
     rawRowsRead += result.rawRowsRead;
     rowsReturnedRead += result.rowsReturnedRead ?? result.rows.length;
     permissionExcluded += result.permissionExcluded;
+    privacyWithheld += result.privacyWithheld;
     unresolvedRows += result.unresolvedRows;
     cacheHits += result.cacheHits;
     pagesRead += result.pagesRead;
@@ -399,6 +401,7 @@ async function readCurrentApplicationStages(
     rawRowsRead,
     rowsReturnedRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     pagesRead,
     status,

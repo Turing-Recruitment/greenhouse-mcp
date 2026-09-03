@@ -119,9 +119,20 @@ export type PermissionScope =
 export type PermissionLookupResult = ReadonlySet<number> | PermissionScope;
 
 export type AppliedPermissionScope =
-  | { kind: "operator"; permittedJobCount: null }
-  | { kind: "all"; permittedJobCount: null }
+  | { kind: "operator"; permittedJobCount: null; privateCandidatesWithheld?: true }
+  | { kind: "all"; permittedJobCount: null; privateCandidatesWithheld?: true }
   | { kind: "jobs"; permittedJobCount: number };
+
+/**
+ * `privateCandidatesWithheld` is the org-wide branch's disclosure, and it appears ONLY there.
+ *
+ * An all-access actor (or a direct operator) whose private-candidate permission nobody has attested
+ * reads everything except private candidates outside their own private-capable reqs. That is a real
+ * narrowing of what the model can see, so the envelope says so rather than letting the model read a
+ * short answer as a complete one. It is absent on an attested envelope, which keeps the attested
+ * read byte-identical to what it was before the gate existed, and absent on a job scope, which was
+ * never org-wide and has always decided private access per req.
+ */
 
 export interface ScopedReadRowCounts {
   raw: number | null;
@@ -130,6 +141,12 @@ export interface ScopedReadRowCounts {
   permissionExcluded?: number;
   /** Rows whose job association could not be resolved from otherwise successful reads. */
   unresolved?: number;
+  /**
+   * Of the excluded rows, how many the private-candidate gate withheld. Present only when it is
+   * non-zero, and never on a single-row read the gate emptied — see the existence-suppression rule
+   * in `scopedRead`, which this count would otherwise walk straight through.
+   */
+  privacyWithheld?: number;
   /** Honest scope-resolution completeness for this page. */
   status?: "complete" | "incomplete_scope_resolution";
 }
@@ -346,6 +363,19 @@ export interface ScopedGreenhouseConfig<SessionIdentity = unknown> {
    */
   authorizationReader?: RawReadClient;
   operatorActorIds?: ReadonlySet<number>;
+  /**
+   * Has an operator attested that Greenhouse grants this actor the org-wide private-candidate
+   * permission? Consulted ONLY on the direct-operator path, which returns raw data before the
+   * permission provider ever runs and so never sees the flag the provider stamps on a scope.
+   *
+   * Absent means unattested — the same fail-closed direction every other unknown takes here. It is
+   * not a claim that the operator lacks the permission, only that this layer cannot establish it,
+   * and Greenhouse's own model is the thing being honoured rather than guessed at.
+   */
+  privateCandidateAttestation?: (
+    greenhouseUserId: number,
+    signal?: AbortSignal
+  ) => Promise<boolean>;
   filterRegistry?: ReadonlyMap<string, ToolRegistration>;
   scopePolicyRegistry?: ReadonlyMap<string, ExecutableScopePolicy>;
 }
@@ -687,6 +717,20 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
         options.onPermissionScopeResolved?.({ kind: "operator" });
         signal?.throwIfAborted();
         const response = await registration.execute(config.rawReader, safeParams, signal);
+        // The operator path returns raw data before the permission provider runs, so the flag the
+        // provider stamps onto a scope never reaches it. It asks directly instead — and an absent
+        // lookup is unattested, not a grant.
+        const operatorAttested = (await config.privateCandidateAttestation?.(actorId, signal)) === true;
+        if (!operatorAttested) {
+          return withholdUnattestedPrivateCandidates({
+            toolName,
+            actorId,
+            effectiveActorId: actorId,
+            response,
+            appliedScope: { kind: "operator", permittedJobCount: null, privateCandidatesWithheld: true },
+            context: privacyOnlyContext(config, applicationTerminal, signal, new Set<number>()),
+          });
+        }
         const rowCounts = unscopedRowCounts(response.data);
         return {
           ok: true,
@@ -727,23 +771,58 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
 
       signal?.throwIfAborted();
       const response = await registration.execute(config.rawReader, safeParams, signal);
-      // An org-wide scope with nothing excluded stays a raw, unfiltered read — the fast path, and
-      // the correct answer for a tenant with no legacy confidential jobs. With exclusions, the same
-      // row filtering everyone else gets runs, over a "permitted" set that is everything BUT them.
+      // Has an operator attested that Greenhouse grants this org-wide actor the private-candidate
+      // permission? Only `=== true` counts, here and everywhere else.
+      const allAccessAttested =
+        permissionScope.kind === "all" && permissionScope.privateCandidatesAttested === true;
+      // An ATTESTED org-wide scope with nothing excluded stays a raw, unfiltered read — the fast
+      // path, and the correct answer for a tenant with no legacy confidential jobs. With
+      // exclusions, the same row filtering everyone else gets runs, over a "permitted" set that is
+      // everything BUT them.
       if (permissionScope.kind === "all" && !(permissionScope.excludedJobIds?.size)) {
-        const rowCounts = unscopedRowCounts(response.data);
-        return {
-          ok: true,
+        if (allAccessAttested) {
+          const rowCounts = unscopedRowCounts(response.data);
+          return {
+            ok: true,
+            toolName,
+            actorId,
+            effectiveActorId,
+            scoped: false,
+            permissionScope: { kind: "all", permittedJobCount: null },
+            rowCounts,
+            data: response.data,
+            nextCursor: response.nextCursor,
+            meta: response.meta,
+          };
+        }
+        // UNATTESTED org-wide: a dedicated branch, deliberately NOT the job-scope filter path.
+        //
+        // Routing it through the filter would change far more than privacy: that path drops a
+        // candidate with no applications as `missingParent`, resolves each row's job through a
+        // per-row parent read, and can deny the WHOLE read with PERMISSION_JOIN_FAILED — which
+        // `recruiter-mcp/src/action-visibility.ts:147` turns into a write denial. None of that is
+        // what "this actor's private-candidate permission is unattested" means. So the raw page is
+        // taken as-is and only the private rows are withheld.
+        //
+        // The cost is the batched candidate loads the gate below performs on the UNCACHED
+        // authorization reader: one `/candidates?ids=…&fields=id,private` per 50 rows on an
+        // endpoint that does not already carry the flag, plus one `/applications` read per private
+        // row IF the actor holds a private-capable role somewhere (nothing at all when they do
+        // not). The window is bounded: from migration 0008 until the operator runs
+        // greenhouse-recruiter-attest-private-candidates for each org-wide user.
+        return withholdUnattestedPrivateCandidates({
           toolName,
           actorId,
           effectiveActorId,
-          scoped: false,
-          permissionScope: { kind: "all", permittedJobCount: null },
-          rowCounts,
-          data: response.data,
-          nextCursor: response.nextCursor,
-          meta: response.meta,
-        };
+          response,
+          appliedScope: { kind: "all", permittedJobCount: null, privateCandidatesWithheld: true },
+          context: privacyOnlyContext(
+            config,
+            applicationTerminal,
+            signal,
+            permissionScope.privateCapableJobIds ?? new Set<number>()
+          ),
+        });
       }
 
       const context: ScopeContext = {
@@ -753,10 +832,14 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
         permittedJobIds: permissionScope.kind === "all"
           ? everyJobExcept(permissionScope.excludedJobIds ?? new Set<number>())
           : permissionScope.jobIds,
-        // A site admin holds Greenhouse's private-candidate access implicitly, so on the jobs they
-        // can still see, private candidates remain visible exactly as they were.
+        // An ATTESTED org-wide actor holds Greenhouse's private-candidate permission, so on the
+        // jobs they can still see, private candidates remain visible exactly as they were. An
+        // unattested one falls back to the private-capable reqs their explicit Greenhouse roles
+        // grant — never to nothing, which would deny access the organization already gave them.
         privateCapableJobIds: permissionScope.kind === "all"
-          ? everyJobExcept(permissionScope.excludedJobIds ?? new Set<number>())
+          ? (allAccessAttested
+              ? everyJobExcept(permissionScope.excludedJobIds ?? new Set<number>())
+              : permissionScope.privateCapableJobIds ?? new Set<number>())
           : permissionScope.privateCapableJobIds ?? new Set<number>(),
         applicationTerminal,
         applicationCache: new Map(),
@@ -809,7 +892,8 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
         (filtered.outcomes.privacyWithheld ?? 0) > 0 &&
         filtered.outcomes.missingParent === 0 &&
         filtered.outcomes.parentReadFailed === 0;
-      const rowCounts = {
+      const privacyWithheld = filtered.outcomes.privacyWithheld ?? 0;
+      const rowCounts: ScopedReadRowCounts = {
         raw: suppressExistence ? 0 : countRows(response.data),
         returned: countReturnedRows(scopedResponse.data),
         permissionExcluded: suppressExistence ? 0 : filtered.outcomes.notPermitted,
@@ -817,6 +901,9 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
         status: filtered.outcomes.missingParent > 0 || filtered.outcomes.parentReadFailed > 0 || filtered.outcomes.incomplete
           ? "incomplete_scope_resolution" as const
           : "complete" as const,
+        // Only when there is something to report, and never under existence suppression — a count
+        // that survived the suppression would restore exactly the oracle it exists to remove.
+        ...(suppressExistence || privacyWithheld === 0 ? {} : { privacyWithheld }),
       };
       return {
         ok: true,
@@ -828,7 +915,11 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
         // the audit trail should say what the scope WAS, and "all, minus what Greenhouse itself
         // restricts" is still all. There is no finite permitted count to report for it.
         permissionScope: permissionScope.kind === "all"
-          ? { kind: "all", permittedJobCount: null }
+          ? {
+              kind: "all",
+              permittedJobCount: null,
+              ...(allAccessAttested ? {} : { privateCandidatesWithheld: true as const }),
+            }
           : { kind: "jobs", permittedJobCount: permissionScope.jobIds.size },
         rowCounts,
         data: scopedResponse.data,
@@ -836,6 +927,95 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
         meta: scopedResponse.meta,
       };
     },
+  };
+}
+
+/**
+ * The ScopeContext an UNATTESTED org-wide read needs: everything permitted (job scope is not what
+ * is in question), and privacy decided by the private-capable reqs Greenhouse's own per-job roles
+ * grant this actor.
+ *
+ * `authorizationReader` is the same uncached reader the rest of the privacy path uses — the
+ * candidate `private` flag decides whether a row is withheld, so it must not age on the data
+ * cache's clock. The parent caches are per-read, exactly as they are on the filter path, so a page
+ * that mentions one candidate twice pays for it once.
+ */
+function privacyOnlyContext(
+  config: { rawReader: RawReadClient; authorizationReader?: RawReadClient },
+  applicationTerminal: ScopeTerminal,
+  signal: AbortSignal | undefined,
+  privateCapableJobIds: ReadonlySet<number>
+): ScopeContext {
+  return {
+    rawReader: config.rawReader,
+    authorizationReader: config.authorizationReader ?? config.rawReader,
+    ...(signal ? { signal } : {}),
+    permittedJobIds: everyJobExcept(new Set<number>()),
+    privateCapableJobIds,
+    applicationTerminal,
+    applicationCache: new Map(),
+    candidateApplicationsCache: new Map(),
+    interviewCache: new Map(),
+    scorecardCache: new Map(),
+    policyParentCache: new Map(),
+    candidatePrivacyCache: new Map(),
+  };
+}
+
+/**
+ * Withhold the private candidates an UNATTESTED org-wide actor (or direct operator) may not see,
+ * and report what that cost — without ever confirming that a particular person exists.
+ *
+ * Runs `applyCandidatePrivacyGate` over the RAW page. That gate is the same one both scope engines
+ * already funnel through, so this branch inherits its batching, its per-row failure handling (an
+ * unreadable parent withholds ITS row rather than denying the page), and its per-job admission
+ * rule. What it does not inherit is job-scope filtering, which is not what an unattested
+ * attestation means.
+ */
+async function withholdUnattestedPrivateCandidates(input: {
+  toolName: string;
+  actorId: number;
+  effectiveActorId: number;
+  response: ApiResponse;
+  appliedScope: AppliedPermissionScope;
+  context: ScopeContext;
+}): Promise<ScopedReadSuccess> {
+  const { toolName, response, context } = input;
+  const filtered = await applyCandidatePrivacyGate(
+    toolName,
+    {
+      response,
+      outcomes: { ...emptyScopeOutcomeCounts(), permitted: countReturnedRows(response.data) },
+    },
+    context
+  );
+  const privacyWithheld = filtered.outcomes.privacyWithheld ?? 0;
+  // The same existence-suppression rule the filter path applies, for the same reason: a single-row
+  // read the privacy gate emptied must report exactly what a nonexistent id reports, or the counts
+  // become a per-person oracle for the restricted flag. There is no missingParent/parentReadFailed
+  // term here because this branch never resolves job scope — a row it could not read is withheld,
+  // not "unresolved".
+  const suppressExistence = isRecord(response.data) && privacyWithheld > 0;
+  return {
+    ok: true,
+    toolName,
+    actorId: input.actorId,
+    effectiveActorId: input.effectiveActorId,
+    // Rows were withheld, so this read was scoped — reporting it as unscoped would tell the model
+    // it holds a complete page when it does not.
+    scoped: true,
+    permissionScope: input.appliedScope,
+    rowCounts: {
+      raw: suppressExistence ? 0 : countRows(response.data),
+      returned: countReturnedRows(filtered.response.data),
+      permissionExcluded: suppressExistence ? 0 : privacyWithheld,
+      unresolved: 0,
+      status: "complete",
+      ...(suppressExistence || privacyWithheld === 0 ? {} : { privacyWithheld }),
+    },
+    data: filtered.response.data,
+    nextCursor: filtered.response.nextCursor,
+    meta: filtered.response.meta,
   };
 }
 
@@ -930,6 +1110,25 @@ function intersects(left: ReadonlySet<number>, right: ReadonlySet<number>): bool
  * `list_interviewers` are absent for the opposite reason: they legitimately return job-level rows
  * belonging to no candidate, gated per-row on their application branch only.
  */
+/**
+ * Tools whose rows ARE candidates, so the gate reads the flag off the row instead of joining to it.
+ *
+ * `/v3/candidates` carries `private` in its default field set and the scoped reader strips any
+ * caller `fields` selector, so the flag is always there in production. A row without a usable
+ * boolean means the field set changed underneath us and fails CLOSED — the same rule
+ * `privateCandidateRowDecision` applies in the row filter.
+ *
+ * The row filter already gates these on the job-scope path, which makes this pass idempotent
+ * there: the rows that survive carry `private: false`, so a second look withholds nothing new. It
+ * is load-bearing on the UNATTESTED org-wide branch, which runs no row filter at all, and where a
+ * gate that could only reach a candidate through an application would have kept every private
+ * candidate on a `list_candidates` page.
+ */
+export const CANDIDATE_ROW_TOOLS: ReadonlySet<string> = new Set([
+  "list_candidates",
+  "get_candidate",
+]);
+
 export const CANDIDATE_SUBSTANCE_TOOLS: ReadonlySet<string> = new Set([
   "list_applications",
   "get_application",
@@ -986,6 +1185,20 @@ async function applyCandidatePrivacyGate(
     // propagates, because that is the caller giving up rather than a scoping failure.
     let verdict: "keep" | "withhold";
     try {
+      if (CANDIDATE_ROW_TOOLS.has(toolName)) {
+        // Private — kept only where Greenhouse itself grants this actor private access, exactly as
+        // the join-backed branch below decides it.
+        verdict =
+          row.private === false || (await actorHoldsPrivateAccessToRow(row, context))
+            ? "keep"
+            : "withhold";
+        if (verdict === "withhold") {
+          withheld += 1;
+          continue;
+        }
+        kept.push(row);
+        continue;
+      }
       const candidateId = await resolveRowCandidateId(row, context);
       if (candidateId === null) {
         // Not candidate substance at all (a job, an opening, a dictionary row) — nothing to gate,

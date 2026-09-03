@@ -93,6 +93,7 @@ describe("production scoped reader configuration", () => {
       } as NodeJS.ProcessEnv);
       const reader = createProductionScopedReader(identityDirectoryForUser(900), {
         OPERATOR_ACTOR_IDS: "900",
+        ...ATTESTED_DIRECTORY_ENV,
       } as NodeJS.ProcessEnv);
 
       const result = await reader.scopedRead(testSession(), "list_applications", {});
@@ -105,6 +106,52 @@ describe("production scoped reader configuration", () => {
         { id: 2, jobs: [{ id: 222 }], candidate_id: 502 },
       ]);
       assert.equal(calls.some((url) => url.includes("/user_job_permissions")), false);
+      assert.equal(
+        calls.some((url) => url.includes("/rest/v1/recruiter_identity_directory")),
+        true,
+        "the operator path has no permission scope to read the attestation off, so it must look it up"
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      _resetClientState();
+    }
+  });
+
+  it("gates an UNATTESTED operator's read through the same production wiring", async () => {
+    // The end-to-end proof that createProductionScopedReader hands the lookup to the operator path:
+    // the same fixture, the same operator, one directory row whose attestation is false — and the
+    // private candidate's application no longer comes back.
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+    globalThis.fetch = fakeGreenhouseFetch(calls, { attested: false, privateCandidateIds: new Set([502]) });
+    try {
+      _resetClientState();
+      configureGreenhouseFromEnv({
+        GREENHOUSE_CLIENT_ID: "client-id",
+        GREENHOUSE_CLIENT_SECRET: "client-secret",
+      } as NodeJS.ProcessEnv);
+      const reader = createProductionScopedReader(identityDirectoryForUser(900), {
+        OPERATOR_ACTOR_IDS: "900",
+        ...ATTESTED_DIRECTORY_ENV,
+        // Own TTL so this gets its own entry in the module-scoped registries rather than a memo
+        // another case warmed.
+        GREENHOUSE_RECRUITER_PERMISSION_TTL_MS: "0",
+        GREENHOUSE_RECRUITER_READ_CACHE_DISABLED: "true",
+      } as NodeJS.ProcessEnv);
+
+      const result = await reader.scopedRead(testSession(), "list_applications", {});
+
+      assert.equal(result.ok, true);
+      assert.equal(result.ok && result.scoped, true);
+      assert.deepEqual(result.ok && result.permissionScope, {
+        kind: "operator",
+        permittedJobCount: null,
+        privateCandidatesWithheld: true,
+      });
+      assert.deepEqual(result.ok && result.data, [{ id: 1, jobs: [{ id: 111 }], candidate_id: 501 }]);
+      assert.equal(result.ok && result.rowCounts.privacyWithheld, 1);
+      assert.equal(calls.some((url) => url.includes("/user_job_permissions")), false,
+        "an unattested operator is still an operator: no permission sweep, only a privacy gate");
     } finally {
       globalThis.fetch = originalFetch;
       _resetClientState();
@@ -237,11 +284,24 @@ function identityDirectoryForUser(greenhouseUserId: number) {
   ]);
 }
 
-function fakeGreenhouseFetch(calls: string[]): typeof fetch {
+// The canonical identity-directory project, so the attestation lookup is configured the way
+// production configures it. The service-role value is a test literal and is never printed.
+const ATTESTED_DIRECTORY_ENV = {
+  GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_URL: "https://ibxvxmfhovmththllwoi.supabase.co",
+  GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_KEY: "test-service-role-key",
+};
+
+function fakeGreenhouseFetch(
+  calls: string[],
+  directory: { attested: boolean; privateCandidateIds?: ReadonlySet<number> } = { attested: true }
+): typeof fetch {
   return async (input) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     calls.push(url);
 
+    if (url.includes("/rest/v1/recruiter_identity_directory")) {
+      return jsonResponse([{ private_candidates_attested: directory.attested }]);
+    }
     if (url === "https://auth.greenhouse.io/token") {
       return jsonResponse({
         access_token: "test-access-token",
@@ -261,7 +321,7 @@ function fakeGreenhouseFetch(calls: string[]): typeof fetch {
       ]);
     }
     if (parsed.pathname === "/v3/candidates") {
-      return jsonResponse(candidatePrivacyRows(parsed));
+      return jsonResponse(candidatePrivacyRows(parsed, directory.privateCandidateIds));
     }
 
     return new Response("not found", { status: 404 });
@@ -270,12 +330,15 @@ function fakeGreenhouseFetch(calls: string[]): typeof fetch {
 
 // Applications carry `candidate_id` in the v3 default field set, and the scoped reader now resolves
 // each kept row's "View Private Candidates" state through it. Neither candidate here is private.
-function candidatePrivacyRows(parsed: URL): { id: number; private: boolean }[] {
+function candidatePrivacyRows(
+  parsed: URL,
+  privateCandidateIds: ReadonlySet<number> = new Set()
+): { id: number; private: boolean }[] {
   return (parsed.searchParams.get("ids") ?? "")
     .split(",")
     .map((id) => Number(id))
     .filter((id) => Number.isInteger(id) && id > 0)
-    .map((id) => ({ id, private: false }));
+    .map((id) => ({ id, private: privateCandidateIds.has(id) }));
 }
 
 function countCalls(calls: string[], fragment: string): number {

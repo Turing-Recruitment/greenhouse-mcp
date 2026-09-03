@@ -93,7 +93,13 @@ function permissionProvider(
     async getPermittedJobIds(actorId: number) {
       calls.push(actorId);
       const permissions = jobIdsForActor.get(actorId) ?? [];
-      return permissions === "all" ? { kind: "all" as const } : new Set(permissions);
+      // "all" here means an ATTESTED org-wide actor: an operator has recorded that Greenhouse grants
+      // them the "Can create and view private candidates" permission, so their read is the raw,
+      // unfiltered one these tests describe. The unattested case has its own suite
+      // (private-candidate-attestation.test.ts) — it is a different read, not a variation on this.
+      return permissions === "all"
+        ? { kind: "all" as const, privateCandidatesAttested: true }
+        : new Set(permissions);
     },
   };
 }
@@ -151,7 +157,7 @@ function rawReader(
 }
 
 describe("scoped Greenhouse read wrapper", () => {
-  it("lets operator actors read unscoped data without loading permissions", async () => {
+  it("lets attested operator actors read unscoped data without loading permissions", async () => {
     const raw = rawReader((path) => {
       assert.equal(path, "/applications");
       return [
@@ -165,6 +171,9 @@ describe("scoped Greenhouse read wrapper", () => {
       permissionProvider: permissionProvider(new Map([[100, [1]]]), permissionCalls),
       rawReader: raw,
       operatorActorIds: new Set([900]),
+      // The direct-operator path bypasses the permission provider entirely, so the attestation is
+      // asked for here rather than read off a scope. Unattested operators are covered separately.
+      privateCandidateAttestation: async () => true,
     });
 
     const result = await scoped.scopedRead(900, "list_applications", {});
@@ -1923,7 +1932,7 @@ describe("scoped Greenhouse read wrapper", () => {
       actorResolver: actorResolver(),
       permissionProvider: {
         async getPermittedJobIds() {
-          return { kind: "all", excludedJobIds: new Set([2]) };
+          return { kind: "all", excludedJobIds: new Set([2]), privateCandidatesAttested: true };
         },
       },
       rawReader: raw,
@@ -1948,13 +1957,13 @@ describe("scoped Greenhouse read wrapper", () => {
   it("keeps an org-wide read raw and unfiltered when nothing is excluded", async () => {
     // The fast path must survive: a tenant with no confidential jobs pays nothing for this.
     //
-    // What this test does NOT assert: that an org-wide actor is entitled to private candidates.
-    // It once did, via a bare "no privacy joins on a raw org-wide read" — which read as an
-    // endorsement of an inference nobody had sourced. Greenhouse's own documentation says the
-    // opposite: "A Site Admin user requires the user-specific permission Can create and view
-    // private candidates" (support article 115002695663). No API exposes whether a given admin holds
-    // it, so the org-side answer is still open; see the phase-1 fold ledger. Until it is answered
-    // the join count below is a statement about the fast path's SHAPE, nothing more.
+    // The open question this test used to name — "no API exposes whether a given admin holds the
+    // user-specific 'Can create and view private candidates' permission" (Greenhouse support
+    // article 115002695663), so the fast path's lack of a privacy join was a statement about its
+    // SHAPE and not a ruling — is now answered, and answered outside the API: an operator attests
+    // the permission per directory row, and the flag rides in on the permission scope. So this test
+    // says what it always meant to: an ATTESTED org-wide actor pays nothing for the gate.
+    // The unattested actor's read is a different read, and it has its own suite.
     const raw = rawReader(() => [
       { id: 10, job_id: 1 },
       { id: 20, job_id: 2 },
@@ -1963,7 +1972,7 @@ describe("scoped Greenhouse read wrapper", () => {
       actorResolver: actorResolver(),
       permissionProvider: {
         async getPermittedJobIds() {
-          return { kind: "all", excludedJobIds: new Set<number>() };
+          return { kind: "all", excludedJobIds: new Set<number>(), privateCandidatesAttested: true };
         },
       },
       rawReader: raw,
@@ -1980,9 +1989,7 @@ describe("scoped Greenhouse read wrapper", () => {
       raw.calls.filter((call) => call.path === "/candidates").length,
       0,
       "the fast path performs no per-row parent joins of ANY kind — that is what makes it the fast " +
-        "path. This is a consequence of skipping the filtering pass, not a ruling that org-wide " +
-        "actors may read private candidates; when that question is answered, the fix belongs in the " +
-        "scope resolver and this assertion changes with it."
+        "path, and an attested org-wide actor keeps it in full."
     );
   });
 

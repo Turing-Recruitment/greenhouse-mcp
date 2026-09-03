@@ -923,6 +923,7 @@ function emptyRows(): RowsResult {
     rawRowsRead: 0,
     rowsReturnedRead: 0,
     permissionExcluded: 0,
+    privacyWithheld: 0,
     unresolvedRows: 0,
     pagesRead: 0,
     status: "complete",

@@ -82,6 +82,27 @@ function memoizePermissionScope(provider: PermissionProviderLike, ttlMs: number)
   };
 }
 
+/**
+ * The attestation ages on the same clock as the permission scope it decides.
+ *
+ * The provider path already gets this for free — the stamp runs inside `memoizePermissionScope`.
+ * The direct-operator path does not: it reads before the provider chain runs, so without this every
+ * operator read would cost its own PostgREST lookup. TTL 0 (which production forces) passes the
+ * lookup straight through, exactly as the permission memo does.
+ */
+function memoizeAttestationLookup(
+  lookup: PrivateCandidateAttestationLookup,
+  ttlMs: number
+): PrivateCandidateAttestationLookup {
+  if (ttlMs <= 0) return lookup;
+  const memo = createTtlMemo<number, boolean>({
+    ttlMs,
+    load: (userId, signal) => lookup(userId, signal),
+    cancelledMessage: "Private-candidate attestation lookup was cancelled by the caller.",
+  });
+  return (userId, signal) => memo(userId, signal);
+}
+
 export function createProductionScopedReader(
   identityDirectory: IdentityDirectory,
   env: NodeJS.ProcessEnv = process.env
@@ -94,7 +115,7 @@ export function createProductionScopedReader(
   const cachedRawReader = createCachingRawReader(rawReader, readReadCacheConfig(env));
   const ttlMs = readPermissionTtlMs(env);
   const disableSiteAdmin = readBooleanEnvFlag(env, "GREENHOUSE_RECRUITER_DISABLE_SITE_ADMIN_ALL_ACCESS");
-  const attestationLookup = getPrivateCandidateAttestationLookup(env);
+  const attestationLookup = memoizeAttestationLookup(getPrivateCandidateAttestationLookup(env), ttlMs);
   const providerKey = [
     `ttl:${ttlMs}`,
     `siteadmin:${disableSiteAdmin ? "off" : "on"}`,
@@ -132,6 +153,10 @@ export function createProductionScopedReader(
     // unaccounted staleness layer on top of the permission TTL for one authorization input.
     authorizationReader: rawReader,
     actorResolver: createIdentityActorResolver(identityDirectory),
+    // The direct-operator path returns raw data before the permission provider runs, so it cannot
+    // read the flag the provider stamps onto a scope. It gets the lookup itself; an operator whose
+    // attestation cannot be established is unattested, never assumed.
+    privateCandidateAttestation: attestationLookup,
     permissionProvider: permissionProvider as Parameters<typeof createScopedGreenhouseReader>[0]["permissionProvider"],
     scopePolicyRegistry: SCOPED_TOOL_SCOPE_POLICIES,
     operatorActorIds:

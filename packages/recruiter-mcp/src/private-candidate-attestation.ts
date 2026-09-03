@@ -114,7 +114,10 @@ export function readPrivateCandidateAttestationAccess(
  */
 export function createPrivateCandidateAttestationLookup(
   env: NodeJS.ProcessEnv = process.env,
-  fetchImpl: typeof fetch = fetch,
+  // Resolved per REQUEST, not captured here: the lookup is built once per env fingerprint and
+  // outlives many requests, so binding whatever `globalThis.fetch` happened to be at construction
+  // time would freeze one moment's transport for the life of the process.
+  fetchImpl?: typeof fetch,
   warn: (message: string) => void = (message) => console.warn(message)
 ): PrivateCandidateAttestationLookup {
   let access: PrivateCandidateAttestationAccess | null;
@@ -150,7 +153,7 @@ export function createPrivateCandidateAttestationLookup(
     let response: Response;
     try {
       response = await fetchWithTimeout(
-        fetchImpl,
+        fetchImpl ?? fetch,
         url,
         {
           method: "GET",
