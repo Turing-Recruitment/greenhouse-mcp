@@ -6,7 +6,8 @@ import {
   type RawReadClient,
   type ReadParams,
 } from "../../scoped-core/src/index.js";
-import { buildHireFacts } from "../src/facts.js";
+import { buildHireFacts, classifyOfferStatus } from "../src/facts.js";
+import { getHarvestEndpointByPath } from "../src/harvest-v3-registry.js";
 import { HIRE_FACTS_OFFER_READ_PARAM_NAMES } from "../src/limits.js";
 import { readHireSet } from "../src/tools/hire-facts.js";
 import { bracketParamsForWindows, readAllWithDateFallback } from "../src/tools/read-with-date-fallback.js";
@@ -562,6 +563,43 @@ describe("H4 buildHireFacts — dating a hire honestly", () => {
     assert.ok(built.omissions.some((line) => /not Accepted/.test(line)));
   });
 
+  // The status is classified against the ENUM the vendored contract publishes for
+  // /v3/offers.status — Created / Accepted / Rejected / Deprecated — not by substring. A substring
+  // read made "Not Accepted" a hire, which is the exact opposite of what the row says.
+  it("classifies against the /v3/offers status enum the generated registry publishes", () => {
+    const statusParam = getHarvestEndpointByPath("/v3/offers")?.parameters?.find((param) => param.name === "status");
+    assert.deepStrictEqual(
+      statusParam?.enumValues,
+      ["Created", "Accepted", "Rejected", "Deprecated"],
+      "the contract's own enum is the list this classifier is written against"
+    );
+    assert.deepStrictEqual(
+      (statusParam?.enumValues ?? []).map((value) => classifyOfferStatus(value)),
+      ["outstanding", "accepted", "rejected", "superseded"]
+    );
+  });
+
+  it("does not read 'Not Accepted' as a hire, and tolerates case and whitespace on the real value", () => {
+    const built = buildHireFacts([
+      offerRow(1, { status: "ACCEPTED " }),
+      offerRow(2, { status: "Not Accepted" }),
+    ]);
+
+    assert.deepStrictEqual(built.facts.map((fact) => fact.offer_id), [1], "'Not Accepted' is a refusal, not a hire");
+    assert.equal(classifyOfferStatus("Not Accepted"), "unknown");
+    assert.equal(classifyOfferStatus("ACCEPTED "), "accepted");
+  });
+
+  it("counts a status it does not recognize as an omission rather than guessing at it", () => {
+    const built = buildHireFacts([offerRow(1), offerRow(2, { status: "Verbal yes" })]);
+
+    assert.deepStrictEqual(built.facts.map((fact) => fact.offer_id), [1]);
+    assert.ok(
+      built.omissions.some((line) => /Verbal yes/.test(line) && /not.*recognized|unrecognized/i.test(line)),
+      `the unrecognized value is named, got ${JSON.stringify(built.omissions)}`
+    );
+  });
+
   it("carries the offer's custom_fields, starts_on, version and opening_id", () => {
     const built = buildHireFacts([
       offerRow(1, { starts_on: "2026-07-01", version: 3, custom_fields: { base_salary: { amount: "1", currency_code: "USD" } } }),
@@ -618,19 +656,33 @@ const ORG_WIDE_500_HIRE_UPSTREAM_READ_CEILING = 30;
 // scoped-core change and a follow-up, not this fold. The live blast radius is
 // bounded because an ATTESTED actor takes the raw fast path and never walks at
 // all; only unattested all-access actors pay this.
+//
+// MEASURED WITH PAGINATION (Greenhouse pages at 500): 85 upstream reads, not the
+// 82 the single-page fixture reported — 1 rejected bracket attempt, 4 /offers
+// pages, 40 /applications and 40 /candidates batches. 17 reads per 100 rows
+// returned.
 const UNWINDOWED_2000_ROW_UPSTREAM_READ_CEILING = 90;
 
 function countingOfferReader(offers: Array<Record<string, unknown>>) {
   const calls: Array<{ path: string; params?: ReadParams }> = [];
   const rawReader: RawReadClient = {
-    async read<T>(path: string, params?: ReadParams): Promise<ApiResponse<T>> {
+    async read<T>(path: string, params?: ReadParams, cursor?: string): Promise<ApiResponse<T>> {
       calls.push({ path, params });
       if (path === "/offers") {
         // The live behaviour: every date filter the vendored contract advertises is rejected.
         if (Object.keys(params ?? {}).some((key) => /\[(gte|lte|gt|lt)\]$/.test(key))) {
           throw new Error("Greenhouse API error: 422 Unprocessable Entity (/offers) [correlation_id=test]");
         }
-        return { data: offers as T, nextCursor: null };
+        // And the other live behaviour this fixture used to skip: Greenhouse PAGES. Handing back
+        // 2,000 rows in one response measured a read that cannot happen, and hid four pages of
+        // cost behind one call.
+        // The cursor is the reader's THIRD argument, never a param (scoped-core refuses to combine
+        // the two), so a fake that reads params.cursor pages for ever against a cursor guard.
+        const perPage = Number(params?.per_page ?? 500);
+        const start = cursor === undefined ? 0 : Number(cursor);
+        const page = offers.slice(start, start + perPage);
+        const nextStart = start + perPage;
+        return { data: page as T, nextCursor: nextStart < offers.length ? String(nextStart) : null };
       }
       if (path === "/applications") {
         const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
@@ -698,7 +750,9 @@ describe("H-cost readHireSet — upstream read cost for an org-wide hire read", 
     assert.equal(result.hires.length, 500, "the local window keeps a quarter of what the walk paid for");
     assert.deepStrictEqual(
       byPath(calls),
-      { "/offers": 2, "/applications": 40, "/candidates": 40 },
+      // 1 rejected bracket attempt + 4 pages of 500, then the privacy walk paying 50 ids at a time
+      // over both carriers on every page: 4 x (10 + 10).
+      { "/offers": 5, "/applications": 40, "/candidates": 40 },
       "the walk is priced on the UNWINDOWED set — this is the cost the scoped-core follow-up removes"
     );
     assert.ok(

@@ -504,6 +504,15 @@ export interface ReconciliationCount {
   value: number | null;
   /** True when no read was made for this count. Distinct from a genuine zero. */
   not_read: boolean;
+  /**
+   * True when the read behind this count STOPPED EARLY (a deadline, a rate limit, a chunk that
+   * never ran), so `value` is a floor rather than the number. Rendered as "at least N".
+   *
+   * Every count used to be reported as exact whatever its read had done, so a bridge that timed
+   * out after one 50-id batch printed "50 of those applications are marked hired" beside a
+   * complete offer count — the confident wrong number this line exists to prevent.
+   */
+  partial: boolean;
   /** The field this count is dated on. Three counts, three clocks. */
   clock: string;
   window_label: string;
@@ -586,10 +595,12 @@ export async function reconciliationLine(
     ...base,
     value: hireFacts.facts.length,
     not_read: false,
+    partial: !hireSet.read.complete,
     clock: "offers.resolved_at",
     privacy_withheld: hireSet.read.privacyWithheld,
     dated_from_fallback: datedFromSentOn,
     notes: [
+      ...floorNotes(hireSet.read.complete, "the hire read", hireSet.read.status),
       ...(hireSet.read.windowAppliedLocally
         ? ["the upstream rejected the resolved_at filter, so the window was applied locally to the complete scoped set"]
         : []),
@@ -607,17 +618,25 @@ export async function reconciliationLine(
           ? Number((hireSet.chain.length / hireFacts.facts.length).toFixed(2))
           : null,
         not_read: false,
+        // A ratio over a short numerator or a short denominator is not a floor, it is simply
+        // uncertain — so it is flagged partial and the sentence says which read stopped.
+        partial: !hireSet.read.complete || hireSet.chainRead?.complete === false,
         clock: "offers.resolved_at (accepted set), counted across every version",
         privacy_withheld: hireSet.chainRead?.privacyWithheld ?? 0,
         dated_from_fallback: 0,
-        notes: hireFacts.facts.length > 0
-          ? []
-          : ["there are no hires in this window, so offer rows per hire has no denominator"],
+        notes: [
+          ...floorNotes(hireSet.read.complete, "the hire read", hireSet.read.status),
+          ...floorNotes(hireSet.chainRead?.complete !== false, "the offer version chain read", hireSet.chainRead?.status ?? "complete"),
+          ...(hireFacts.facts.length > 0
+            ? []
+            : ["there are no hires in this window, so offer rows per hire has no denominator"]),
+        ],
       }
     : {
         ...base,
         value: null,
         not_read: true,
+        partial: false,
         clock: "offers.resolved_at (accepted set), counted across every version",
         privacy_withheld: 0,
         dated_from_fallback: 0,
@@ -655,6 +674,7 @@ export async function reconciliationLine(
         ...base,
         value: null,
         not_read: true,
+        partial: false,
         clock: "applications.status (point-in-time, not dated)",
         privacy_withheld: 0,
         dated_from_fallback: 0,
@@ -664,12 +684,18 @@ export async function reconciliationLine(
         ...base,
         value: bridged.rows.filter((row) => normalizedText(row.status) === "hired").length,
         not_read: false,
+        // The hire read bounds this count too: a bridge keyed off a short accepted set is short.
+        partial: !bridged.read.complete || !hireSet.read.complete,
         // Deliberately NOT dated: /v3/applications carries no hire timestamp, so this count is a
         // snapshot of the accepted set's applications as they stand right now.
         clock: "applications.status (point-in-time, not dated)",
         privacy_withheld: bridged.read.privacyWithheld,
         dated_from_fallback: 0,
-        notes: ["Greenhouse sets status=hired only once the hire endpoint has fired, so this count trails the accepted-offer count rather than contradicting it"],
+        notes: [
+          "Greenhouse sets status=hired only once the hire endpoint has fired, so this count trails the accepted-offer count rather than contradicting it",
+          ...floorNotes(bridged.read.complete, "the applications bridge", bridged.read.status),
+          ...floorNotes(hireSet.read.complete, "the hire read", hireSet.read.status),
+        ],
       };
   if (bridged.kind === "failed") {
     warnings.push(bridged.warning);
@@ -689,6 +715,7 @@ export async function reconciliationLine(
       applications_status_hired_scope_all_time = {
         value: null,
         not_read: true,
+        partial: false,
         clock: "applications.status (point-in-time, not dated)",
         window_label: "all time",
         scope_label: scope.label,
@@ -703,6 +730,7 @@ export async function reconciliationLine(
       applications_status_hired_scope_all_time = {
         value: allTime.hired,
         not_read: false,
+        partial: !allTime.read.complete,
         clock: "applications.status (point-in-time, not dated)",
         window_label: "all time",
         scope_label: scope.label,
@@ -710,6 +738,7 @@ export async function reconciliationLine(
         dated_from_fallback: 0,
         notes: [
           "this count is NOT windowed — it is every hired application in scope, whenever it was hired",
+          ...floorNotes(allTime.read.complete, "the all-time hired-application read", allTime.read.status),
           ...(allTime.rowsNotHired > 0
             ? [`${allTime.rowsNotHired} row(s) the status=hired filter returned do not carry status=hired and were excluded here`]
             : []),
@@ -736,6 +765,7 @@ export async function reconciliationLine(
         ...base,
         value: openings.hireClosed,
         not_read: false,
+        partial: openings.status !== "complete",
         clock: "openings.closed_at",
         privacy_withheld: openings.privacyWithheld,
         dated_from_fallback: 0,
@@ -745,6 +775,7 @@ export async function reconciliationLine(
         // that had silently fallen back to a local window over an unfiltered read read as a clean
         // server-side number.
         notes: [
+          ...floorNotes(openings.status === "complete", "the closed-openings read", openings.status),
           ...(openings.windowAppliedLocally
             ? [`the upstream rejected the closed_at filter (${openings.dateParamsRejected.join(", ")}), so the window was applied locally to the complete scoped set of closed openings`]
             : []),
@@ -757,6 +788,7 @@ export async function reconciliationLine(
         ...base,
         value: null,
         not_read: true,
+        partial: false,
         clock: "openings.closed_at",
         privacy_withheld: 0,
         dated_from_fallback: 0,
@@ -1015,34 +1047,46 @@ export function hireReconciliationSummary(line: HireReconciliationLine): string 
   sentences.push(
     line.accepted_current_offers.not_read
       ? "Accepted current offers were not read."
-      : `${line.accepted_current_offers.value} accepted current offers${withheldClause(line.accepted_current_offers)}, dated on ${line.accepted_current_offers.clock} over ${line.window.label} across ${line.scope.label}${datedFromFallbackClause(line.accepted_current_offers)}.`
+      : `${countValue(line.accepted_current_offers)} accepted current offers${withheldClause(line.accepted_current_offers)}, dated on ${line.accepted_current_offers.clock} over ${line.window.label} across ${line.scope.label}${datedFromFallbackClause(line.accepted_current_offers)}.`
   );
   sentences.push(
     line.accepted_offer_applications_marked_hired.not_read
       ? `The accepted set's applications were not read${line.accepted_offer_applications_marked_hired.notes.length > 0 ? ` — ${line.accepted_offer_applications_marked_hired.notes[0]}` : "."}`
-      : `${line.accepted_offer_applications_marked_hired.value} of those applications are marked hired in Greenhouse${withheldClause(line.accepted_offer_applications_marked_hired)} — ${line.accepted_offer_applications_marked_hired.clock}, so it trails the offer count until the hire endpoint fires.`
+      : `${countValue(line.accepted_offer_applications_marked_hired)} of those applications are marked hired in Greenhouse${withheldClause(line.accepted_offer_applications_marked_hired)} — ${line.accepted_offer_applications_marked_hired.clock}, so it trails the offer count until the hire endpoint fires.`
   );
   sentences.push(
     line.openings_closed_by_hire.not_read
       ? "Openings closed by a hire were not read."
-      : `${line.openings_closed_by_hire.value} openings closed on a hire reason${withheldClause(line.openings_closed_by_hire)}, dated on ${line.openings_closed_by_hire.clock}; ${line.openings_closed_by_hire.closed_with_no_reason} closed with no reason at all and ${line.openings_closed_by_hire.closed_reason_unresolved} on a reason this read could not resolve, so neither can be called a hire or a cancel.`
+      : `${countValue(line.openings_closed_by_hire)} openings closed on a hire reason${withheldClause(line.openings_closed_by_hire)}, dated on ${line.openings_closed_by_hire.clock}; ${line.openings_closed_by_hire.closed_with_no_reason} closed with no reason at all and ${line.openings_closed_by_hire.closed_reason_unresolved} on a reason this read could not resolve, so neither can be called a hire or a cancel.`
   );
   sentences.push(
     line.offer_rows_per_hire.not_read
       ? "Superseded versions were not read, so offer rows per hire is not reported."
       : line.offer_rows_per_hire.value === null
         ? "There are no hires in this window, so offer rows per hire is undefined rather than zero."
-        : `${line.offer_rows_per_hire.value} offer rows per hire across every version${withheldClause(line.offer_rows_per_hire)}.`
+        : `${countValue(line.offer_rows_per_hire)} offer rows per hire across every version${withheldClause(line.offer_rows_per_hire)}.`
   );
   if (line.applications_status_hired_scope_all_time) {
     sentences.push(
       line.applications_status_hired_scope_all_time.not_read
         ? "The all-time hired-application count was asked for but could not be read."
-        : `Separately, and over all time rather than ${line.window.label}: ${line.applications_status_hired_scope_all_time.value} applications in scope carry status=hired${withheldClause(line.applications_status_hired_scope_all_time)}.`
+        : `Separately, and over all time rather than ${line.window.label}: ${countValue(line.applications_status_hired_scope_all_time)} applications in scope carry status=hired${withheldClause(line.applications_status_hired_scope_all_time)}.`
     );
   }
   sentences.push("These count different populations on different clocks; they are not expected to match, and no total across them is meaningful.");
   return sentences.join(" ");
+}
+
+/** Which read stopped, on the count it made a floor of. Empty when the read finished. */
+function floorNotes(complete: boolean, which: string, status: ReadAllStatus): string[] {
+  return complete
+    ? []
+    : [`${which} stopped before it had read everything in scope (${status}), so this count is a floor rather than the number`];
+}
+
+/** "at least 50" when the read behind the count stopped early; "50" when it finished. */
+function countValue(count: ReconciliationCount): string {
+  return `${count.partial ? "at least " : ""}${count.value}`;
 }
 
 /** The labeled approximation, said out loud: N of these hires are dated off the send date. */

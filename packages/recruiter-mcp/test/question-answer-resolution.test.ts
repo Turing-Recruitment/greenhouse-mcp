@@ -267,6 +267,55 @@ describe("answer_my_recruiting_question — scope resolution", () => {
     assert.ok(reader.calls.some((c) => c.toolName === "list_scorecards"));
   });
 
+  // An EXPLICITLY EMPTY job_ids is a scope the caller named — zero reqs — not an absent one.
+  // hasExactJobIds read "" and [] as false, so the planner skipped resolveAnalysisContext (which
+  // rejects an empty set) and ran anyway. On the RECIPE path each recipe re-resolved the scope and
+  // caught it; on the PLANNED-DOMAIN path (offers, openings) nothing did, and the answer came back
+  // over everything the actor's permissions reach — the one direction a scope must never move on
+  // its own. Probed at 7b2a1a5: `{question: "offer acceptance rate", job_ids: ""}` returned ok with
+  // one unfiltered list_offers read.
+  for (const [label, jobIds] of [["an empty string", ""], ["an empty array", []]] as const) {
+    it(`rejects ${label} of job_ids on the planned-domain path instead of widening it to everything the actor can see`, async () => {
+      const reader = fakeScopedReader((toolName) => {
+        throw new Error(`an explicitly empty job_ids must read nothing (called ${toolName})`);
+      });
+      const { runtime } = testRuntime(reader, {
+        scopeSigner: signer,
+        jobInventory: createFixtureInventoryProvider(fixture, "narrow_recruiter"),
+      });
+
+      const result = await runRecruitingQuestionAnswer(runtime, {
+        question: "What is our offer acceptance rate this month?",
+        job_ids: jobIds,
+      });
+
+      assert.equal(result.ok, false, "zero named reqs is a scope error, never a permission-wide answer");
+      assert.equal(result.ok === false && result.denial.code, "INVALID_REQUEST");
+      assert.deepStrictEqual(reader.calls.map((call) => call.toolName), [], "and it costs no upstream read");
+    });
+  }
+
+  it("still answers a planned-domain question with NO job_ids key over the permission-wide scope", async () => {
+    // The other half of the rule: `undefined` is not an empty scope, it is "whatever my Greenhouse
+    // permissions reach", and it stays ONE read.
+    const reader = fakeScopedReader((toolName) => scopedSuccess(toolName, [
+      { id: 1, job_id: 9001006, application_id: 101, status: "Accepted", resolved_at: "2026-06-05T10:00:00.000Z" },
+    ]));
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "narrow_recruiter"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, true);
+    const offerReads = reader.calls.filter((call) => call.toolName === "list_offers");
+    assert.equal(offerReads.length, 1, "a permission-wide planned-domain read is one read");
+    assert.equal(offerReads[0]!.params?.job_ids, undefined, "and it invents no job_ids");
+  });
+
   it("denies an inaccessible exact job_ids planner request before any analysis", async () => {
     const reader = fakeScopedReader((toolName) => {
       throw new Error(`inaccessible exact job_ids must not run analysis (called ${toolName})`);

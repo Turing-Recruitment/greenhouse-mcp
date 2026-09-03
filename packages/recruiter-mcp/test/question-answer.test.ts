@@ -1357,6 +1357,44 @@ describe("H3c the reconciliation lead never destroys a computed answer", () => {
       (data.answer.omissions as string[]).some((line) => /applications bridge behind the second count did not finish/.test(line))
     );
   });
+
+  it("does NOT hedge a multi-batch bridge that finished — the floor comes from the read status", async () => {
+    // The companion to the case above, and the one that kills the naive implementation: "more than
+    // one batch ran" is not the same fact as "the read stopped short". Both batches complete here,
+    // so the number is exact.
+    const offers = Array.from({ length: 60 }, (_, index) => ({
+      id: index + 1,
+      job_id: 10,
+      application_id: 100 + index,
+      status: "Accepted",
+      sent_on: "2026-06-01",
+      resolved_at: "2026-06-05T10:00:00.000Z",
+    }));
+    let applicationBatches = 0;
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") return scopedSuccess(toolName, offers);
+      if (toolName === "list_applications") {
+        applicationBatches += 1;
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(applicationBatches, 2, "the bridge ran two batches");
+    const message = String(data.answer.message);
+    assert.match(message, /60 of their applications are marked hired/, `an exact count for a complete read, got: ${message}`);
+    assert.ok(!/at least/.test(message), "a floor on a read that finished is a false hedge");
+    assert.equal(data.summary.completeness_status, "complete");
+  });
 });
 
 describe("H3b the planner's offer path contains its own errors", () => {

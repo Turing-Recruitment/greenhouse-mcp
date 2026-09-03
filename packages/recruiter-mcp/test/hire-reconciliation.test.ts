@@ -562,6 +562,86 @@ describe("H2d reconciliationLine — contained reads, propagated cancellation", 
 });
 
 // ---------------------------------------------------------------------------
+// H2e: a count from a read that stopped early is a FLOOR, and says so.
+//
+// Every count carried an exact value regardless of the status of the read behind
+// it, so a bridge that timed out after one batch of 50 rendered "50 of those
+// applications are marked hired" beside a complete offer count — a confident
+// wrong number, which is the failure this whole line exists to prevent.
+// ---------------------------------------------------------------------------
+describe("H2e reconciliationLine — a truncated read yields a floor, not a number", () => {
+  const SIXTY_OFFERS = Array.from({ length: 60 }, (_, index) => ({
+    id: index + 1,
+    job_id: 10,
+    application_id: 100 + index,
+    candidate_id: 1000 + index,
+    status: "Accepted",
+    sent_on: "2026-05-01",
+    resolved_at: "2026-05-10T12:00:00.000Z",
+  }));
+
+  it("marks the bridged count partial and renders 'at least N' when batch two times out", async () => {
+    let batches = 0;
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_offers") return scopedSuccess(toolName, SIXTY_OFFERS);
+      if (toolName === "list_applications") {
+        batches += 1;
+        if (batches > 1) throw new Error("SCOPED_GREENHOUSE_TOOL_TIMEOUT:deadline");
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    assert.equal(batches, 2, "the bridge really did run more than one batch");
+    const count = result.line.accepted_offer_applications_marked_hired;
+    assert.equal(count.value, 50, "the rows that did come back are real");
+    assert.equal(count.partial, true, "but they are only part of the accepted set");
+    assert.equal(result.line.accepted_current_offers.partial, false, "the offer read completed, so its count is exact");
+    const rendered = hireReconciliationSummary(result.line);
+    assert.match(rendered, /at least 50 of those applications are marked hired/);
+    assert.match(rendered, /60 accepted current offers/, "the complete count is NOT hedged");
+    assert.ok(!/at least 60 accepted/.test(rendered), "a floor on a complete read would be a false hedge");
+    assert.ok(
+      count.notes.some((note) => /stopped before every id batch|did not finish|floor/i.test(note)),
+      `the count says which read stopped, got ${JSON.stringify(count.notes)}`
+    );
+  });
+
+  it("marks the accepted-offer count itself partial when the hire read is the one that stops", async () => {
+    const jobIds = Array.from({ length: 60 }, (_, index) => 9_000_000 + index);
+    let offerChunks = 0;
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_offers" && params?.["resolved_at[gte]"] !== undefined) {
+        offerChunks += 1;
+        if (offerChunks > 1) throw new Error("SCOPED_GREENHOUSE_TOOL_TIMEOUT:deadline");
+        return scopedSuccess(toolName, SIXTY_OFFERS.slice(0, 10));
+      }
+      if (toolName === "list_offers") return scopedSuccess(toolName, []);
+      if (toolName === "list_applications") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", { jobIds, label: "60 named reqs" }, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    assert.equal(result.line.accepted_current_offers.value, 10);
+    assert.equal(result.line.accepted_current_offers.partial, true);
+    assert.match(hireReconciliationSummary(result.line), /at least 10 accepted current offers/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // H6: the offer-compensation privacy probe classifies THREE ways. "Inconclusive"
 // is a real answer here — no match, conflicting matches, or a definition row that
 // never carried `private` all mean the same thing operationally: we do not know

@@ -1545,7 +1545,13 @@ async function resolvePlannerScope(
     if (!scoped.ok) return { ok: false, code: scoped.code, message: scoped.message };
     return { ok: true, kind: "scoped", jobIds: readResolvedJobIds(scoped.params), header: scoped.header };
   }
-  if (hasExactJobIds(params.job_ids)) {
+  // KEY PRESENCE, not "is it a non-empty list". An explicitly EMPTY job_ids ("" or []) is a scope
+  // the caller named — zero reqs — and resolveAnalysisContext rejects it (analysis-context.ts,
+  // "job_ids must contain at least one Greenhouse job id"). Branching on non-emptiness skipped that
+  // check, and on the planned-domain path (offers, openings) nothing downstream repeated it: the
+  // answer came back over everything the actor's permissions reach. Same rule as the hire read's
+  // scope — `undefined` is permission-wide, `[]` is zero.
+  if (params.job_ids !== undefined && params.job_ids !== null) {
     // Exact ids are not assumed safe because they are numeric; validate and scope
     // them through the same helper the analysis tools use before any recipe runs.
     const scoped = await resolveAnalysisContext(runtime, explicitScopeParams(params), deadline);
@@ -1907,13 +1913,6 @@ function hasResolverIntent(params: Record<string, unknown>): boolean {
   );
 }
 
-function hasExactJobIds(value: unknown): boolean {
-  if (value === undefined || value === null) return false;
-  if (typeof value === "string") return value.trim().length > 0;
-  if (Array.isArray(value)) return value.length > 0;
-  return false;
-}
-
 function withPlannerJobIds(params: Record<string, unknown>, jobIds: string): Record<string, unknown> {
   const next = { ...params };
   delete next.scope_handle;
@@ -1951,11 +1950,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * tenant-defined and this tenant capitalizes), so the two cannot disagree about what "outstanding"
  * means. `Deprecated` is excluded: a superseded version is not an offer anybody is waiting on.
  */
+// The SAME classifier the mix, the hire facts and the reconciliation lead use (facts.ts). This was
+// the fourth substring reading of an offer status in one answer; an unrecognized value now reads as
+// unknown here too, so nothing is called "still open" on a guess.
 function isOutstandingOffer(fact: Record<string, unknown>): boolean {
-  const status = typeof fact.status === "string" ? fact.status.trim().toLowerCase() : "";
-  if (status.length === 0) return false;
-  if (status.includes("accept") || status.includes("reject") || status.includes("declin")) return false;
-  return !status.includes("deprecat");
+  return classifyOfferStatus(fact.status) === "outstanding";
 }
 
 /**

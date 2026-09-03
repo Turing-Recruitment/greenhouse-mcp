@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { FactBuildResult, FactCompletenessStatus } from "../src/facts.js";
-import { projectEvidenceResult } from "../src/tools/evidence-projection.js";
+import { metricsBlockedByOmittedField, projectEvidenceResult } from "../src/tools/evidence-projection.js";
 import { SCOPED_ENDPOINT_ADAPTERS_BY_EVIDENCE_TOOL } from "../src/tools/scoped-endpoint-adapters.js";
 import type { RecruiterProjectionMetadata } from "../src/types.js";
 import {
@@ -349,34 +349,42 @@ describe("METRIC_IDS_BY_REQUIRED_FIELD key set", () => {
     );
   });
 
-  it("DOES add its own blocks_answer omission wherever status is dropped — on a projection already marked incomplete", () => {
+  // An omission blocks a metric only where that metric's field actually LIVES. The map used to be
+  // keyed by field alone and consulted on every endpoint, so dropping `status` from
+  // /v3/prospect_pools — an endpoint carrying no offers at all — announced that the HIRE COUNT was
+  // blocked. That is a false blocker on a read that was fine, and it is exactly the kind of
+  // disclosure noise that teaches an operator to ignore disclosures.
+  it("does NOT attach the offer metrics to a prospect_pools projection that drops status", () => {
     const projection = statusOmittingProjection();
     assert.deepStrictEqual(
       projection.omittedFields.map((omission) => omission.field),
       ["status"],
       "the fixture omits exactly the field under test"
     );
-    const metricIds = projection.requiredFieldOmissions.map((omission) => omission.metricOrFact);
-    assert.ok(metricIds.includes("hire_count"), "registering hire_count really does add an entry here — that is the honest claim");
-    // The five that were already there. hire_count joins them; it does not create the condition.
-    for (const existing of [
-      "scorecard_submission_rate",
-      "weekly_qualified_pipeline_movement",
-      "source_quality_by_outcome",
-      "opening_fill_status",
-      "offer_resolution",
-    ]) {
-      assert.ok(metricIds.includes(existing), `${existing} already blocked on a dropped status`);
-    }
-    assert.equal(
-      projection.incompleteProjection,
-      true,
-      "and it was ALREADY incomplete for this field, so hire_count changes the disclosure's length, not its verdict"
+    assert.deepStrictEqual(
+      projection.requiredFieldOmissions.map((omission) => omission.metricOrFact).sort(),
+      // Exact equality, not `includes`: an implementation that attaches everything would satisfy
+      // any "these are present" assertion while still emitting the false hire_count blocker.
+      ["opening_fill_status", "scorecard_submission_rate", "source_quality_by_outcome", "weekly_qualified_pipeline_movement"],
+      "the offer metrics read /v3/offers, so a prospect-pool projection cannot block them"
     );
     assert.deepStrictEqual(
       [...new Set(projection.requiredFieldOmissions.map((omission) => omission.field))],
       ["status"],
       "no field other than the one omitted is implicated"
     );
+  });
+
+  it("DOES attach them where the field lives — /v3/offers", () => {
+    assert.deepStrictEqual(
+      metricsBlockedByOmittedField("/v3/offers", "status").sort(),
+      ["hire_count", "offer_resolution", "opening_fill_status", "scorecard_submission_rate", "source_quality_by_outcome", "weekly_qualified_pipeline_movement"],
+      "a projection that drops status from the OFFER rows really does block the hire count"
+    );
+    assert.deepStrictEqual(
+      metricsBlockedByOmittedField("/v3/prospect_pools", "status").sort(),
+      ["opening_fill_status", "scorecard_submission_rate", "source_quality_by_outcome", "weekly_qualified_pipeline_movement"]
+    );
+    assert.deepStrictEqual(metricsBlockedByOmittedField("/v3/offers", "candidate_id"), [], "a field no metric requires blocks nothing");
   });
 });
