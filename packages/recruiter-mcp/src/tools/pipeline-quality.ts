@@ -27,6 +27,7 @@ export const PIPELINE_QUALITY_TOOL: RecruiterToolDefinition = {
 interface ApplicationRow extends Record<string, unknown> {
   id: number | null;
   candidate_id: number | null;
+  source_id?: number | null;
   job_id: number | null;
   stage_id: number | null;
   stage_name: string | null;
@@ -43,6 +44,7 @@ interface ApplicationObservation {
   jobId: number | null;
   stageId: number | null;
   stageName: string | null;
+  sourceId: number | null;
   status: string;
   active: boolean;
   terminal: boolean;
@@ -162,13 +164,31 @@ export async function runPipelineQuality(
         windowEnd: window.windowEnd,
       }
     );
-    // Every metric in this layer buckets by created_at over a recent-weeks window, so it is fed the
-    // same INFLOW cohort the weekly series above displays — not the whole snapshot cohort, which would
-    // have made weekly_application_volume disagree with temporal.weekly_inflow beside it.
+    // Two cohorts, because this recipe genuinely has two. The WEEKLY metrics bucket by created_at
+    // over the window, so they are fed the same INFLOW cohort the weekly series above displays —
+    // otherwise weekly_application_volume disagrees with temporal.weekly_inflow beside it. But
+    // source_quality_by_outcome is not weekly at all: it groups the whole read by source and outcome.
+    // Handing it the inflow cohort emptied it silently ("No application facts with source_id were
+    // available" with rows in hand), so it keeps the full snapshot cohort.
+    // A row is in the inflow cohort when its OWN timestamp is inside the window — the same test the
+    // temporal view applies — not merely when its week is displayed, which would readmit the rows a
+    // partial edge week excluded.
     const inflowWeeks = new Set(temporal.weekly_inflow.map((bucket) => bucket.week));
-    const inflowObservations = observations.filter((row) => inflowWeeks.has(weekKey(row.applicationTimestamp) ?? ""));
+    const windowStartMs = Date.parse(window.windowStart);
+    const windowEndMs = Date.parse(window.windowEnd);
+    const inflowObservations = observations.filter((row) => {
+      const at = row.applicationTimestamp === null ? Number.NaN : Date.parse(row.applicationTimestamp);
+      if (!Number.isFinite(at) || at < windowStartMs || at > windowEndMs) return false;
+      return inflowWeeks.has(weekKey(row.applicationTimestamp) ?? "");
+    });
+    const snapshotFacts = { application_lifecycle_fact: buildApplicationLifecycleFacts(applicationFactRows(observations)) };
+    const inflowFacts = { application_lifecycle_fact: buildApplicationLifecycleFacts(applicationFactRows(inflowObservations)) };
     const factMetricLayer = buildAnalysisFactMetricLayer({
-      facts: { application_lifecycle_fact: buildApplicationLifecycleFacts(applicationFactRows(inflowObservations)) },
+      facts: snapshotFacts,
+      factsByMetricId: {
+        weekly_application_volume: inflowFacts,
+        weekly_qualified_pipeline_movement: inflowFacts,
+      },
       metricIds: [
         "weekly_application_volume",
         "weekly_qualified_pipeline_movement",
@@ -326,6 +346,7 @@ function buildObservations(applications: ApplicationRow[], windowEnd: string, st
       jobId: readApplicationJobId(row),
       stageId: readApplicationStageId(row),
       stageName: readApplicationStageName(row),
+      sourceId: readPositiveNumber(row.source_id),
       status,
       active,
       terminal: isTerminalStatus(status),
@@ -345,6 +366,10 @@ function applicationFactRows(observations: ApplicationObservation[]): Record<str
     candidate_id: row.candidateId,
     job_id: row.jobId,
     stage_id: row.stageId,
+    // source_id is one of source_quality_by_outcome's two required fields (metrics.ts). Dropping it
+    // here left that metric reporting "No application facts with source_id were available" on every
+    // read, however many sourced applications the recipe was holding.
+    source_id: row.sourceId,
     status: row.status,
     created_at: row.applicationTimestamp,
     last_activity_at: row.lastActivityAt,

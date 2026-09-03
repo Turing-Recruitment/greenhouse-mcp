@@ -3,7 +3,6 @@ import { SCORECARD_WINDOW_CLOCK } from "./analysis-window-copy.js";
 import {
   SCORECARD_MISSING_BASIS_DISCLOSURE,
   SCORECARD_WINDOW_BASIS_LABEL,
-  countScorecardWindowPartitions,
   partitionScorecardByWindow,
   readScorecardsForWindow,
   scorecardWindowBasis,
@@ -92,7 +91,7 @@ export async function runInterviewFeedbackDrag(
     // /v3/scorecards has NO job_ids filter and Harvest v3 REJECTS it with 422 (it does not
     // ignore it), so job_ids is never forwarded to the scorecard read below. A narrowed scope
     // is bridged job -> application_ids and scorecards are read by application_ids
-    // (readScorecardRowsForJobScope). An undefined job_ids means "all permitted jobs", unchanged.
+    // (readScorecardsForWindow's one derive hop). An undefined job_ids means "all permitted jobs".
     const requestedJobIds = parseRequestedJobIds(params.job_ids);
     const window = resolveAnalysisWindow(params, runtime.now, 30);
     // A caller-stated window (explicit params, or a time phrase in the question forwarded by the
@@ -125,33 +124,37 @@ export async function runInterviewFeedbackDrag(
       return auditDenied ?? scorecards.result;
     }
 
-    // Every row read lands in exactly ONE partition (the two below plus submitted_before_interview,
-    // counted after the observations are built), so the completeness identity holds:
-    // total_records_in_scope === records_analyzed + records_excluded. It did not before: rows with no
-    // basis and rows whose submission predates their interview were dropped silently and UNCOUNTED,
-    // which made analysis-result.ts flag an accounting mismatch on every such read.
-    const windowPartitions = countScorecardWindowPartitions(scorecards.rows, window.windowStart, window.windowEnd);
-    const windowed = scorecards.rows.filter(
-      (row) => partitionScorecardByWindow(row, window.windowStart, window.windowEnd) === "in_window"
-    );
-    const outsideWindowCount = windowPartitions.outside_window;
-    const missingBasisCount = windowPartitions.missing_basis;
-    const applicationJobIds = await loadApplicationJobIds(runtime, windowed, deadline);
+    // ONE partition per row, decided in a fixed precedence: missing_basis, then outside_window, then
+    // submitted_before_interview, then in_window. Every count below is therefore disjoint and they sum
+    // to the rows read, which is what makes the completeness identity
+    // total_records_in_scope === records_analyzed + records_excluded true. Counting the window
+    // partition and the submitted-before-interview drop independently gave a row TWO memberships (3
+    // rows, 4 memberships on the D2b fixture) and told the reader a card was both analysed in-window
+    // and excluded.
+    const partitions = partitionFeedbackRows(scorecards.rows, window);
+    const windowedEntries = partitions.inWindow;
+    const outsideWindowCount = partitions.outsideWindow;
+    const missingBasisCount = partitions.missingBasis;
+    const submittedBeforeInterview = partitions.submittedBeforeInterview;
+    const applicationJobIds = await loadApplicationJobIds(runtime, windowedEntries.map((entry) => entry.row), deadline);
     if (applicationJobIds.denial) {
       const result = deny(toolName, applicationJobIds.denial.code, applicationJobIds.denial.message);
       const auditDenied = await emitAnalysisAudit(runtime, startedAt, correlationId, result, null, null, actAsUser);
       return auditDenied ?? result;
     }
-    const resolvableToAnyJob = filterRowsWithResolvedApplicationJob(windowed, applicationJobIds);
-    const unresolvedAssociationCount = windowed.length - resolvableToAnyJob.length;
+    const resolvableToAnyJob = windowedEntries.filter((entry) =>
+      hasResolvedApplicationJob(entry.row, applicationJobIds)
+    );
+    const unresolvedAssociationCount = windowedEntries.length - resolvableToAnyJob.length;
     // Re-apply the resolved job scope: because /v3/scorecards could not filter by job, a
     // narrowed request would otherwise analyze every permitted job's scorecards.
-    const resolvableScorecards = requestedJobIds
-      ? resolvableToAnyJob.filter((row) =>
-          requestedJobIds.has(applicationJobIds.jobIdsByApplication.get(row.application_id as number) as number))
+    const inScopeEntries = requestedJobIds
+      ? resolvableToAnyJob.filter((entry) =>
+          requestedJobIds.has(applicationJobIds.jobIdsByApplication.get(entry.row.application_id as number) as number))
       : resolvableToAnyJob;
-    const outOfScopeCount = resolvableToAnyJob.length - resolvableScorecards.length;
-    const { observations, submittedBeforeInterview } = buildObservations(resolvableScorecards, window.windowEnd, dueDays);
+    const outOfScopeCount = resolvableToAnyJob.length - inScopeEntries.length;
+    const resolvableScorecards = inScopeEntries.map((entry) => entry.row);
+    const observations = buildObservations(inScopeEntries, dueDays);
     const rankings = buildRankings(observations, applicationJobIds, dueDays)
       .slice(0, maxRankings)
       .map((entry, index) => ({
@@ -209,9 +212,12 @@ export async function runInterviewFeedbackDrag(
       read_warnings: scorecards.warnings,
       data_quality: {
         window_basis: SCORECARD_WINDOW_BASIS_LABEL,
-        in_window: windowPartitions.in_window,
-        outside_window: windowPartitions.outside_window,
-        missing_basis: windowPartitions.missing_basis,
+        // Disjoint by construction: in_window counts the rows that are in-window AND carry a
+        // measurable feedback delay, so a submitted-before-interview card appears in exactly one of
+        // these and the four sum to rows_fetched.
+        in_window: windowedEntries.length,
+        outside_window: outsideWindowCount,
+        missing_basis: missingBasisCount,
         submitted_before_interview: submittedBeforeInterview,
         missing_basis_note: SCORECARD_MISSING_BASIS_DISCLOSURE,
         submitted_before_interview_note:
@@ -312,30 +318,60 @@ async function loadApplicationJobIds(runtime: RecruiterToolRuntime, scorecards: 
   return loadApplicationJobIdsFromScopedList(runtime, appIds, deadline);
 }
 
+interface WindowedFeedbackRow {
+  row: ScorecardRow;
+  /** Days from the interview (or submission) basis to submission, or to window_end when unsubmitted. */
+  delayDays: number;
+}
+
+interface FeedbackRowPartitions {
+  inWindow: WindowedFeedbackRow[];
+  outsideWindow: number;
+  missingBasis: number;
+  submittedBeforeInterview: number;
+}
+
 /**
- * Rows that reach here are already in-window, so the only drop left is a card whose submission
- * PRECEDES its interview (daysBetween returns null on a negative span). It is returned as a count
- * rather than swallowed, so the caller can report it as its own exclusion reason.
+ * Assign every row read exactly one partition, in precedence order, and carry the measured delay
+ * forward so nothing downstream can drop a row without counting it.
+ *
+ * A card whose submitted_at PRECEDES its interviewed_at yields no measurable delay (daysBetween is
+ * null on a negative span). That is a property of the row itself, not of the job scope, so it is
+ * decided here — before the application -> job bridge — and the row never reaches the observations.
  */
-function buildObservations(
-  scorecards: ScorecardRow[],
-  windowEnd: string,
-  dueDays: number
-): { observations: FeedbackObservation[]; submittedBeforeInterview: number } {
-  const observations: FeedbackObservation[] = [];
-  let submittedBeforeInterview = 0;
-  for (const row of scorecards) {
-    const basis = scorecardWindowBasis(row);
-    if (basis === null) continue; // unreachable: partitioned out as missing_basis before this point.
-    const submitted = isSubmittedScorecard(row);
-    const delayDays = submitted && row.submitted_at
-      ? daysBetween(basis, row.submitted_at)
-      : daysBetween(basis, windowEnd);
-    if (delayDays === null) {
-      submittedBeforeInterview += 1;
+function partitionFeedbackRows(
+  rows: ScorecardRow[],
+  window: { windowStart: string; windowEnd: string }
+): FeedbackRowPartitions {
+  const partitions: FeedbackRowPartitions = { inWindow: [], outsideWindow: 0, missingBasis: 0, submittedBeforeInterview: 0 };
+  for (const row of rows) {
+    const partition = partitionScorecardByWindow(row, window.windowStart, window.windowEnd);
+    if (partition === "missing_basis") {
+      partitions.missingBasis += 1;
       continue;
     }
-    observations.push({
+    if (partition === "outside_window") {
+      partitions.outsideWindow += 1;
+      continue;
+    }
+    const basis = scorecardWindowBasis(row)!;
+    const delayDays = isSubmittedScorecard(row) && row.submitted_at
+      ? daysBetween(basis, row.submitted_at)
+      : daysBetween(basis, window.windowEnd);
+    if (delayDays === null) {
+      partitions.submittedBeforeInterview += 1;
+      continue;
+    }
+    partitions.inWindow.push({ row, delayDays });
+  }
+  return partitions;
+}
+
+/** Rows reaching here are in-window, in-scope, and already carry a measurable delay. */
+function buildObservations(entries: WindowedFeedbackRow[], dueDays: number): FeedbackObservation[] {
+  return entries.map(({ row, delayDays }) => {
+    const submitted = isSubmittedScorecard(row);
+    return {
       scorecardId: readPositiveNumber(row.id),
       applicationId: readPositiveNumber(row.application_id),
       personId: readScorecardPersonId(row),
@@ -343,9 +379,8 @@ function buildObservations(
       late: delayDays > dueDays,
       unsubmitted: !submitted,
       delayDays,
-    });
-  }
-  return { observations, submittedBeforeInterview };
+    };
+  });
 }
 
 function buildRankings(
@@ -383,14 +418,12 @@ function buildRankings(
   return [...byPerson.values()].sort((a, b) => severityScore(b, dueDays) - severityScore(a, dueDays) || b.lateOrUnsubmitted - a.lateOrUnsubmitted || a.personKey.localeCompare(b.personKey));
 }
 
-function filterRowsWithResolvedApplicationJob(
-  scorecards: ScorecardRow[],
+function hasResolvedApplicationJob(
+  row: ScorecardRow,
   applications: { jobIdsByApplication: Map<number, number | null> }
-): ScorecardRow[] {
-  return scorecards.filter((row) => {
-    if (!isPositiveInteger(row.application_id)) return false;
-    return isPositiveInteger(applications.jobIdsByApplication.get(row.application_id));
-  });
+): boolean {
+  if (!isPositiveInteger(row.application_id)) return false;
+  return isPositiveInteger(applications.jobIdsByApplication.get(row.application_id));
 }
 
 function severityScore(entry: FeedbackAccumulator, dueDays: number): number {

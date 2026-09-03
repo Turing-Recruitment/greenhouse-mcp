@@ -79,8 +79,10 @@ describe("recruiting question planner", () => {
     assert.deepStrictEqual(data.summary.plan.requiredEndpoints, ["/v3/applications", "/v3/scorecards"]);
     assert.equal(data.summary.plan.requiredProjectionProfile, "recruiter_default");
     assert.equal(data.summary.plan.needsUserConfirmation, false);
-    // 9 = 3 scorecards + the application_ids bridge derive (3) run once per window-basis read.
-    assert.equal(data.summary.rows_read, 9);
+    // 6 = 3 scorecards + the application_ids bridge derive (3), which now runs ONCE for both
+    // window-basis reads instead of once per read. The ids cannot change between two reads inside
+    // one tool call, so the second derive was pure re-read cost (9 -> 6 on this fixture).
+    assert.equal(data.summary.rows_read, 6);
     assert.equal(data.summary.rows_considered, 3);
     assert.equal(data.analyses.length, 1);
     assert.equal(data.analyses[0].toolName, "analyze_scorecard_accountability");
@@ -98,7 +100,7 @@ describe("recruiting question planner", () => {
     assert.ok(data.answer.interpretation[0].completeness_requirements.length > 0);
     assert.ok(data.answer.interpretation[0].safety_notes.length > 0);
     assert.equal(auditSink.events.at(-1)?.tool, "answer_my_recruiting_question");
-    assert.equal(auditSink.events.at(-1)?.rowsRead, 9);
+    assert.equal(auditSink.events.at(-1)?.rowsRead, 6);
     assert.equal(auditSink.events.some((event) => event.tool === "analyze_scorecard_accountability"), true);
   });
 

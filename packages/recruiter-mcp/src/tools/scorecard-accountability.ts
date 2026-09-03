@@ -81,7 +81,7 @@ export async function runScorecardAccountability(
     // /v3/scorecards has NO job_ids filter and Harvest v3 REJECTS it with 422 (it does not
     // ignore it), so job_ids is never forwarded to the scorecard read below. A narrowed scope
     // is instead bridged job -> application_ids and the scorecards are read by application_ids
-    // (readScorecardRowsForJobScope). An undefined job_ids (a recruiter who did not narrow)
+    // (readScorecardsForWindow's one derive hop). An undefined job_ids (a recruiter who did not narrow)
     // means "all permitted jobs" and reads the full permitted set, unchanged.
     const requestedJobIds = parseRequestedJobIds(params.job_ids);
     const window = resolveAnalysisWindow(params, runtime.now, 30);

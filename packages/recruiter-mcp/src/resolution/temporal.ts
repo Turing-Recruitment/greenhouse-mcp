@@ -23,6 +23,15 @@
  * 12-week horizon before now. The 0-for-a-missing-week reading survives only INSIDE the window: a
  * comparison week that is not wholly inside it is reported as null-with-a-reason, never as a real 0,
  * because "no rows read for that week" and "that week was never in scope" are different facts.
+ *
+ * IN OR OUT IS A RECORD'S QUESTION, NOT ITS WEEK'S. Every record is classified by its OWN timestamp
+ * against window_start/window_end BEFORE anything is bucketed. Bucketing first and then comparing each
+ * bucket's Monday to the raw bounds got both edges wrong on the ordinary midweek window: a Wednesday
+ * window_start sits after its own week's Monday, so the whole first partial week — including records
+ * created inside the window — was dropped and counted as `excluded_before_window`; and a record created
+ * after window_end but inside the anchor week was displayed as inflow and counted nowhere. The two edge
+ * buckets are therefore genuine PARTIAL weeks (the window covers only part of their calendar week) and
+ * are marked `partial: true` so a reader never reads a part-week's count as a full week's inflow.
  */
 
 import { weekKey } from "../metrics.js";
@@ -39,6 +48,12 @@ export interface WeeklyBucket {
   week: string; // Monday (UTC) of the ISO week, YYYY-MM-DD — aligned with weekly_application_volume
   count: number;
   status_mix: Record<string, number>;
+  /**
+   * True when the stated window covers only PART of this calendar week (the first bucket of a window
+   * that starts midweek, the last bucket of one that ends midweek). Present only in windowed mode. Its
+   * count is a part-week's inflow and must not be compared like-for-like against a full week's.
+   */
+  partial?: true;
 }
 
 export interface WeekOverWeek {
@@ -74,9 +89,11 @@ export interface TemporalWindowSummary {
   /** The first/last week actually present in weekly_inflow; null when the window produced no bucket. */
   first_bucket_week: string | null;
   last_bucket_week: string | null;
-  /** Dated records whose week fell outside the window. These rows are still analysed in the recipe's
-   *  snapshot cohort — they are excluded from the INFLOW series only, which is why they are reported
-   *  here rather than as completeness exclusions. */
+  /** Dated records whose OWN timestamp fell before/after the window (not their week's Monday — a
+   *  midweek bound splits a calendar week, and the records on the far side of it are out of scope even
+   *  though their week is in scope). These rows are still analysed in the recipe's snapshot cohort —
+   *  they are excluded from the INFLOW series only, which is why they are reported here rather than as
+   *  completeness exclusions. */
   excluded_before_window: number;
   excluded_after_window: number;
   /** Records carrying no parseable inflow timestamp at all. */
@@ -89,7 +106,11 @@ export interface TemporalView {
   /** Present only when the caller stated a window; null in unwindowed (now-anchored) mode. */
   inflow_window: TemporalWindowSummary | null;
   weekly_inflow: WeeklyBucket[];
-  /** The current, still-accumulating week — reported separately so it never distorts the WoW diff. */
+  /**
+   * The current, still-accumulating week — reported separately so it never distorts the WoW diff.
+   * Null whenever the anchor week is not the LIVE week: a historical window's last week finished long
+   * ago, and calling it "still accumulating" invited a reader to discount a complete number.
+   */
   in_progress_week: WeeklyBucket | null;
   /** The genuine two-window diff over the two most recent COMPLETE calendar weeks; null only when now
    *  is unresolvable or there are zero dated records. */
@@ -148,14 +169,30 @@ export function buildTemporalView(records: TemporalRecord[], options: BuildTempo
     : options.maxWeeks && options.maxWeeks > 0
       ? Math.floor(options.maxWeeks)
       : DEFAULT_MAX_WEEKS;
+
+  // Classify every record on ITS OWN timestamp first. In unwindowed mode there are no bounds to
+  // classify against, so every dated record is "inside" and the horizon below does the trimming.
   const buckets = new Map<string, WeeklyBucket>();
   let datedRecords = 0;
   let missingTimestamp = 0;
+  let excludedBeforeWindow = 0;
+  let excludedAfterWindow = 0;
   for (const record of records) {
-    const week = weekKey(record.timestamp);
+    const at = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : Number.NaN;
+    const week = Number.isFinite(at) ? weekKey(record.timestamp) : null;
     if (!week) {
       missingTimestamp += 1;
       continue;
+    }
+    if (windowed) {
+      if (at < windowed.startMs) {
+        excludedBeforeWindow += 1;
+        continue;
+      }
+      if (at > windowed.endMs) {
+        excludedAfterWindow += 1;
+        continue;
+      }
     }
     datedRecords += 1;
     const bucket = buckets.get(week) ?? { week, count: 0, status_mix: {} };
@@ -168,15 +205,21 @@ export function buildTemporalView(records: TemporalRecord[], options: BuildTempo
   // Windowed mode anchors on window_end; otherwise on now, as before.
   const currentWeek = windowed ? windowed.anchorWeek : weekKey(safeIso(options.nowMs));
   const horizonStartWeek = currentWeek ? shiftWeek(currentWeek, -(maxWeeks - 1)) : null;
-  // In windowed mode the window itself is the lower bound — a fixed horizon would silently clip a
-  // bucket the caller explicitly asked for (the window's own first week).
-  const lowerBoundWeek = windowed ? windowed.startDate : horizonStartWeek;
+  // In windowed mode the lower bound is the WEEK CONTAINING window_start, not window_start's calendar
+  // date: the bucket keys are Mondays, so comparing them to a midweek date deleted the window's own
+  // first partial week. The records inside that week were already bounded above, by their own
+  // timestamps, which is where the question belongs.
+  const lowerBoundWeek = windowed ? windowed.startWeek : horizonStartWeek;
 
   const weeklyInflow = [...buckets.values()]
     .filter((bucket) => (lowerBoundWeek ? bucket.week >= lowerBoundWeek : true) && (currentWeek ? bucket.week <= currentWeek : true))
     .sort((a, b) => a.week.localeCompare(b.week));
+  if (windowed) markPartialEdgeWeeks(weeklyInflow, windowed);
 
-  const inProgressWeek = currentWeek ? buckets.get(currentWeek) ?? null : null;
+  // The anchor week is "still accumulating" only when it IS this week. A historical window's last
+  // week is finished; labelling it in-progress told the reader to discount a complete count.
+  const liveWeek = weekKey(safeIso(options.nowMs));
+  const inProgressWeek = currentWeek && currentWeek === liveWeek ? buckets.get(currentWeek) ?? null : null;
 
   // A comparison week that is not WHOLLY inside the stated window is not a quiet week — it was never
   // in scope. Substituting 0 for it manufactured a delta out of the window's own edge.
@@ -192,10 +235,8 @@ export function buildTemporalView(records: TemporalRecord[], options: BuildTempo
           weeks_covered: windowed.weeksCovered,
           first_bucket_week: weeklyInflow[0]?.week ?? null,
           last_bucket_week: weeklyInflow[weeklyInflow.length - 1]?.week ?? null,
-          excluded_before_window: countBucketedRecordsOutside(buckets, (week) => week < windowed.startDate),
-          excluded_after_window: currentWeek
-            ? countBucketedRecordsOutside(buckets, (week) => week > currentWeek)
-            : 0,
+          excluded_before_window: excludedBeforeWindow,
+          excluded_after_window: excludedAfterWindow,
           missing_timestamp: missingTimestamp,
         }
       : null,
@@ -209,13 +250,26 @@ export function buildTemporalView(records: TemporalRecord[], options: BuildTempo
   };
 }
 
+/**
+ * Flag the edge buckets whose calendar week the window only partly covers. Only the two edge weeks can
+ * be partial: every week between them is wholly inside the window by construction.
+ */
+function markPartialEdgeWeeks(weeklyInflow: WeeklyBucket[], windowed: WindowMode): void {
+  for (const bucket of weeklyInflow) {
+    const weekStartMs = Date.parse(`${bucket.week}T00:00:00.000Z`);
+    const weekEndMs = weekStartMs + WEEK_MS - 1;
+    if (weekStartMs < windowed.startMs || weekEndMs > windowed.endMs) bucket.partial = true;
+  }
+}
+
 interface WindowMode {
   start: string;
   end: string;
-  /** YYYY-MM-DD of window_start; a bucket's Monday must be >= this to be displayed. */
-  startDate: string;
-  /** YYYY-MM-DD of window_end; the last day any comparison week may reach. */
-  endDate: string;
+  /** The bounds every RECORD is classified against, to the millisecond. */
+  startMs: number;
+  endMs: number;
+  /** Monday of the week CONTAINING window_start; the first bucket the series may display. */
+  startWeek: string;
   anchorWeek: string;
   weeksCovered: number;
 }
@@ -225,12 +279,14 @@ function resolveWindowMode(options: BuildTemporalOptions): WindowMode | null {
   const startMs = Date.parse(options.windowStart);
   const endMs = Date.parse(options.windowEnd);
   const anchorWeek = weekKey(options.windowEnd);
-  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs || !anchorWeek) return null;
+  const startWeek = weekKey(options.windowStart);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs || !anchorWeek || !startWeek) return null;
   return {
     start: options.windowStart,
     end: options.windowEnd,
-    startDate: new Date(startMs).toISOString().slice(0, 10),
-    endDate: new Date(endMs).toISOString().slice(0, 10),
+    startMs,
+    endMs,
+    startWeek,
     anchorWeek,
     weeksCovered: Math.max(1, Math.ceil((endMs - startMs) / WEEK_MS)),
   };
@@ -251,17 +307,12 @@ function windowComparisonGap(windowed: WindowMode, currentWeek: string | null): 
   );
 }
 
+// Wholly inside, to the millisecond and on the same bounds every record is classified against — so a
+// week the series marks `partial` is exactly a week this refuses as a comparison week.
 function isWeekInsideWindow(week: string, windowed: WindowMode): boolean {
-  const weekEnd = shiftWeek(week, 1);
-  // weekEnd is the FOLLOWING Monday; the week's last day is the day before it.
-  const lastDay = new Date(Date.parse(`${weekEnd}T00:00:00.000Z`) - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  return week >= windowed.startDate && lastDay <= windowed.endDate;
-}
-
-function countBucketedRecordsOutside(buckets: Map<string, WeeklyBucket>, outside: (week: string) => boolean): number {
-  let count = 0;
-  for (const bucket of buckets.values()) if (outside(bucket.week)) count += bucket.count;
-  return count;
+  const weekStartMs = Date.parse(`${week}T00:00:00.000Z`);
+  if (!Number.isFinite(weekStartMs)) return false;
+  return weekStartMs >= windowed.startMs && weekStartMs + WEEK_MS - 1 <= windowed.endMs;
 }
 
 // The weekly inflow / WoW / velocity all lean on application created_at being a real, spread signal

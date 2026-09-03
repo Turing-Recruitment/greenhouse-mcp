@@ -34,6 +34,14 @@ export interface AnalysisFactMetricLayer {
 
 export function buildAnalysisFactMetricLayer(input: {
   facts: Partial<Record<MetricFactName, FactBuildResult<unknown>>>;
+  /**
+   * Per-metric cohort override. One recipe can hold two honest cohorts at once — pipeline_quality
+   * windows its weekly metrics to the inflow the temporal series displays, while its non-weekly
+   * source-quality metric is a property of the whole snapshot cohort — and feeding one set to both
+   * silently emptied whichever metric the other cohort was not built for. A metric named here
+   * computes over ITS OWN facts; every other metric computes over `facts`.
+   */
+  factsByMetricId?: Record<string, Partial<Record<MetricFactName, FactBuildResult<unknown>>>>;
   metricIds: string[];
   nowMs?: number;
   overdueDays?: number;
@@ -55,21 +63,26 @@ export function buildAnalysisFactMetricLayer(input: {
       projectionProfiles.add(metric.requiredRoleProfile);
     }
     metricResults[metricId] = computeMetric(metricId, {
-      facts: input.facts,
+      facts: input.factsByMetricId?.[metricId] ?? input.facts,
       nowMs: input.nowMs,
       overdueDays: input.overdueDays,
       slaHours: input.slaHours,
     });
   }
 
+  // Every cohort actually fed to a metric contributes its endpoints, profiles and completeness.
+  const factSets = [input.facts, ...Object.values(input.factsByMetricId ?? {})];
   for (const factName of requiredFacts) {
-    const result = input.facts[factName];
-    if (!result) continue;
-    for (const endpoint of result.requiredEndpoints) requiredEndpoints.add(endpoint);
-    projectionProfiles.add(result.requiredProjectionProfile);
+    for (const factSet of factSets) {
+      const result = factSet[factName];
+      if (!result) continue;
+      for (const endpoint of result.requiredEndpoints) requiredEndpoints.add(endpoint);
+      projectionProfiles.add(result.requiredProjectionProfile);
+    }
   }
 
   const allResults = Object.values(metricResults);
+  const allFactResults = factSets.flatMap((factSet) => Object.values(factSet));
   const readTruncated = input.readStatus !== undefined && input.readStatus !== "complete";
   return {
     required_facts: [...requiredFacts],
@@ -79,12 +92,12 @@ export function buildAnalysisFactMetricLayer(input: {
     completeness: {
       status: combineMetricCompleteness([
         ...allResults.map((result) => result.completeness),
-        ...Object.values(input.facts).map((result) => result.completeness),
+        ...allFactResults.map((result) => result.completeness),
         ...(readTruncated ? (["incomplete_truncated"] as MetricCompletenessStatus[]) : []),
       ]),
       omissions: uniqueStrings([
         ...allResults.flatMap((result) => result.omissions),
-        ...Object.values(input.facts).flatMap((result) => result.omissions),
+        ...allFactResults.flatMap((result) => result.omissions),
         ...(readTruncated ? [`Upstream read did not complete (${input.readStatus}); metric denominators may be partial.`] : []),
       ]),
       // Rank 36: matches DEFAULT_LIMITS.maxEvidenceIds — the old 50 capped the metric layer's refs.
