@@ -67,6 +67,10 @@ export interface MetricComputeContext {
     rawRowsRead?: number;
     /** Rows left after `current_only=true` collapsed each application's version chain. */
     rowsAfterCurrentOnly?: number;
+    /** Of the gap between those two, how many Greenhouse's private-candidate permission withheld. */
+    privacyWithheld?: number;
+    /** Of that gap, how many the actor's job permissions excluded (privacy included). */
+    permissionExcluded?: number;
     /** Offers excluded by the window for having no resolved_at while still being unresolved. */
     offersOutstanding?: number;
     /** Whether the full version chain was read. False means re-extension counts are not claimed. */
@@ -623,8 +627,23 @@ function computeOfferResolutionMix(context: MetricComputeContext): MetricResult 
   const rawRowsRead = context.offerRead?.rawRowsRead;
   const rowsAfterCurrentOnly = context.offerRead?.rowsAfterCurrentOnly;
   if (typeof rawRowsRead === "number" && typeof rowsAfterCurrentOnly === "number") {
+    // What this sentence used to say — "N rows returned and M survived current_only" — was simply
+    // false. `current_only=true` is applied SERVER-SIDE, so every row the read returned had already
+    // survived it; nothing was filtered here. The gap between the two numbers is the PERMISSION
+    // gate, and it is attributed to the permission gate.
+    const withheld = context.offerRead?.privacyWithheld ?? 0;
+    const excluded = context.offerRead?.permissionExcluded ?? 0;
+    const gap = Math.max(0, rawRowsRead - rowsAfterCurrentOnly);
+    const attribution = gap === 0
+      ? ""
+      : ` ${gap} row(s) the upstream matched are absent from it — ` +
+        (withheld > 0 ? `${withheld} withheld as private candidates you cannot see` : "") +
+        (withheld > 0 && excluded - withheld > 0 ? ", " : "") +
+        (excluded - withheld > 0 ? `${excluded - withheld} outside your job permissions` : "") +
+        (withheld === 0 && excluded === 0 ? "the read did not say which permission" : "") +
+        ".";
     readOmissions.push(
-      `denominator is offer CHAINS, not offer rows: the read returned ${rawRowsRead} row(s) and ${rowsAfterCurrentOnly} survived current_only=true (one current offer per application).`
+      `denominator counts offer CHAINS, not offer rows: current_only=true was applied server-side, so the ${rowsAfterCurrentOnly} row(s) in this mix are already one current offer per application.${attribution}`
     );
   }
   if (context.offerRead?.supersededVersionsRead !== true) {

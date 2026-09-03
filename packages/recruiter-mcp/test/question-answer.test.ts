@@ -968,10 +968,19 @@ describe("recruiting question planner — unknown questions get a labeled compos
   });
 
   it("A11: a recognized planned domain still routes to planned_metric, never the composite", async () => {
-    const reader = fakeScopedReader((toolName) => {
+    const reader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_jobs") return scopedSuccess(toolName, []);
       if (toolName === "list_offers") {
-        return scopedSuccess(toolName, [{ id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01" }]);
+        // resolved_at, not just sent_on: without it the offer falls out of the window as
+        // outstanding, the accepted set is empty and the reconciliation bridge never runs at all —
+        // so this fixture used to exercise a code path that is not the one the test names.
+        return scopedSuccess(toolName, [
+          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01", resolved_at: "2026-06-05T10:00:00.000Z" },
+        ]);
+      }
+      if (toolName === "list_applications") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
       }
       throw new Error(`unexpected scoped tool ${toolName}`);
     });
@@ -980,6 +989,11 @@ describe("recruiting question planner — unknown questions get a labeled compos
     assert.equal(result.ok, true);
     const data = result.ok ? (result.data as any) : null;
     assert.equal(data.answer.mode, "planned_metric");
+    assert.equal(
+      reader.calls.filter((call) => call.toolName === "list_applications").length,
+      1,
+      "the reconciliation bridge actually runs on this fixture"
+    );
   });
 
   it("A11b: a deadline that kills the first recipe still returns the labeled composite, marked incomplete", async () => {
@@ -1208,6 +1222,119 @@ describe("H3 the planner's offer path", () => {
     assert.ok(
       (data.data?.next_steps ?? data.next_steps ?? []).some((step: string) => /openings closed by a hire/i.test(step)),
       `the third count is offered as a follow-up rather than paid for unasked: ${JSON.stringify(data.next_steps)}`
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H3c: the reconciliation lead is ADDITIVE.
+//
+// The lead is a second population read for a sentence. It used to be able to
+// destroy the whole answer: `if (bridged.kind === "denial") return
+// bridged.result` handed back UPSTREAM_ERROR for a metric that had already been
+// computed from a read that completed. A denial on an optional read reduces what
+// the answer says; it never replaces the answer with a refusal.
+// ---------------------------------------------------------------------------
+describe("H3c the reconciliation lead never destroys a computed answer", () => {
+  function offerRows() {
+    return [
+      { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01", resolved_at: "2026-06-05T10:00:00.000Z" },
+      { id: 2, job_id: 10, application_id: 102, status: "Accepted", sent_on: "2026-06-02", resolved_at: "2026-06-06T10:00:00.000Z" },
+      { id: 3, job_id: 10, application_id: 103, status: "Rejected", sent_on: "2026-06-03", resolved_at: "2026-06-07T10:00:00.000Z" },
+    ];
+  }
+
+  it("keeps the metric, reduces the lead, and names the failure when the applications bridge 500s", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") return scopedSuccess(toolName, offerRows());
+      if (toolName === "list_applications") {
+        throw new Error("Greenhouse API error: 500 Internal Server Error (/applications) [correlation_id=test]");
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, true, "a bridge failure must not turn a computed rate into a denial envelope");
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "planned_metric");
+    assert.equal(data.answer.metric.value, 0.6667, "the rate the offer read paid for is still answered (2 accepted / 3 resolved)");
+    const message = String(data.answer.message);
+    assert.match(message, /^2 accepted current offers\./, `the lead reduces to the count that was made, got: ${message}`);
+    assert.ok(!/marked hired/.test(message), "it does not claim a number it could not read");
+    const omissions = data.answer.omissions as string[];
+    assert.ok(
+      omissions.some((line) => /could not be read \(UPSTREAM_ERROR\)/.test(line)),
+      `the failure is named, got ${JSON.stringify(omissions)}`
+    );
+  });
+
+  it("keeps the metric when list_applications is disabled outright", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") return scopedSuccess(toolName, offerRows());
+      if (toolName === "list_applications") return scopedDenial(toolName, "TOOL_NOT_AVAILABLE");
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.metric.value, 0.6667);
+    assert.ok((data.answer.omissions as string[]).some((line) => /TOOL_NOT_AVAILABLE/.test(line)));
+  });
+
+  it("hedges the second count and marks the answer incomplete when the bridge is truncated", async () => {
+    // 60 accepted offers, so the bridge runs two 50-id batches. The first completes; the second
+    // hits the deadline. The count that comes back is a floor over half the accepted set, and
+    // reporting it as an exact figure beside a complete offer count is the bug.
+    const offers = Array.from({ length: 60 }, (_, index) => ({
+      id: index + 1,
+      job_id: 10,
+      application_id: 100 + index,
+      status: "Accepted",
+      sent_on: "2026-06-01",
+      resolved_at: "2026-06-05T10:00:00.000Z",
+    }));
+    let applicationBatches = 0;
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") return scopedSuccess(toolName, offers);
+      if (toolName === "list_applications") {
+        applicationBatches += 1;
+        if (applicationBatches > 1) throw new Error("SCOPED_GREENHOUSE_TOOL_TIMEOUT:deadline");
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(applicationBatches, 2, "the bridge really did run more than one batch");
+    const message = String(data.answer.message);
+    assert.match(message, /at least 50 of their applications are marked hired/, `the count is hedged as a floor, got: ${message}`);
+    assert.match(message, /read was cut short/);
+    assert.equal(
+      data.summary.completeness_status,
+      "incomplete_timeout",
+      "an answer whose lead came from a truncated read is not a complete answer"
+    );
+    assert.ok(
+      (data.answer.omissions as string[]).some((line) => /applications bridge behind the second count did not finish/.test(line))
     );
   });
 });

@@ -26,7 +26,7 @@ import { resolveScopeSigner } from "../resolvers/job-scope/signer.js";
 import { resolveOwnerScope } from "./job-scope/tools.js";
 import { METRIC_REGISTRY_BY_ID, computeMetric, type MetricComputeContext, type MetricFactName } from "../metrics.js";
 import {
-  HIRE_ACCEPTED_OFFER_STATUS,
+  classifyOfferStatus,
   buildApprovalFlowFacts,
   buildInterviewEventFacts,
   buildJobPostExposureFacts,
@@ -35,7 +35,7 @@ import {
   buildProspectStateFacts,
   type FactBuildResult,
 } from "../facts.js";
-import { classifyUpstreamError } from "../read-all.js";
+import { classifyUpstreamError, combineReadStatuses, type ReadAllStatus } from "../read-all.js";
 import { readIdChunks, uniquePositiveIds } from "./hire-facts.js";
 import { readAllWithDateFallback } from "./read-with-date-fallback.js";
 import type { RecruiterProjectionProfileName } from "../types.js";
@@ -1021,8 +1021,11 @@ async function executePlannedDomain(
             rawRowsRead: read.rawRowsRead,
             // The read already asked the API for current versions only, so what came back IS the
             // post-current_only set. Naming both numbers is what lets the answer say whether its
-            // denominator counts chains or extensions.
+            // denominator counts chains or extensions — and the gap between them belongs to the
+            // permission gate, so the gate's own figures travel with them.
             rowsAfterCurrentOnly: read.rows.length,
+            privacyWithheld: read.privacyWithheld,
+            permissionExcluded: read.permissionExcluded,
             offersOutstanding,
             supersededVersionsRead: false,
           },
@@ -1035,29 +1038,69 @@ async function executePlannedDomain(
   // about in the same breath, and on this tenant they disagree.
   let reconciliationLead: string | undefined;
   const nextSteps: string[] = [];
+  const answerStatuses: ReadAllStatus[] = [read.status];
   if (binding.reconcileHires) {
+    // The SAME classifier the mix and the hire facts use (facts.ts). This lead matched the literal
+    // string `Accepted` while the rate under it matched case-insensitively, so on a tenant that
+    // writes the status any other way the two numbers in one paragraph counted different offers.
     const accepted = (scopedFactResult.facts as Array<Record<string, unknown>>).filter(
-      (fact) => fact.status === HIRE_ACCEPTED_OFFER_STATUS
+      (fact) => classifyOfferStatus(fact.status) === "accepted"
     );
-    const bridged = await readIdChunks(
-      runtime,
-      QUESTION_ANSWER_TOOL.name,
-      "list_applications",
-      uniquePositiveIds(accepted, "application_id"),
-      (batch) => sanitizeReadParams(
-        { ids: batch.join(",") },
-        runtime.limits,
-        { allowedParamNames: HIRE_FACTS_ID_BRIDGE_READ_PARAM_NAMES }
-      ),
-      deadline
-    );
-    if (bridged.kind === "denial") return bridged.result;
-    const markedHired = bridged.rows.filter(
-      (row) => typeof row.status === "string" && row.status.trim().toLowerCase() === "hired"
-    ).length;
-    reconciliationLead =
-      `${accepted.length} accepted current offers; ${markedHired} of their applications ` +
-      `${markedHired === 1 ? "is" : "are"} marked hired in Greenhouse.`;
+    // The bridge is contained here, not by the planner's outer catch. An upstream THROW on this
+    // optional read escaped executePlannedDomain and became a denial envelope for the whole
+    // question — the same destruction as returning the denial, by a different route. A cancellation
+    // is the one exception: it means the client is gone and nothing should keep running.
+    let bridged: Awaited<ReturnType<typeof readIdChunks>>;
+    try {
+      bridged = await readIdChunks(
+        runtime,
+        QUESTION_ANSWER_TOOL.name,
+        "list_applications",
+        uniquePositiveIds(accepted, "application_id"),
+        (batch) => sanitizeReadParams(
+          { ids: batch.join(",") },
+          runtime.limits,
+          { allowedParamNames: HIRE_FACTS_ID_BRIDGE_READ_PARAM_NAMES }
+        ),
+        deadline
+      );
+    } catch (error) {
+      if (isToolCancelledError(error)) throw error;
+      bridged = { kind: "denial", result: plannerErrorToDenial(QUESTION_ANSWER_TOOL.name, error) };
+    }
+    if (bridged.kind === "denial") {
+      // The metric is already computed from a read that SUCCEEDED. Returning the bridge's denial
+      // here threw that answer away and handed back "we cannot tell you anything" because an
+      // OPTIONAL second population — a lead sentence, not the metric — could not be read. The lead
+      // reduces to the count that was actually made, and the failure is named.
+      reconciliationLead = `${accepted.length} accepted current offers.`;
+      omissions.push(
+        `How many of those applications Greenhouse marks hired could not be read (${bridged.result.ok === false ? bridged.result.denial.code : "UNKNOWN"}), so that half of the reconciliation is not reported. The accepted-offer count and the rate below it stand: they come from a read that completed.`
+      );
+    } else {
+      const markedHired = bridged.rows.filter(
+        (row) => typeof row.status === "string" && row.status.trim().toLowerCase() === "hired"
+      ).length;
+      // A bridge that stopped short (deadline, rate limit) read only SOME of the accepted set's
+      // applications, so its count is a floor, not the number. Reporting it as an exact figure
+      // beside a complete offer count is how a confident wrong number gets published.
+      const bridgeComplete = bridged.read.status === "complete";
+      answerStatuses.push(bridged.read.status);
+      reconciliationLead = bridgeComplete
+        ? `${accepted.length} accepted current offers; ${markedHired} of their applications ` +
+          `${markedHired === 1 ? "is" : "are"} marked hired in Greenhouse.`
+        : `${accepted.length} accepted current offers; at least ${markedHired} of their applications ` +
+          `${markedHired === 1 ? "is" : "are"} marked hired in Greenhouse — the applications read was cut short, so that second number is a floor.`;
+      if (!bridgeComplete) {
+        omissions.push(
+          `The applications bridge behind the second count did not finish (${bridged.read.status}), so it covers only part of the accepted set.`
+        );
+        omissions.push(...bridged.read.warnings);
+      }
+      if (bridged.read.privacyWithheld > 0) {
+        omissions.push(`${bridged.read.privacyWithheld} of those applications withheld as private candidates you cannot see.`);
+      }
+    }
     omissions.push(
       "These two counts are dated on different clocks — offers.resolved_at for the first, applications.status (point-in-time) for the second — and Greenhouse sets status=hired only once the hire endpoint has fired, so the second trailing the first is normal rather than an error."
     );
@@ -1065,15 +1108,15 @@ async function executePlannedDomain(
     if (read.privacyWithheld > 0) {
       omissions.push(`${read.privacyWithheld} offer row(s) withheld as private candidates you cannot see.`);
     }
-    if (bridged.read.privacyWithheld > 0) {
-      omissions.push(`${bridged.read.privacyWithheld} of those applications withheld as private candidates you cannot see.`);
-    }
     nextSteps.push(
       "Ask for the openings closed by a hire to complete the reconciliation — it is a third population (openings.closed_at plus the close-reason dictionary) and costs two further reads, so it is not run unasked."
     );
   }
 
-  const completeness = read.status === "complete" ? metric.completeness : read.status;
+  // BOTH reads decide how complete the answer is. Deriving it from the offer read alone reported a
+  // complete answer over a lead sentence that had been computed from a truncated bridge.
+  const answerStatus = combineReadStatuses(answerStatuses);
+  const completeness = answerStatus === "complete" ? metric.completeness : answerStatus;
   const plan: AnalysisPlan = {
     interpretedQuestion: question,
     requestedScope: requestedScope(scopeHeader),
