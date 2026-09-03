@@ -217,8 +217,13 @@ export async function readHireSet(
     warnings,
   };
 
-  const applicationIds = uniquePositiveIds(hires, "application_id");
-  const candidateIds = uniquePositiveIds(hires, "candidate_id");
+  // Keyed off the HIRES, not off every row the read handed back. buildHireFacts is the one
+  // definition of a hire, and the bridges have to use it too: a stray row the builder refuses put
+  // its offer versions into the numerator of offer-rows-per-hire while its own row stayed out of
+  // the denominator, and it spent a candidate-bridge slot on somebody who was never hired.
+  const hireRows = buildHireFacts(hires).facts as unknown as Array<Record<string, unknown>>;
+  const applicationIds = uniquePositiveIds(hireRows, "application_id");
+  const candidateIds = uniquePositiveIds(hireRows, "candidate_id");
 
   // The hire read has already happened and its rows are real. Both bridges below are OPTIONAL
   // enrichments — a version chain and a set of names — so a failure on either reduces what the

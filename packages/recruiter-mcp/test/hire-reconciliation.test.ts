@@ -323,6 +323,40 @@ describe("H2b reconciliationLine — one definition of a hire", () => {
     );
   });
 
+  it("keys the version chain off the HIRES, so a stray row cannot inflate offer rows per hire", async () => {
+    // The bridges were keyed off the RETURNED ROWS while the ratio's denominator came from the
+    // facts, so one row the fact builder refuses put its versions in the numerator and itself out
+    // of the denominator — the same "count rows, not hires" bug the line was built to end, one
+    // level down. Found folding fold 2, not in the fold list.
+    const stray = { id: 99, job_id: 10, application_id: 199, candidate_id: 1099, status: "Created", sent_on: "2026-05-01", resolved_at: "2026-05-10T12:00:00.000Z" };
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_offers" && params?.current_only === false) {
+        const ids = String(params?.application_ids ?? "").split(",").filter(Boolean).map(Number);
+        // Two versions per application asked for, so a stray id shows up as two extra rows.
+        return scopedSuccess(toolName, ids.flatMap((id) => [
+          { id, job_id: 10, application_id: id, status: "Accepted", version: 2, resolved_at: "2026-05-10T12:00:00.000Z" },
+          { id: id + 5000, job_id: 10, application_id: id, status: "Deprecated", version: 1, resolved_at: "2026-05-01T12:00:00.000Z" },
+        ]));
+      }
+      if (toolName === "list_offers") return scopedSuccess(toolName, [...ACCEPTED_OFFERS, stray]);
+      if (toolName === "list_applications") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, { includeChain: true });
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    const chainCall = reader.calls.find((call) => call.params?.current_only === false);
+    assert.ok(!String(chainCall?.params?.application_ids ?? "").split(",").includes("199"), "the stray row's application never reaches the chain read");
+    assert.equal(result.line.accepted_current_offers.value, 10);
+    assert.equal(result.line.offer_rows_per_hire.value, 2, "20 version rows across 10 hires, not 22 across 10");
+  });
+
   it("says offer rows per hire is undefined, not null, when the window holds no hires", async () => {
     const reader = fakeScopedReader((toolName) => {
       if (toolName === "list_offers") return scopedSuccess(toolName, []);
