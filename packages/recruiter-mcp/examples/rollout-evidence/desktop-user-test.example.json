@@ -23,5 +23,5 @@
   "containsTokens": false,
   "exampleOnly": true,
   "warning": "Example-only placeholder. Replace it with all v2 routing cases and at least three real observed runs per case; this file is not rollout evidence.",
-  "catalogAttestation": "read_only_44"
+  "catalogAttestation": "read_only_full_catalog"
 }

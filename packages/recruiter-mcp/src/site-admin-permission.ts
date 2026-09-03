@@ -5,6 +5,16 @@ import type {
 } from "../../scoped-core/src/index.js";
 
 /**
+ * THE one place `siteAdmin: true` is stamped.
+ *
+ * Every all-access answer this wrapper returns carries it, and no other code path may: the flag is
+ * what tells the projection layer that the org-wide scope came from Greenhouse's own
+ * `/v3/users.site_admin` flag rather than from an all-jobs job-admin grant, which the BASE provider
+ * answers with the same `{ kind: "all" }` shape. Downstream, the staff directory, standing
+ * permission grants, teammate work emails and email-template recipients are gated on the flag — so
+ * omitting it here withholds (fail-closed), and adding it anywhere else would grant the site-admin
+ * view to someone whose site-admin status nobody read.
+ *
  * Wraps a base PermissionProvider so that Greenhouse site admins receive
  * all-job access (`{ kind: "all" }`), matching their real Greenhouse authority:
  * a site admin has implicit access to every non-confidential job.
@@ -99,7 +109,7 @@ export function createSiteAdminAwarePermissionProvider(
           // sweep here would be paid by every site admin on every permission refresh. The
           // attestation stamp asks for the actor's private-capable grants only when it needs them
           // (an UNATTESTED actor), which is the one case where that sweep buys something.
-          return { kind: "all" };
+          return { kind: "all", siteAdmin: true };
         }
         // An admin explicitly on a confidential job's hiring team keeps it: those grants DO appear
         // in /v3/user_job_permissions, which is what the base provider reads.
@@ -134,15 +144,15 @@ export function createSiteAdminAwarePermissionProvider(
             "kind" in granted && granted.kind === "all" && granted.privateCapableJobIds
               ? { privateCapableJobIds: new Set(granted.privateCapableJobIds) }
               : {};
-          return { kind: "all", ...inherited };
+          return { kind: "all", siteAdmin: true, ...inherited };
         }
         const excludedJobIds = new Set<number>();
         for (const jobId of confidentialJobIds) {
           if (!grantedJobIds.has(jobId)) excludedJobIds.add(jobId);
         }
         return excludedJobIds.size === 0
-          ? { kind: "all", ...carry }
-          : { kind: "all", excludedJobIds, ...carry };
+          ? { kind: "all", siteAdmin: true, ...carry }
+          : { kind: "all", siteAdmin: true, excludedJobIds, ...carry };
       }
       signal?.throwIfAborted();
       return options.base.getPermittedJobIds(greenhouseUserId, signal);

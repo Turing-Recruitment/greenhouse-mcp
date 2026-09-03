@@ -25,40 +25,17 @@ const PASSING_READINESS_CHECKS = RECRUITER_MCP_READINESS_CHECK_NAMES.map((name) 
   status: "pass",
   summary: `${name} passed`,
 }));
-const EXPECTED_HIDDEN_TOOL_NAMES = [
-  "search_my_approvers",
-  "search_my_approver_groups",
-  "search_my_scorecard_questions",
-  "search_my_scorecard_question_options",
-  "search_my_scorecard_question_answer_options",
-  "search_my_default_interviewers",
-  "search_my_job_post_locations",
-  "search_my_pay_input_ranges",
-  "search_my_prospect_pools",
-  "search_my_prospect_pool_stages",
-  "search_my_interviewer_tags",
-  "search_my_candidate_tags",
-  "search_my_job_boards",
-  "search_my_custom_field_departments",
-  "search_my_custom_field_offices",
-  "search_my_job_interviews",
-  "search_my_job_notes",
-  "search_my_tracking_links",
-  "search_my_approval_flows",
-  "search_my_interview_kits",
-  "search_my_prospect_details",
-  "search_my_pay_inputs",
-].sort();
 
 describe("remote distribution validation", () => {
-  it("keeps exactly 44 model-facing tools and the approved 22-tool hidden complement", () => {
+  // R2a inverted this test. It used to pin a 22-name "approved hidden complement" — the list that WAS
+  // the mechanism. The surviving property is that the complement is EMPTY: what the distribution
+  // validator expects a remote server to expose is the whole registered read catalog.
+  it("expects the whole registered read catalog remotely, with no hidden complement", () => {
     const visible = new Set<string>(PILOT_TOOL_NAMES);
     const hidden = RECRUITER_TOOL_DEFINITIONS.map((tool) => tool.name).filter((name) => !visible.has(name)).sort();
 
-    assert.equal(RECRUITER_TOOL_DEFINITIONS.length, 66);
-    assert.equal(PILOT_TOOL_NAMES.length, 44);
-    assert.equal(new Set(PILOT_TOOL_NAMES).size, 44);
-    assert.deepEqual(hidden, EXPECTED_HIDDEN_TOOL_NAMES);
+    assert.deepEqual(hidden, [], "no registered read tool may be missing from the expected remote catalog");
+    assert.equal(new Set(PILOT_TOOL_NAMES).size, RECRUITER_TOOL_DEFINITIONS.length);
   });
 
   it("validates the hosted MCP protocol path and recruiter-only tool catalog", async () => {
@@ -93,7 +70,6 @@ describe("remote distribution validation", () => {
       GREENHOUSE_RECRUITER_AUDIT_JSONL_PATH: "/tmp/greenhouse-recruiter-distribution-validation-audit.jsonl",
       GREENHOUSE_RECRUITER_AUDIT_DURABLE_MOUNT_PATH: "/tmp",
       GREENHOUSE_RECRUITER_CORS_ORIGIN: "https://chatgpt.com,https://claude.ai",
-      GREENHOUSE_RECRUITER_ALLOWED_TOOLS: PILOT_TOOL_NAMES.join(","),
       GREENHOUSE_RECRUITER_BUILD_SHA: EXPECTED_COMMIT,
     } as NodeJS.ProcessEnv);
     try {
@@ -121,7 +97,7 @@ describe("remote distribution validation", () => {
       assert.ok(report.toolNames.includes("analyze_pipeline_quality"));
       assert.ok(report.toolNames.includes("analyze_source_quality"));
       assert.ok(report.toolNames.includes("answer_my_recruiting_question"));
-      assert.equal(report.toolNames.length, 44);
+      assert.equal(report.toolNames.length, RECRUITER_TOOL_DEFINITIONS.length);
       assert.equal(report.toolNames.some((name) => name === "reject_application" || name.startsWith("patch_")), false);
       // Drift guard: every check the rollout gate requires of distribution evidence must actually be
       // emitted (and pass) by the validator, so a renamed/removed validator check is caught here
@@ -187,7 +163,7 @@ describe("remote distribution validation", () => {
       assert.equal(report.ok, true, JSON.stringify(report.checks));
       assert.equal(report.sessionSurface, identity.surface);
       assert.equal(report.sessionClient, identity.client);
-      assert.equal(report.toolNames.length, 44);
+      assert.equal(report.toolNames.length, RECRUITER_TOOL_DEFINITIONS.length);
     }
     assert.ok(redirectModes.length > 0);
     assert.ok(redirectModes.every((mode) => mode === "error"));
@@ -226,7 +202,10 @@ describe("remote distribution validation", () => {
     const report = await runRemoteDistributionValidationFromEnv({
       GREENHOUSE_RECRUITER_REMOTE_MCP_URL: "https://greenhouse-recruiter.example.com/mcp",
       GREENHOUSE_RECRUITER_SESSION_TOKEN: token,
-      GREENHOUSE_RECRUITER_ALLOWED_TOOLS: PILOT_TOOL_NAMES.join(","),
+      // A live runtime catalog control, so expectedToolNamesFromEnv still takes the DERIVE branch.
+      // R2a deleted GREENHOUSE_RECRUITER_ALLOWED_TOOLS, which is what used to stand here, and its
+      // presence in an env no longer says anything about the catalog.
+      GREENHOUSE_RECRUITER_DISABLE_TOOLS: "",
       GREENHOUSE_RECRUITER_REMOTE_READY_TOKEN: READYZ_TOKEN,
       GREENHOUSE_RECRUITER_EXPECTED_COMMIT_SHA: EXPECTED_COMMIT,
     } as NodeJS.ProcessEnv, {

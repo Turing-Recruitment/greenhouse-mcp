@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createMemoryAuditSink } from "../src/audit.js";
 import { createRecruiterMcpServer, createRecruiterRuntimeForServer, readTrustedActAsUserFromEnv } from "../src/server.js";
 import { runEvidenceTool } from "../src/tools/evidence.js";
-import { PILOT_TOOL_NAMES } from "../src/tools/register.js";
+import { PILOT_TOOL_NAMES, RECRUITER_TOOL_DEFINITIONS } from "../src/tools/register.js";
 import { fakeScopedReader, scopedSuccess, testSession } from "./test-helpers.js";
 
 describe("recruiter MCP server factory", () => {
@@ -18,33 +18,11 @@ describe("recruiter MCP server factory", () => {
     });
 
     assert.ok(bundle.server);
-    assert.deepStrictEqual(bundle.registeredTools.slice(0, PILOT_TOOL_NAMES.length), [...PILOT_TOOL_NAMES]);
-    assert.deepStrictEqual(bundle.registeredTools.slice(PILOT_TOOL_NAMES.length), [
-      "search_my_job_interviews",
-      "search_my_tracking_links",
-      "search_my_job_notes",
-      "search_my_pay_inputs",
-      "search_my_approval_flows",
-      "search_my_approvers",
-      "search_my_approver_groups",
-      "search_my_scorecard_questions",
-      "search_my_scorecard_question_options",
-      "search_my_scorecard_question_answer_options",
-      "search_my_interview_kits",
-      "search_my_default_interviewers",
-      "search_my_job_post_locations",
-      "search_my_pay_input_ranges",
-      "search_my_interviewer_tags",
-      "search_my_candidate_tags",
-      "search_my_prospect_pools",
-      "search_my_prospect_pool_stages",
-      "search_my_prospect_details",
-      "search_my_job_boards",
-      "search_my_custom_field_departments",
-      "search_my_custom_field_offices",
-    ]);
-    assert.equal(bundle.registeredTools.length, 66);
-    assert.equal(new Set(bundle.registeredTools).size, 66);
+    // R2a: every registered read tool mounts, in PILOT_TOOL_NAMES order — there is no curated head
+    // and withheld tail any more, so this is one equality rather than two slices.
+    assert.deepStrictEqual(bundle.registeredTools, [...PILOT_TOOL_NAMES]);
+    assert.equal(bundle.registeredTools.length, RECRUITER_TOOL_DEFINITIONS.length);
+    assert.equal(new Set(bundle.registeredTools).size, RECRUITER_TOOL_DEFINITIONS.length);
   });
 
   it("applies surface kill switches during registration", () => {
@@ -60,31 +38,6 @@ describe("recruiter MCP server factory", () => {
     });
 
     assert.deepStrictEqual(bundle.registeredTools, []);
-  });
-
-  it("registers exactly the ordered 44-tool production catalog when the allowlist is configured", () => {
-    const scopedReader = fakeScopedReader((toolName) => scopedSuccess(toolName, []));
-    const bundle = createRecruiterMcpServer({
-      session: testSession(),
-      scopedReader,
-      auditSink: createMemoryAuditSink(),
-      configureGreenhouse: false,
-      env: { GREENHOUSE_RECRUITER_ALLOWED_TOOLS: PILOT_TOOL_NAMES.join(",") },
-    });
-
-    assert.equal(bundle.registeredTools.length, 44);
-    assert.deepEqual(bundle.registeredTools, [...PILOT_TOOL_NAMES]);
-  });
-
-  it("refuses to build a server with an unknown allowlisted tool", () => {
-    const scopedReader = fakeScopedReader((toolName) => scopedSuccess(toolName, []));
-    assert.throws(() => createRecruiterMcpServer({
-      session: testSession(),
-      scopedReader,
-      auditSink: createMemoryAuditSink(),
-      configureGreenhouse: false,
-      env: { GREENHOUSE_RECRUITER_ALLOWED_TOOLS: "search_my_jobs,unknown_tool" },
-    }), /unknown tool name/);
   });
 
   it("passes the owning HTTP request signal into the per-request runtime", () => {

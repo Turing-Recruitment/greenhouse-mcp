@@ -55,13 +55,17 @@ describe("Harvest v3 endpoint registry", () => {
     }
   });
 
-  it("classifies /v3/user_job_permissions as internal permission infrastructure", () => {
+  // R2d bound /v3/user_job_permissions as search_my_user_job_permissions. Its CLASSIFICATION is
+  // unchanged — it is still admin reference, still the scoped reader's own permission source — but
+  // it is no longer internal-only, because "who else can see this req" is a recruiter's question and
+  // the row carries the job_id that bounds the answer to their own reqs.
+  it("keeps /v3/user_job_permissions classified as admin permission infrastructure, now bound", () => {
     const entry = HARVEST_V3_ENDPOINT_REGISTRY_BY_PATH.get("/v3/user_job_permissions");
     assert.ok(entry);
     assert.equal(entry.scopeClass, "admin_reference");
     assert.equal(entry.sensitivityClass, "admin_diagnostic");
     assert.equal(entry.defaultProjectionProfile, "internal_permission");
-    assert.equal(entry.toolName, undefined);
+    assert.equal(entry.toolName, "search_my_user_job_permissions");
     assert.ok(entry.parameters.some((param) => param.name === "user_ids"));
     assert.ok(entry.responseFields.some((field) => field.name === "job_id"));
   });
@@ -111,10 +115,13 @@ describe("Harvest v3 endpoint registry", () => {
       }
     }
 
-    const internal = SCOPED_ENDPOINT_ADAPTERS_BY_PATH.get("/v3/user_job_permissions");
-    assert.ok(internal);
-    assert.equal(internal.exposure, "internal_permission");
-    assert.deepStrictEqual(internal.evidenceTools, []);
+    // R2d: bound, so it is model_evidence like any other reader. The `internal_permission` exposure
+    // branch stays in exposureForEndpoint for the case it was written for — an endpoint the scoped
+    // reader needs and no tool exposes — but nothing is in that state today.
+    const permissions = SCOPED_ENDPOINT_ADAPTERS_BY_PATH.get("/v3/user_job_permissions");
+    assert.ok(permissions);
+    assert.equal(permissions.exposure, "model_evidence");
+    assert.deepStrictEqual(permissions.evidenceTools.map((tool) => tool.toolName), ["search_my_user_job_permissions"]);
     assert.equal([...SCOPED_ENDPOINT_ADAPTERS_BY_EVIDENCE_TOOL.keys()].length, EVIDENCE_TOOL_MAP.size);
   });
 
@@ -357,7 +364,14 @@ describe("Harvest v3 endpoint registry", () => {
       const schema = schemas.get(toolName);
       assert.ok(schema, `missing registered schema for ${toolName}`);
       if (toolName.startsWith("get_")) {
-        assert.deepStrictEqual(Object.keys(schema), ["id"]);
+        // A single-record read selects by numeric id THROUGH the endpoint's `ids` filter — except
+        // where v3 puts the selector in the path, which is exactly one endpoint
+        // (/v3/bulk_requests/{bulk_action_uuid}). The schema follows the contract's own parameter,
+        // so the tool asks for the value the endpoint actually takes.
+        const pathParams = (getHarvestEndpointForEvidenceTool(toolName)?.parameters ?? [])
+          .filter((parameter) => parameter.in === "path")
+          .map((parameter) => parameter.name);
+        assert.deepStrictEqual(Object.keys(schema), pathParams.length > 0 ? pathParams : ["id"]);
         continue;
       }
       const endpoint = getHarvestEndpointForEvidenceTool(toolName);

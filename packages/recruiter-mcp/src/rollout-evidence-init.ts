@@ -570,7 +570,7 @@ greenhouse-recruiter-record-desktop-test \
   --attest-durable-session-access \
   --attest-session-persisted-across-restart \
   --attest-no-routine-reverification \
-  --attest-catalog read_only_44 \
+  --attest-catalog read_only_full_catalog \
   --out ./desktop-chatgpt-desktop.json
 
 # Repeat for Claude Desktop with --surface claude_desktop, --client claude_desktop_chat, and --attachment-method claude_desktop_mcpb.

@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import { chmod, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { isClientSurfaceCompatible, isRecruiterClient, normalizeSessionIssuedAt, normalizeSessionTokenId } from "./auth.js";
 import { containsTokenOrConfigPayload } from "./evidence-hygiene.js";
 import type { DesktopConfigFileManifest } from "./desktop-config.js";
 import type { IssuedEmailSessionFileManifest } from "./email-session.js";
+import { ACTION_DEFINITIONS } from "../../action-mcp/dist/index.js";
 import { PILOT_TOOL_NAMES, RECRUITER_TOOL_DEFINITIONS } from "./tools/register.js";
 import type { RecruiterClient } from "./types.js";
 
@@ -37,6 +39,8 @@ const DESKTOP_USER_TEST_REPORT_FIELDS = new Set([
   "attachmentMethod",
   "exercisedTools",
   "catalogAttestation",
+  "catalogToolCount",
+  "catalogToolNamesHash",
   "containsTokens",
   "taskOutcome",
   "taskOutcomeReason",
@@ -310,11 +314,48 @@ export interface BuildDesktopUserTestEvidenceOptions {
 /**
  * The dual-catalog contract (CLO-83). The old attestation — "no write/admin tools visible" — made a
  * correct write-entitled deployment fail its own release process once the write plane shipped. What
- * a tester attests now is WHICH exact catalog they saw: a read-only identity sees exactly the 44
- * curated read tools, a write-entitled identity sees exactly 66 — the same 44 plus the 22
- * preview and apply pairs. Anything else on either side of the entitlement is a defect.
+ * a tester attests is WHICH exact catalog they saw: a read-only identity sees the full read catalog,
+ * a write-entitled identity sees that catalog plus every preview/apply pair. Anything else on either
+ * side of the entitlement is a defect.
+ *
+ * The tokens carry no COUNT. They used to (`read_only_44` / `write_entitled_66`), which meant every
+ * change to the catalog silently invalidated evidence a tester had already recorded and forced a
+ * rename across nine files. The counts still get checked — `EXPECTED_CATALOG_TOOL_COUNTS` below
+ * derives them from `PILOT_TOOL_NAMES` and `ACTION_DEFINITIONS`, so the runbook tells the tester the
+ * live numbers to look for — but they are no longer baked into the evidence's vocabulary.
  */
-export type DesktopCatalogAttestation = "read_only_44" | "write_entitled_66";
+export type DesktopCatalogAttestation = "read_only_full_catalog" | "write_entitled_full_catalog";
+
+/**
+ * The tool counts a tester must actually see for each attestation, derived from the registrar rather
+ * than restated. Exported so the runbook generator and the rollout gate quote one number.
+ */
+export const EXPECTED_CATALOG_TOOL_COUNTS: Readonly<Record<DesktopCatalogAttestation, number>> = {
+  read_only_full_catalog: PILOT_TOOL_NAMES.length,
+  write_entitled_full_catalog: PILOT_TOOL_NAMES.length + ACTION_DEFINITIONS.length * 2,
+};
+
+const ACTION_TOOL_NAMES: readonly string[] = ACTION_DEFINITIONS.flatMap((definition) => [
+  definition.previewTool,
+  definition.applyTool,
+]);
+
+/**
+ * The catalog this evidence was recorded against, as a hash of the ORDERED tool names.
+ *
+ * The attestation token carries no count on purpose (a count baked into the vocabulary invalidated
+ * recorded evidence on every catalog change and forced a rename across nine files). That left the
+ * evidence unable to say WHICH catalog the tester saw, so a copied file stayed green through the next
+ * catalog change — the exact staleness the release gate exists to catch. The hash is recorded here,
+ * at build time, and the rollout gate recomputes it from the CURRENT catalog and requires a match:
+ * change the catalog and yesterday's evidence stops passing, which is the point.
+ */
+export function catalogToolNamesHash(attestation: DesktopCatalogAttestation): string {
+  const names = attestation === "write_entitled_full_catalog"
+    ? [...PILOT_TOOL_NAMES, ...ACTION_TOOL_NAMES]
+    : [...PILOT_TOOL_NAMES];
+  return createHash("sha256").update(names.join("\n")).digest("hex");
+}
 
 export interface DesktopUserTestReport {
   status: "pass";
@@ -334,6 +375,10 @@ export interface DesktopUserTestReport {
   attachmentMethod: DesktopAttachmentMethod;
   exercisedTools: string[];
   catalogAttestation: DesktopCatalogAttestation;
+  /** The number of tools the attestation stands for, so the runbook and the gate quote one figure. */
+  catalogToolCount: number;
+  /** sha256 of the ordered catalog names this evidence was recorded against (see catalogToolNamesHash). */
+  catalogToolNamesHash: string;
   containsTokens: false;
   taskOutcome: "useful" | "not_useful" | "could_not_use";
   taskOutcomeReason: "wrong_scope" | "timeout_error" | "installation_blocked" | "answer_received" | "not_yet_needed";
@@ -370,9 +415,10 @@ export async function buildDesktopUserTestEvidenceFromManifests(
     throw new Error("--attest-no-routine-reverification is required.");
   }
   const catalogAttestation = options.catalogAttestation;
-  if (catalogAttestation !== "read_only_44" && catalogAttestation !== "write_entitled_66") {
+  if (catalogAttestation !== "read_only_full_catalog" && catalogAttestation !== "write_entitled_full_catalog") {
     throw new Error(
-      "--attest-catalog is required: read_only_44 (a read-only identity saw exactly the 44 read tools) or write_entitled_66 (a write-entitled identity saw exactly 66 — the 44 plus 22 preview_*/apply_*)."
+      `--attest-catalog is required: read_only_full_catalog (a read-only identity saw exactly the ${EXPECTED_CATALOG_TOOL_COUNTS.read_only_full_catalog} read tools) `
+      + `or write_entitled_full_catalog (a write-entitled identity saw exactly ${EXPECTED_CATALOG_TOOL_COUNTS.write_entitled_full_catalog} — those plus every preview_*/apply_* pair).`
     );
   }
 
@@ -429,6 +475,8 @@ export async function buildDesktopUserTestEvidenceFromManifests(
     attachmentMethod,
     exercisedTools,
     catalogAttestation,
+    catalogToolCount: EXPECTED_CATALOG_TOOL_COUNTS[catalogAttestation],
+    catalogToolNamesHash: catalogToolNamesHash(catalogAttestation),
     containsTokens: false,
     ...taskOutcome,
     clientVersion,

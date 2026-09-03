@@ -106,6 +106,14 @@ export interface EvidenceReadEnvelope {
    * short answer as a complete one.
    */
   privacy_withheld?: number;
+  /**
+   * Date fields the caller bounded EXCLUSIVELY (`{gt}` / `{lt}`) and this read applied inclusively.
+   *
+   * The tool advertises one cheap string per date filter, so the exclusive form has nowhere to go;
+   * the bound is widened by one instant rather than rejected, and named here so an answer built on
+   * it is not quietly one row wider than the question. Absent when nothing was widened.
+   */
+  bounds_treated_inclusive?: string[];
   unresolved_scope_rows: number;
   pages_read: number;
   per_page: number;
@@ -192,6 +200,20 @@ export interface RecruiterProjectionMetadata {
   omittedFields: RecruiterProjectionOmittedField[];
   requiredFieldOmissions: RecruiterProjectionRequiredFieldOmission[];
   incompleteProjection: boolean;
+  /**
+   * The read is gated on the caller's ROLE, not on their requisitions, and this caller does not hold
+   * it — so no row of this endpoint is returned to them and every count in the envelope is zero.
+   *
+   * Stated on EVERY call to a role-gated tool by a caller outside the role, never only when rows
+   * existed: a disclosure that appeared exactly when there was something to withhold would itself
+   * answer the question the gate exists to refuse ("does a record for this colleague exist").
+   */
+  roleGatedRowsWithheld?: RecruiterProjectionRoleGate;
+}
+
+export interface RecruiterProjectionRoleGate {
+  reason: "privacy";
+  note: string;
 }
 
 export interface RecruiterToolDefinition {

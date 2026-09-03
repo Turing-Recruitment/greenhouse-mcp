@@ -91,6 +91,22 @@ const EVIDENCE_TOOL_SCOPED_TOOL_ENTRIES = [
   ["search_my_job_boards", "list_job_boards"],
   ["search_my_custom_field_departments", "list_custom_field_departments"],
   ["search_my_custom_field_offices", "list_custom_field_offices"],
+  ["search_my_job_post_searchable_locations", "list_job_post_searchable_locations"],
+  ["search_my_applied_candidate_tags", "list_applied_candidate_tags"],
+  ["search_my_user_roles", "list_user_roles"],
+  ["search_my_email_templates", "list_email_templates"],
+  ["search_my_user_job_permissions", "list_user_job_permissions"],
+  ["search_my_future_job_permissions", "list_future_job_permissions"],
+  ["search_my_job_candidate_attributes", "list_job_candidate_attributes"],
+  ["search_my_candidate_attribute_types", "list_candidate_attribute_types"],
+  ["search_my_scorecard_candidate_attributes", "list_scorecard_candidate_attributes"],
+  ["search_my_focus_candidate_attributes", "list_focus_candidate_attributes"],
+  ["search_my_scorecard_question_candidate_attributes", "list_scorecard_question_candidate_attributes"],
+  ["search_my_user_emails", "list_user_emails"],
+  ["search_my_bulk_requests", "list_bulk_requests"],
+  ["get_my_bulk_request", "get_bulk_request"],
+  ["search_my_blocked_spam_sources", "list_blocked_spam_sources"],
+  ["search_my_job_board_custom_locations", "list_job_board_custom_locations"],
 ] as const;
 
 export const EVIDENCE_TOOL_SCOPED_TOOL_NAMES: ReadonlyMap<string, string> = new Map(
@@ -116,7 +132,7 @@ export const SCOPED_ENDPOINT_ADAPTERS: readonly ScopedEndpointAdapter[] = HARVES
       allowedProjectionProfiles: endpoint.allowedProjectionProfiles,
       joinDependencies: endpoint.joinDependencies,
       scopePolicy: endpoint.scopePolicy,
-      boundingRule: boundingRuleForScopeClass(endpoint.scopeClass),
+      boundingRule: boundingRuleForEndpoint(endpoint),
       exposure,
       evidenceTools,
       nonExposureReason: nonExposureReason(endpoint, exposure),
@@ -195,6 +211,31 @@ function nonExposureReason(endpoint: EndpointRegistryEntry, exposure: EndpointEx
   return "Registry-covered read endpoint without a default model-facing evidence tool; available for future scoped facts or metrics.";
 }
 
+/**
+ * The bounding rule as a per-ENDPOINT fact, not a per-class slogan.
+ *
+ * `admin_reference` covered two different shapes and told both the same story: /v3/user_job_permissions
+ * rows do carry job_id and are bounded by it, while future_job_permissions, bulk_requests and
+ * bulk_requests/{uuid} carry none at all — so "rows must carry a permitted job_id" described a rule
+ * that could not be running on three of the four. A model reading it would conclude a global read was
+ * requisition-scoped.
+ */
+function boundingRuleForEndpoint(endpoint: EndpointRegistryEntry): string {
+  if (endpoint.scopeClass === "admin_reference") {
+    const carriesJobId = endpoint.responseFields.some((field) => field.name === "job_id");
+    if (carriesJobId) {
+      // R2d bound /v3/user_job_permissions. The row carries job_id and the endpoint takes job_ids, so
+      // a reader sees who can reach THEIR reqs, never an org-wide access map.
+      return "Rows must carry a permitted job_id before projection; a reader sees permission rows for their own requisitions only.";
+    }
+    // No job on the row, so nothing to bound it to. Two of these are org diagnostics with no personal
+    // data and are returned to everyone; /v3/future_job_permissions is a staff-permission row and is
+    // gated on the reader's ROLE instead (evidence-projection.ts, the site-admin/operator row gate).
+    return "Rows carry no job_id, so this is a global org-configuration read; where the rows are staff-permission records, they reach site admins and allowlisted operators only.";
+  }
+  return boundingRuleForScopeClass(endpoint.scopeClass);
+}
+
 function boundingRuleForScopeClass(scopeClass: HarvestScopeClass): string {
   if (scopeClass === "job_scoped") {
     return "Rows must carry a permitted job_id or permitted endpoint parent job before projection.";
@@ -217,8 +258,11 @@ function boundingRuleForScopeClass(scopeClass: HarvestScopeClass): string {
   if (scopeClass === "global_reference") {
     return "Reference rows are not job-filtered; they may be used only as safe projected dimensions for scoped facts.";
   }
-  if (scopeClass === "admin_reference") {
-    return "Admin reference rows are not exposed on the default recruiter surface except as internal permission infrastructure.";
-  }
-  return "Sensitive personal rows require an explicit role, purpose, and projection profile before model exposure.";
+  // admin_reference is answered per endpoint by boundingRuleForEndpoint above: the class covers rows
+  // that carry a job_id and rows that carry none, and one sentence could not be true of both.
+  // R2d bound /v3/user_emails. There is no job to bound a staff-directory row to, so the gate is the
+  // reader's ROLE rather than their requisitions: the projector returns rows to a site admin or an
+  // allowlisted operator and nothing to a job-scoped recruiter, which is the line Greenhouse itself
+  // draws around its staff-directory and permission settings.
+  return "Rows reach site admins and allowlisted operators only; a job-scoped recruiter receives none.";
 }

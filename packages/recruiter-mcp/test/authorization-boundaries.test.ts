@@ -235,6 +235,66 @@ const BOUNDARY_CASES: BoundaryCase[] = [
     expectedParentPaths: ["/prospect_pools"],
   },
   {
+    // R2b. The row carries job_post_id and NO job_id — it was classified job_scoped, which would have
+    // resolved every row unresolved. The chain is the post's.
+    name: "job-post searchable locations",
+    toolName: "list_job_post_searchable_locations",
+    sourcePath: "/job_post_searchable_locations",
+    sourceRows: [
+      { id: 1, job_post_id: 10, city: "Bengaluru" },
+      { id: 2, job_post_id: 20, city: "Palo Alto" },
+    ],
+    parentRows: {
+      "/job_posts": [
+        { id: 10, job_id: 1 },
+        { id: 20, job_id: 2 },
+      ],
+    },
+    expectedRows: [{ id: 1, job_post_id: 10, city: "Bengaluru" }],
+    expectedParentPaths: ["/job_posts"],
+  },
+  {
+    // R2d. job_candidate_attribute_id is a real field on this row and reaches no job; the interview
+    // kit is what does. Pointing the join at the former passed every presence-shaped assertion.
+    name: "focus candidate attributes",
+    toolName: "list_focus_candidate_attributes",
+    sourcePath: "/focus_candidate_attributes",
+    sourceRows: [
+      { id: 1, interview_kit_id: 10, job_candidate_attribute_id: 900 },
+      { id: 2, interview_kit_id: 20, job_candidate_attribute_id: 901 },
+    ],
+    parentRows: {
+      "/interview_kits": [
+        { id: 10, job_id: 1 },
+        { id: 20, job_id: 2 },
+      ],
+    },
+    expectedRows: [{ id: 1, interview_kit_id: 10, job_candidate_attribute_id: 900 }],
+    expectedParentPaths: ["/interview_kits"],
+  },
+  {
+    // R2d. Two hops: the rubric question, then its kit.
+    name: "scorecard question candidate attributes",
+    toolName: "list_scorecard_question_candidate_attributes",
+    sourcePath: "/scorecard_question_candidate_attributes",
+    sourceRows: [
+      { id: 1, scorecard_question_id: 10, focus_candidate_attribute_id: 800 },
+      { id: 2, scorecard_question_id: 20, focus_candidate_attribute_id: 801 },
+    ],
+    parentRows: {
+      "/scorecard_questions": [
+        { id: 10, interview_kit_id: 100 },
+        { id: 20, interview_kit_id: 200 },
+      ],
+      "/interview_kits": [
+        { id: 100, job_id: 1 },
+        { id: 200, job_id: 2 },
+      ],
+    },
+    expectedRows: [{ id: 1, scorecard_question_id: 10, focus_candidate_attribute_id: 800 }],
+    expectedParentPaths: ["/scorecard_questions", "/interview_kits"],
+  },
+  {
     name: "mixed prospect pools",
     toolName: "list_prospect_pools",
     sourcePath: "/prospect_pools",
@@ -249,6 +309,21 @@ const BOUNDARY_CASES: BoundaryCase[] = [
 ];
 
 describe("join-backed authorization boundary matrix", () => {
+  it("covers every policy-driven reader the registry knows about", () => {
+    // The matrix is hand-written, so a new join-backed reader could arrive with no boundary case and
+    // nothing would say so. Derived from the policy registry instead: adding one fails here until it
+    // has an A-in / B-out case.
+    // Three application readers are policy-driven but are not JOIN chains: their policy terminates on
+    // the application's own job_id, and their A-in/B-out behaviour (including the compat `jobs[].id`
+    // shape and the private-candidate gate) is exercised directly in
+    // scoped-core/test/scoped-greenhouse.test.ts and private-candidate-multihop.test.ts. Named, so a
+    // NEW policy-driven reader cannot join them silently.
+    const COVERED_ELSEWHERE = ["get_application", "list_application_stages", "list_applications"];
+    const covered = new Set([...BOUNDARY_CASES.map((testCase) => testCase.toolName), ...COVERED_ELSEWHERE]);
+    const uncovered = [...SCOPED_TOOL_SCOPE_POLICIES.keys()].filter((toolName) => !covered.has(toolName)).sort();
+    assert.deepEqual(uncovered, [], "these policy-driven readers have no job-A-in / job-B-out case");
+  });
+
   for (const testCase of BOUNDARY_CASES) {
     it(`keeps job A and excludes job B for ${testCase.name}`, async () => {
       const raw = fixtureReader(testCase);

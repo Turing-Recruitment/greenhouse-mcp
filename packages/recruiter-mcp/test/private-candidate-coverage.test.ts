@@ -1,9 +1,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { CANDIDATE_SUBSTANCE_TOOLS } from "../../scoped-core/src/index.js";
-import { SCOPED_TOOL_SCOPE_POLICIES } from "../src/tools/scoped-endpoint-adapters.js";
+import { CANDIDATE_ROW_TOOLS, CANDIDATE_SUBSTANCE_TOOLS, DEFAULT_FILTER_REGISTRY } from "../../scoped-core/src/index.js";
+import {
+  SCOPED_ENDPOINT_ADAPTERS_BY_EVIDENCE_TOOL,
+  SCOPED_TOOL_SCOPE_POLICIES,
+} from "../src/tools/scoped-endpoint-adapters.js";
 
 /**
+ * THE OTHER HALF OF THIS GUARD LIVES IN `scoped-core/test/private-candidate-multihop.test.ts`
+ * ("classifies every registered endpoint that can carry candidate substance"), which walks the WHOLE
+ * filter registry by endpoint and fails on any registration nobody classified. This file is the
+ * recruiter-side half: it works from the tool's SCOPE CLASS, so a reader whose rows reach a candidate
+ * has to be classified whichever engine ends up scoping it.
+ *
  * Whether a tool's private candidates are protected depends on WHICH SCOPE ENGINE it happens to use,
  * and nothing in the type system says so.
  *
@@ -32,6 +41,8 @@ const CANDIDATE_SUBSTANCE_SURFACE: ReadonlyArray<{ tool: string; why: string }> 
   { tool: "get_candidate", why: "the same record, fetched by id" },
   { tool: "list_candidate_educations", why: "education history" },
   { tool: "list_candidate_employments", why: "employment history" },
+  { tool: "list_applied_candidate_tags", why: "which tags a candidate carries — the row names them by id" },
+  { tool: "list_scorecard_candidate_attributes", why: "an interviewer's attribute rating and free-text note about one candidate" },
   { tool: "list_notes", why: "notes written about the candidate" },
   { tool: "list_attachments", why: "resumes and other attachments" },
   { tool: "list_scorecard_question_answers", why: "the free text of interview feedback" },
@@ -75,6 +86,55 @@ describe("private-candidate coverage cannot drift between the two scope engines"
     );
   });
 
+  it("derives the surface from the registry's scope classes, not only from this hand-written list", () => {
+    // The list above is human judgement and stays; this is the tripwire under it. Every reader the
+    // REGISTRY classifies as candidate-, application- or scorecard-backed carries rows that resolve to
+    // a candidate, so each one must be named on the surface above — whether it is row-filtered or
+    // policy-driven, which is the half the previous predicate skipped.
+    const CANDIDATE_REACHING_CLASSES = new Set(["candidate_backed", "application_backed", "scorecard_backed", "interview_backed"]);
+    const surface = new Set(CANDIDATE_SUBSTANCE_SURFACE.map(({ tool }) => tool));
+    const unclassified = [...SCOPED_ENDPOINT_ADAPTERS_BY_EVIDENCE_TOOL.values()]
+      .filter((adapter) => CANDIDATE_REACHING_CLASSES.has(adapter.scopeClass))
+      .map((adapter) => adapter.scopedToolName)
+      .filter((scopedToolName) => !surface.has(scopedToolName))
+      .sort();
+
+    assert.deepEqual(
+      [...new Set(unclassified)],
+      [],
+      "a reader whose registry scope class reaches a candidate is missing from the candidate-substance " +
+        "surface, so nobody has decided whether the private-candidate gate covers it"
+    );
+  });
+
+  it("names the gate on every ROW-FILTERED reader on the surface, not only the policy-driven ones", () => {
+    // The original predicate only looked at policy-driven tools, so the row-filtered half of the
+    // surface was unguarded here. Each of them is now held to a NAMED gate: the universal backstop,
+    // the candidate-row path (the row IS the candidate, so `private` is decided on the row itself), or
+    // the filter's own inline walk. A new row-filtered candidate reader fails this until someone says
+    // which of the three covers it.
+    const GATED_BY_THEIR_OWN_FILTER_WALK = new Set([
+      // The row carries no candidate id at all; the filter walks interview -> application -> job and
+      // the privacy gate rides that walk. scoped-core's own sweep classifies both as non-candidate
+      // rows for exactly this reason.
+      "list_interviews",
+      "list_interviewers",
+    ]);
+    const rowFiltered = CANDIDATE_SUBSTANCE_SURFACE
+      .filter(({ tool }) => DEFAULT_FILTER_REGISTRY.get(tool)?.rowFilter !== undefined)
+      .map(({ tool }) => tool);
+    assert.ok(rowFiltered.length > 0, "the surface must actually contain row-filtered readers");
+    const ungated = rowFiltered.filter((tool) =>
+      !CANDIDATE_SUBSTANCE_TOOLS.has(tool) && !CANDIDATE_ROW_TOOLS.has(tool) && !GATED_BY_THEIR_OWN_FILTER_WALK.has(tool)
+    );
+    assert.deepEqual(
+      ungated,
+      [],
+      "these row-filtered candidate-substance readers name no gate at all: add them to " +
+        "CANDIDATE_SUBSTANCE_TOOLS, or state which walk covers them"
+    );
+  });
+
   it("documents the policy-driven tools that are deliberately NOT privacy gated", () => {
     // These reach a candidate's application through their join chain but return no candidate
     // substance: approval chains, kit staffing, post/comp config, pool structure and rubric
@@ -90,10 +150,13 @@ describe("private-candidate coverage cannot drift between the two scope engines"
       "list_approver_groups",
       "list_approvers",
       "list_default_interviewers",
+      "list_focus_candidate_attributes",
       "list_job_post_locations",
+      "list_job_post_searchable_locations",
       "list_pay_input_ranges",
       "list_prospect_pool_stages",
       "list_prospect_pools",
+      "list_scorecard_question_candidate_attributes",
       "list_scorecard_question_options",
       "list_scorecard_questions",
     ];

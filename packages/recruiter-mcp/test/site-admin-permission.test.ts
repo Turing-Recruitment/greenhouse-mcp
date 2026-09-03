@@ -55,7 +55,10 @@ describe("site-admin-aware permission provider", () => {
 
     const scope = await provider.getPermittedJobIds(5236917004);
 
-    assert.deepEqual(scope, { kind: "all" });
+    // `siteAdmin: true` is the PROOF the projection layer keys the admin view off. The base
+    // provider answers `{ kind: "all" }` for a non-admin holding an all-jobs grant, so the flag —
+    // not the kind — is what separates the two (evidence-projection profileForPermissionScope).
+    assert.deepEqual(scope, { kind: "all", siteAdmin: true });
     assert.equal(baseCalls.length, 0, "base provider must not be consulted for a site admin");
   });
 
@@ -110,7 +113,7 @@ describe("site-admin-aware permission provider", () => {
 
     const scope = await provider.getPermittedJobIds(42);
 
-    assert.deepEqual(scope, { kind: "all" }, "no exclusions means the fast, unfiltered read path");
+    assert.deepEqual(scope, { kind: "all", siteAdmin: true }, "no exclusions means the fast, unfiltered read path");
     assert.deepEqual(baseCalls, [], "and no reason to consult the base provider at all");
   });
 

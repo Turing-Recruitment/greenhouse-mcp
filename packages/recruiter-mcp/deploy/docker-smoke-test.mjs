@@ -8,6 +8,12 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(scriptDir, "..");
 const repoRoot = resolve(packageRoot, "..", "..", "..");
 const dockerfilePath = "packages/recruiter-mcp/deploy/Dockerfile";
+// No catalog SIZE literal lives here any more. The container's own self-check already asserts the
+// exact ordered catalog against the registrar it was built from (container-self-check.ts,
+// assertExactCatalog) — a stronger check than a count, and one this file cannot get wrong. What the
+// smoke test verifies is that the self-check ran and reported a catalog it is happy with: a positive
+// count, and nothing hidden. Pinning a second copy of the number here only ever produced a second
+// place to forget to update.
 const imageTag = process.env.GREENHOUSE_RECRUITER_DOCKER_SMOKE_IMAGE ?? "greenhouse-recruiter-mcp:smoke";
 const shouldRunContainer = process.env.GREENHOUSE_RECRUITER_DOCKER_SMOKE_RUN === "true";
 const hostPort = normalizePort(process.env.GREENHOUSE_RECRUITER_DOCKER_SMOKE_PORT);
@@ -106,7 +112,6 @@ function smokeEnv() {
     GREENHOUSE_RECRUITER_REVOCATION_SUPABASE_KEY: "smoke-revocation-key-placeholder",
     GREENHOUSE_RECRUITER_AUDIT_JSONL_PATH: "/app/audit/audit.jsonl",
     GREENHOUSE_RECRUITER_AUDIT_DURABLE_MOUNT_PATH: "/app/audit",
-    GREENHOUSE_RECRUITER_ALLOWED_TOOLS: "answer_my_recruiting_question,analyze_scorecard_accountability,analyze_interview_feedback_drag,analyze_stage_latency,analyze_pipeline_quality,analyze_source_quality,analyze_rejection_reason_drift,resolve_job_scope,confirm_job_scope,get_job_scope,get_recruiting_capabilities,read_my_resume,search_my_jobs,get_my_job,search_my_applications,get_my_application,search_my_interviews,search_my_offers,search_my_openings,search_my_users,search_my_job_owners,search_my_job_interview_stages,search_my_application_stages,search_my_job_hiring_managers,search_my_job_posts,search_my_candidates,get_my_candidate,search_my_scorecards,search_my_rejection_details,search_my_rejection_reasons,search_my_notes,search_my_attachments,search_my_interviewers,search_my_scorecard_question_answers,search_my_candidate_educations,search_my_candidate_employments,get_my_user,search_my_sources,search_my_referrers,search_my_custom_field_options,search_my_custom_fields,search_my_departments,search_my_offices,search_my_close_reasons",
     GREENHOUSE_RECRUITER_CORS_ORIGIN: "https://chatgpt.com,https://claude.ai",
     GREENHOUSE_RECRUITER_MCP_PORT: "3333",
   };
@@ -158,8 +163,12 @@ function runDockerJson(args) {
     if (
       parsed?.ok !== true ||
       parsed?.authenticatedHttpSimulated !== false ||
-      parsed?.catalogToolCount !== 44 ||
-      parsed?.hiddenToolCount !== 22 ||
+      // R2a: the registrar IS the catalog, so nothing is hidden. The self-check proved the exact
+      // ordered list inside the container; these two are the shape of its answer, not a second copy
+      // of the number.
+      !Number.isInteger(parsed?.catalogToolCount) ||
+      parsed?.catalogToolCount <= 0 ||
+      parsed?.hiddenToolCount !== 0 ||
       parsed?.catalogOrder !== true ||
       parsed?.readOnlyAnnotations !== true ||
       parsed?.pdfParser !== true ||

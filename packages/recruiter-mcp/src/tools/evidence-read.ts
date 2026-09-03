@@ -115,7 +115,7 @@ export async function runEvidenceListRead(
     }
 
     const { translated, windowSpecs } = translateRangeParams(params, allowedParamNames);
-    const safeParams = sanitizeReadParams(translated, runtime.limits, { allowedParamNames });
+    const safeParams = sanitizeReadParams(translated, runtime.limits, { allowedParamNames, endpointPath: adapter.endpointPath });
     let windowAppliedLocally: { fields: string[]; rows_missing_field: number; note: string } | undefined;
 
     let rows: RowsResult;
@@ -222,8 +222,8 @@ export async function runEvidenceListRead(
                 ...(nextOffset !== undefined ? { next_offset: nextOffset } : {}),
                 note:
                   truncatedBy === "per_page" || truncatedBy === "offset"
-                    ? "Returned the requested slice of the complete scoped set. Page onward by passing offset=next_offset (with per_page), or narrow with a date range (e.g. resolved_at: {\"gte\": \"2026-04-01\", \"lte\": \"2026-06-30\"})."
-                    : "The complete scoped set exceeds the client's tool-result size cap; returned the largest prefix that fits. Page onward with offset=next_offset (+ per_page), or narrow with job_ids/scope_handle or a date range (e.g. resolved_at: {\"gte\": ..., \"lte\": ...}).",
+                    ? "Returned the requested slice of the complete scoped set. Page onward by passing offset=next_offset (with per_page), or narrow with a date range (e.g. resolved_at: \"2026-04-01..2026-06-30\")."
+                    : "The complete scoped set exceeds the client's tool-result size cap; returned the largest prefix that fits. Page onward with offset=next_offset (+ per_page), or narrow with job_ids/scope_handle or a date range (e.g. resolved_at: \"2026-04-01..2026-06-30\").",
               },
             }
           : {}),
