@@ -35,7 +35,7 @@ import {
   buildProspectStateFacts,
   type FactBuildResult,
 } from "../facts.js";
-import { classifyUpstreamError, combineReadStatuses, type ReadAllStatus } from "../read-all.js";
+import { classifyUpstreamError, combineReadStatuses, isCancellationDenial, type ReadAllStatus } from "../read-all.js";
 import { readIdChunks, uniquePositiveIds } from "./hire-facts.js";
 import { readAllWithDateFallback } from "./read-with-date-fallback.js";
 import type { RecruiterProjectionProfileName } from "../types.js";
@@ -1068,6 +1068,11 @@ async function executePlannedDomain(
       if (isToolCancelledError(error)) throw error;
       bridged = { kind: "denial", result: plannerErrorToDenial(QUESTION_ANSWER_TOOL.name, error) };
     }
+    // A cancellation reaches this path as a DENIAL, not as an exception (read-all.ts maps it), so
+    // the rule below — an optional bridge's denial only reduces the lead — quietly answered a
+    // client that had already hung up, with ok: true and a complete verdict on it. A cancellation
+    // is never a reduced answer; it is the end of the run, and it is returned as such.
+    if (bridged.kind === "denial" && isCancellationDenial(bridged.result)) return bridged.result;
     if (bridged.kind === "denial") {
       // The metric is already computed from a read that SUCCEEDED. Returning the bridge's denial
       // here threw that answer away and handed back "we cannot tell you anything" because an

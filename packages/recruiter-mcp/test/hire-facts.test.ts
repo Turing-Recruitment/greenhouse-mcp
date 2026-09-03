@@ -9,7 +9,7 @@ import {
 import { buildHireFacts } from "../src/facts.js";
 import { HIRE_FACTS_OFFER_READ_PARAM_NAMES } from "../src/limits.js";
 import { readHireSet } from "../src/tools/hire-facts.js";
-import { readAllWithDateFallback } from "../src/tools/read-with-date-fallback.js";
+import { bracketParamsForWindows, readAllWithDateFallback } from "../src/tools/read-with-date-fallback.js";
 import { computeMetric } from "../src/metrics.js";
 import { SCOPED_TOOL_SCOPE_POLICIES } from "../src/tools/scoped-endpoint-adapters.js";
 import type { AuthenticatedSession } from "../src/types.js";
@@ -117,8 +117,106 @@ describe("H1 readHireSet — the shared 422 date fallback", () => {
     assert.equal(second["sent_on[lte]"], WINDOW.end);
     assert.equal(second["resolved_at[gte]"], undefined, "the primary field's brackets are swapped out, not stacked");
     assert.equal(second.status, "Accepted", "every other filter is kept");
+    assert.equal(second.current_only, true, "including current_only — a chain-collapsing filter the leg must not drop");
     assert.equal(result.read.windowAppliedLocally, false);
     assert.deepStrictEqual(result.read.dateParamsRejected, []);
+  });
+
+  // The supplemental leg is a READ like any other, so it gets the same two legs the primary one
+  // does. Without this a 422 on the sent_on leg turned into a warning and a `complete: true`
+  // answer that was quietly missing every sent_on-dated hire.
+  it("self-heals a 422 on the sent_on leg and recovers the hires it was asked for", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (params?.["sent_on[gte]"] !== undefined) {
+        throw new Error("Greenhouse API error: 422 Unprocessable Entity (/offers) [correlation_id=test]");
+      }
+      if (params?.["resolved_at[gte]"] !== undefined) return scopedSuccess(toolName, [offerRow(1)]);
+      // The bracket-free re-read of the sent_on leg: the whole scoped set.
+      return scopedSuccess(toolName, [
+        offerRow(1),
+        offerRow(4, { resolved_at: undefined, sent_on: "2026-05-05" }),
+        offerRow(7, { resolved_at: undefined, sent_on: "2026-01-05" }), // before the window
+      ]);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "rows");
+    if (result.kind !== "rows") return;
+    assert.deepStrictEqual(result.hires.map((row) => row.id), [1, 4], "the sent_on-only hire is recovered, not lost to a warning");
+    assert.equal(result.read.complete, true, "a leg that healed itself leaves the read complete");
+  });
+
+  it("marks the read incomplete and names the field when a fallback leg fails for any other reason", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (params?.["sent_on[gte]"] !== undefined) {
+        throw new Error("Greenhouse API error: 500 Internal Server Error (/offers) [correlation_id=test]");
+      }
+      return scopedSuccess(toolName, [offerRow(1)]);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "rows");
+    if (result.kind !== "rows") return;
+    assert.deepStrictEqual(result.hires.map((row) => row.id), [1], "the primary leg's hires are real either way");
+    assert.equal(result.read.complete, false, "a leg that never answered cannot leave the set complete");
+    assert.equal(result.read.status, "incomplete_upstream");
+    assert.ok(
+      result.read.warnings.some((warning) => /sent_on/.test(warning)),
+      `the failing field is named, got ${JSON.stringify(result.read.warnings)}`
+    );
+  });
+
+  it("counts a supplemental leg that returned NOTHING in the read accounting", async () => {
+    // A zero-row leg is still a page fetched and rows scanned upstream. Dropping it from the
+    // accounting understated what the read cost and hid a leg that had run.
+    const reader = fakeScopedReader((toolName, params) => {
+      if (params?.["sent_on[gte]"] !== undefined) return scopedSuccess(toolName, []);
+      return scopedSuccess(toolName, [offerRow(1)]);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const outcome = await readAllWithDateFallback(runtime, "test_tool", "list_offers", {
+      "resolved_at[gte]": WINDOW.start,
+      "resolved_at[lte]": WINDOW.end,
+    }, [{ field: "resolved_at", fallbackFields: ["sent_on"], gte: WINDOW.start, lte: WINDOW.end }]);
+
+    assert.equal(outcome.read.kind, "rows");
+    if (outcome.read.kind !== "rows") return;
+    assert.equal(outcome.read.pagesRead, 2, "both legs' pages are counted, including the empty one");
+    assert.deepStrictEqual(outcome.fallbackFieldsQueried, ["sent_on"]);
+  });
+
+  it("derives the bracket keys from an lte-only and a gt/lt-only spec", async () => {
+    // The stripped keys come from the SPEC, not from a hard-coded gte/lte pair: a one-sided or
+    // exclusive window that 422s must strip exactly the keys it sent.
+    for (const [spec, expected] of [
+      [{ field: "resolved_at", lte: WINDOW.end }, ["resolved_at[lte]"]],
+      [{ field: "resolved_at", gt: WINDOW.start, lt: WINDOW.end }, ["resolved_at[gt]", "resolved_at[lt]"]],
+    ] as const) {
+      const reader = fakeScopedReader((toolName, params) => {
+        if (Object.keys(params ?? {}).some((key) => /^resolved_at\[/.test(key))) {
+          throw new Error("Greenhouse API error: 422 Unprocessable Entity (/offers) [correlation_id=test]");
+        }
+        return scopedSuccess(toolName, []);
+      });
+      const { runtime } = testRuntime(reader);
+
+      const outcome = await readAllWithDateFallback(
+        runtime,
+        "test_tool",
+        "list_offers",
+        { ...bracketParamsForWindows([spec]), job_ids: "1" },
+        [spec]
+      );
+
+      assert.equal(outcome.windowAppliedLocally, true);
+      assert.deepStrictEqual(outcome.dateParamsRejected, [...expected].sort());
+      assert.equal((reader.calls[1]!.params as Record<string, unknown>).job_ids, "1", "the non-date filter survives");
+    }
   });
 
   // The self-heal must fire on a DATE 422 and nothing else. A test-honesty mutation proved the
@@ -127,7 +225,10 @@ describe("H1 readHireSet — the shared 422 date fallback", () => {
   // tenant outage into a silent full unfiltered read.
   for (const [label, thrown] of [
     ["a 401", new Error("Greenhouse API error: 401 Unauthorized (/offers) [correlation_id=test]")],
+    ["a 403", new Error("Greenhouse API error: 403 Forbidden (/offers) [correlation_id=test]")],
     ["a 500", new Error("Greenhouse API error: 500 Internal Server Error (/offers) [correlation_id=test]")],
+    // Not an HTTP error at all: httpErrorStatus finds no status, so there is no 422 to heal.
+    ["a network failure", new Error("fetch failed: ECONNRESET")],
   ] as const) {
     it(`rethrows ${label} on the bracket leg instead of re-reading without the window`, async () => {
       const reader = fakeScopedReader(() => {
@@ -262,7 +363,94 @@ describe("H1b readHireSet — chunking only on an explicit job set", () => {
     assert.deepStrictEqual(sent, [50, 50, 20]);
     const allIds = offerCalls.flatMap((call) => String(call.params?.job_ids ?? "").split(",").filter(Boolean));
     assert.deepStrictEqual([...new Set(allIds)].length, 120, "every named req is actually read");
+
+    // The supplemental sent_on leg is a read of the same scope and chunks the same way; sending
+    // 120 ids to it as one string is a URL Greenhouse will not answer.
+    const fallbackCalls = reader.calls
+      .filter((call) => call.toolName === "list_offers" && call.params?.["sent_on[gte]"] !== undefined);
+    assert.deepStrictEqual(
+      fallbackCalls.map((call) => String(call.params?.job_ids ?? "").split(",").filter(Boolean).length),
+      [50, 50, 20],
+      "the fallback-field leg chunks its job_ids too"
+    );
   });
+});
+
+// ---------------------------------------------------------------------------
+// H5: the optional enrichments are CONTAINED.
+//
+// The chain read, the candidate bridge and (on the line) the openings read are
+// enrichments on top of a hire read that already succeeded. readAllScopedRows
+// rethrows a 5xx, so an upstream failure on any of them used to escape as an
+// exception and destroy a count that had already been computed. A cancellation
+// is the one thing that still stops everything: the client is gone.
+// ---------------------------------------------------------------------------
+describe("H5 readHireSet — an optional enrichment never destroys the hire read", () => {
+  function enrichmentReader(failing: "chain" | "candidates", thrown: Error) {
+    return fakeScopedReader((toolName, params) => {
+      if (toolName === "list_offers" && params?.current_only === false) {
+        if (failing === "chain") throw thrown;
+        return scopedSuccess(toolName, [offerRow(1)]);
+      }
+      if (toolName === "list_offers") return scopedSuccess(toolName, [offerRow(1)]);
+      if (toolName === "list_candidates") {
+        if (failing === "candidates") throw thrown;
+        return scopedSuccess(toolName, [{ id: 1001, first_name: "Ada", last_name: "Hire" }]);
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+  }
+
+  it("keeps the hires when the version chain read fails upstream", async () => {
+    const reader = enrichmentReader("chain", new Error("Greenhouse API error: 500 Internal Server Error (/offers) [correlation_id=test]"));
+    const { runtime } = testRuntime(reader);
+
+    const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {
+      includeChain: true,
+    });
+
+    assert.equal(result.kind, "rows", "a failed enrichment must not throw the hire read away");
+    if (result.kind !== "rows") return;
+    assert.equal(result.hires.length, 1);
+    assert.equal(result.chain, undefined, "the chain says nothing rather than saying zero");
+    assert.ok(
+      result.read.warnings.some((warning) => /version chain/.test(warning)),
+      `the failure is named, got ${JSON.stringify(result.read.warnings)}`
+    );
+  });
+
+  it("keeps the hires when the candidate name bridge fails upstream", async () => {
+    const reader = enrichmentReader("candidates", new Error("Greenhouse API error: 500 Internal Server Error (/candidates) [correlation_id=test]"));
+    const { runtime } = testRuntime(reader);
+
+    const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {
+      includeCandidates: true,
+    });
+
+    assert.equal(result.kind, "rows");
+    if (result.kind !== "rows") return;
+    assert.equal(result.hires.length, 1);
+    assert.equal(result.candidates, undefined);
+    assert.ok(result.read.warnings.some((warning) => /candidate name bridge/.test(warning)));
+  });
+
+  for (const failing of ["chain", "candidates"] as const) {
+    it(`propagates a cancellation on the ${failing} read instead of answering without it`, async () => {
+      // read-all turns a cancellation into a CANCELLED DENIAL rather than an exception, so
+      // degrading every denial to a warning answered a client that had already hung up.
+      const reader = enrichmentReader(failing, new Error("SCOPED_GREENHOUSE_TOOL_CANCELLED"));
+      const { runtime } = testRuntime(reader);
+
+      const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {
+        includeChain: failing === "chain",
+        includeCandidates: failing === "candidates",
+      });
+
+      assert.equal(result.kind, "denial");
+      if (result.kind !== "denial") return;
+      assert.equal(result.result.ok === false && result.result.denial.code, "CANCELLED");
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -463,7 +463,6 @@ describe("H2c reconciliationLine — the openings read discloses what it did", (
 
   it("reads NOTHING for an explicitly empty req set on any of the three counts", async () => {
     const reader = fakeScopedReader((toolName) => {
-      if (toolName === "list_close_reasons") return scopedSuccess(toolName, []);
       throw new Error(`an empty scope must not read ${toolName}`);
     });
     const { runtime } = testRuntime(reader);
@@ -483,11 +482,83 @@ describe("H2c reconciliationLine — the openings read discloses what it did", (
     assert.equal(result.line.openings_closed_by_hire.value, 0);
     assert.equal(result.line.applications_status_hired_scope_all_time?.value, 0);
     assert.deepStrictEqual(
-      toolNames(reader.calls).filter((name) => name !== "list_close_reasons"),
+      toolNames(reader.calls),
       [],
-      "an empty explicit scope reads no offers, no applications and no openings"
+      "an empty explicit scope reads NOTHING — not offers, not applications, not openings, and not the close-reason dictionary it has no ids to resolve"
     );
   });
+});
+
+// ---------------------------------------------------------------------------
+// H2d: every read behind the line is contained, and a cancellation is the one
+// thing that stops it.
+//
+// readAllScopedRows rethrows a 5xx, so the openings read, the close-reason
+// dictionary and the all-time count could each escape as an exception and
+// destroy two counts that had already been computed off completed reads.
+// ---------------------------------------------------------------------------
+describe("H2d reconciliationLine — contained reads, propagated cancellation", () => {
+  function failingReader(failing: string, thrown: Error) {
+    const base = reconciliationReader();
+    return fakeScopedReader((toolName, params) => {
+      if (toolName === failing) throw thrown;
+      return base.scopedRead(undefined as never, toolName, params, undefined);
+    });
+  }
+
+  for (const [label, failing, options] of [
+    ["the closed-openings read", "list_openings", { includeOpenings: true }],
+    ["the close-reason dictionary", "list_close_reasons", { includeOpenings: true }],
+  ] as const) {
+    it(`keeps the other counts when ${label} fails upstream`, async () => {
+      const reader = failingReader(failing, new Error(`Greenhouse API error: 500 Internal Server Error (/${failing}) [correlation_id=test]`));
+      const { runtime } = testRuntime(reader);
+
+      const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, options);
+
+      assert.equal(result.kind, "line", "one broken population must not destroy two computed counts");
+      if (result.kind !== "line") return;
+      assert.equal(result.line.accepted_current_offers.value, 10);
+      assert.equal(result.line.accepted_offer_applications_marked_hired.value, 8);
+      assert.equal(result.line.openings_closed_by_hire.not_read, true);
+      assert.ok(
+        result.line.openings_closed_by_hire.notes.some((note) => /500|could not be read/i.test(note)),
+        `the failure is named on the count, got ${JSON.stringify(result.line.openings_closed_by_hire.notes)}`
+      );
+    });
+  }
+
+  it("keeps the other counts when the all-time hired-application read fails upstream", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_applications" && params?.status === "hired") {
+        throw new Error("Greenhouse API error: 500 Internal Server Error (/applications) [correlation_id=test]");
+      }
+      return reconciliationReader().scopedRead(undefined as never, toolName, params, undefined);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, {
+      includeAllTimeHiredApplications: true,
+    });
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    assert.equal(result.line.accepted_current_offers.value, 10);
+    assert.equal(result.line.applications_status_hired_scope_all_time?.not_read, true);
+  });
+
+  for (const failing of ["list_applications", "list_openings"] as const) {
+    it(`propagates a cancellation on ${failing} rather than answering a client that has gone`, async () => {
+      const reader = failingReader(failing, new Error("SCOPED_GREENHOUSE_TOOL_CANCELLED"));
+      const { runtime } = testRuntime(reader);
+
+      const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, { includeOpenings: true });
+
+      assert.equal(result.kind, "denial");
+      if (result.kind !== "denial") return;
+      assert.equal(result.result.ok === false && result.result.denial.code, "CANCELLED");
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

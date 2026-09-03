@@ -1273,6 +1273,26 @@ describe("H3c the reconciliation lead never destroys a computed answer", () => {
     );
   });
 
+  it("propagates a CANCELLED bridge as the planner's cancellation, never as a complete answer", async () => {
+    // A cancellation reaches this path as a DENIAL, not an exception (read-all.ts maps it), so the
+    // rule "an optional bridge denial only reduces the lead" quietly answered a client that had
+    // already hung up — with `ok: true` and a complete verdict.
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") return scopedSuccess(toolName, offerRows());
+      if (toolName === "list_applications") throw new Error("SCOPED_GREENHOUSE_TOOL_CANCELLED");
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, false, "a cancellation is not a reduced answer, it is the end of the run");
+    assert.equal(result.ok === false && result.denial.code, "CANCELLED");
+  });
+
   it("keeps the metric when list_applications is disabled outright", async () => {
     const reader = fakeScopedReader((toolName) => {
       if (toolName === "list_jobs") return scopedSuccess(toolName, []);

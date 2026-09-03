@@ -8,10 +8,11 @@ import {
 import {
   combineReadStatuses,
   denialTruncationStatus,
+  isCancellationDenial,
   type ReadAllRowsResult,
   type ReadAllStatus,
 } from "../read-all.js";
-import type { RecruiterToolRuntime, ToolDeadline } from "../runtime.js";
+import { deny, isToolCancelledError, type RecruiterToolRuntime, type ToolDeadline } from "../runtime.js";
 import type { RecruiterToolResult } from "../types.js";
 import { buildHireFacts, HIRE_ACCEPTED_OFFER_STATUS } from "../facts.js";
 import { chunks } from "./application-job-lookup.js";
@@ -220,28 +221,40 @@ export async function readHireSet(
   const candidateIds = uniquePositiveIds(hires, "candidate_id");
 
   // The hire read has already happened and its rows are real. Both bridges below are OPTIONAL
-  // enrichments — a version chain and a set of names — so a denial on either reduces what the
+  // enrichments — a version chain and a set of names — so a failure on either reduces what the
   // answer can say and is disclosed, but it never destroys the count that was already computed.
   // Returning the bridge's denial here converted a complete hire read into "we cannot tell you
   // anything", which is the worse answer by every measure.
+  //
+  // Both shapes of failure are contained, because a read can fail in two: readAllScopedRows
+  // RETHROWS a 5xx and RETURNS a denial for a permission/deadline refusal. Containing only the
+  // second let an ordinary upstream 500 escape as an exception — the same destruction, by the
+  // other route. The one thing that still stops everything is a cancellation: the client is gone,
+  // and nothing downstream should keep running or answer as if it had not.
   let chain: Array<Record<string, unknown>> | undefined;
   let chainRead: HireReadStatus | undefined;
   if (options.includeChain) {
-    const chainResult = await readOfferChain(runtime, exposedToolName, applicationIds, deadline);
-    if (chainResult.kind === "denial") {
-      read.warnings.push(denialWarning("the offer version chain", chainResult.result));
+    const chainResult = await contain("the offer version chain", () =>
+      readOfferChain(runtime, exposedToolName, applicationIds, deadline)
+    );
+    if (chainResult.kind === "cancelled") return { kind: "denial", result: chainResult.result };
+    if (chainResult.kind === "failed") {
+      read.warnings.push(chainResult.warning);
     } else {
-      chain = chainResult.rows;
-      chainRead = chainResult.read;
+      chain = chainResult.value.rows;
+      chainRead = chainResult.value.read;
     }
   }
 
   let candidates: HireCandidateRow[] | undefined;
   let candidatesRead: HireReadStatus | undefined;
   if (options.includeCandidates) {
-    const bridged = await readHireCandidates(runtime, exposedToolName, candidateIds, deadline);
-    if (bridged.kind === "denial") {
-      read.warnings.push(denialWarning("the candidate name bridge", bridged.result));
+    const bridgedResult = await contain("the candidate name bridge", () =>
+      readHireCandidates(runtime, exposedToolName, candidateIds, deadline)
+    );
+    if (bridgedResult.kind === "cancelled") return { kind: "denial", result: bridgedResult.result };
+    if (bridgedResult.kind === "failed") {
+      read.warnings.push(bridgedResult.warning);
       return {
         kind: "rows",
         hires,
@@ -252,6 +265,7 @@ export async function readHireSet(
         window,
       };
     }
+    const bridged = bridgedResult.value;
     candidates = bridged.candidates;
     candidatesRead = bridged.read;
     const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
@@ -423,6 +437,45 @@ function denialWarning(what: string, result: RecruiterToolResult): string {
   return `${what} could not be read (${code}), so the counts that depend on it are not reported; the hire read itself stands.`;
 }
 
+/** What an optional bridge's THROWN failure says. Same sentence, the upstream message in place of a code. */
+function errorWarning(what: string, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return `${what} could not be read (${message}), so the counts that depend on it are not reported; the hire read itself stands.`;
+}
+
+type ContainedRead<T> =
+  | { kind: "value"; value: T }
+  | { kind: "failed"; warning: string }
+  | { kind: "cancelled"; result: RecruiterToolResult };
+
+/**
+ * Run ONE optional enrichment read and let neither shape of failure past.
+ *
+ * Both shapes exist and both used to escape somewhere: `readAllScopedRows` RETHROWS an ordinary
+ * 5xx and RETURNS a denial for a refusal or a deadline. A cancellation, in either shape, is the
+ * exception to containment and is handed back so the caller can stop.
+ */
+async function contain<T extends { kind: "rows" | "counts" } | { kind: "denial"; result: RecruiterToolResult }>(
+  what: string,
+  run: () => Promise<T>
+): Promise<ContainedRead<Exclude<T, { kind: "denial" }>>> {
+  let result: T;
+  try {
+    result = await run();
+  } catch (error) {
+    if (isToolCancelledError(error)) {
+      return { kind: "cancelled", result: deny("hire_facts", "CANCELLED", "Scoped Greenhouse read was cancelled because the client request ended.") };
+    }
+    return { kind: "failed", warning: errorWarning(what, error) };
+  }
+  if (result.kind === "denial") {
+    const denial = (result as { kind: "denial"; result: RecruiterToolResult }).result;
+    if (isCancellationDenial(denial)) return { kind: "cancelled", result: denial };
+    return { kind: "failed", warning: denialWarning(what, denial) };
+  }
+  return { kind: "value", value: result as Exclude<T, { kind: "denial" }> };
+}
+
 function foldRead(
   read: RowsResult,
   rows: Array<Record<string, unknown>>,
@@ -578,7 +631,7 @@ export async function reconciliationLine(
   // business contributing an application id to the count of "how many of THESE hires does
   // Greenhouse call hired".
   const applicationIds = uniquePositiveIds(hireFacts.facts as unknown as Array<Record<string, unknown>>, "application_id");
-  const bridged = await readIdChunks(
+  const bridgedResult = await contain("the accepted set's applications", () => readIdChunks(
     runtime,
     exposedToolName,
     "list_applications",
@@ -589,11 +642,15 @@ export async function reconciliationLine(
       { allowedParamNames: HIRE_FACTS_ID_BRIDGE_READ_PARAM_NAMES }
     ),
     deadline
-  );
+  ));
+  if (bridgedResult.kind === "cancelled") return { kind: "denial", result: bridgedResult.result };
+  const bridged = bridgedResult.kind === "failed"
+    ? ({ kind: "failed", warning: bridgedResult.warning } as const)
+    : ({ kind: "rows", rows: bridgedResult.value.rows, read: bridgedResult.value.read } as const);
   // A bridge failure costs this ONE count, not the line. The accepted-offer count above is already
   // computed off a completed read; discarding it because a second population could not be read
   // would answer "we cannot tell you anything" to a question one read had already answered.
-  const accepted_offer_applications_marked_hired: ReconciliationCount = bridged.kind === "denial"
+  const accepted_offer_applications_marked_hired: ReconciliationCount = bridged.kind === "failed"
     ? {
         ...base,
         value: null,
@@ -601,7 +658,7 @@ export async function reconciliationLine(
         clock: "applications.status (point-in-time, not dated)",
         privacy_withheld: 0,
         dated_from_fallback: 0,
-        notes: [denialWarning("the accepted set's applications", bridged.result)],
+        notes: [bridged.warning],
       }
     : {
         ...base,
@@ -614,8 +671,8 @@ export async function reconciliationLine(
         dated_from_fallback: 0,
         notes: ["Greenhouse sets status=hired only once the hire endpoint has fired, so this count trails the accepted-offer count rather than contradicting it"],
       };
-  if (bridged.kind === "denial") {
-    warnings.push(denialWarning("the accepted set's applications", bridged.result));
+  if (bridged.kind === "failed") {
+    warnings.push(bridged.warning);
   } else {
     statuses.push(bridged.read.status);
     warnings.push(...bridged.read.warnings);
@@ -623,9 +680,12 @@ export async function reconciliationLine(
 
   let applications_status_hired_scope_all_time: ReconciliationCount | undefined;
   if (options.includeAllTimeHiredApplications) {
-    const allTime = await readAllTimeHiredApplications(runtime, exposedToolName, scope, deadline);
-    if (allTime.kind === "denial") {
-      warnings.push(denialWarning("the all-time hired-application count", allTime.result));
+    const allTimeResult = await contain("the all-time hired-application count", () =>
+      readAllTimeHiredApplications(runtime, exposedToolName, scope, deadline)
+    );
+    if (allTimeResult.kind === "cancelled") return { kind: "denial", result: allTimeResult.result };
+    if (allTimeResult.kind === "failed") {
+      warnings.push(allTimeResult.warning);
       applications_status_hired_scope_all_time = {
         value: null,
         not_read: true,
@@ -634,9 +694,10 @@ export async function reconciliationLine(
         scope_label: scope.label,
         privacy_withheld: 0,
         dated_from_fallback: 0,
-        notes: [denialWarning("the all-time hired-application count", allTime.result)],
+        notes: [allTimeResult.warning],
       };
     } else {
+      const allTime = allTimeResult.value;
       statuses.push(allTime.read.status);
       warnings.push(...allTime.read.warnings);
       applications_status_hired_scope_all_time = {
@@ -657,17 +718,20 @@ export async function reconciliationLine(
     }
   }
 
-  const openings = options.includeOpenings
-    ? await readOpeningsClosedByHire(runtime, exposedToolName, scope, window, deadline)
+  const openingsResult = options.includeOpenings
+    ? await contain("the closed-openings count", () =>
+        readOpeningsClosedByHire(runtime, exposedToolName, scope, window, deadline))
     : null;
-  if (openings && openings.kind === "counts") {
+  if (openingsResult?.kind === "cancelled") return { kind: "denial", result: openingsResult.result };
+  const openings = openingsResult?.kind === "value" ? openingsResult.value : null;
+  if (openings) {
     statuses.push(openings.status);
     warnings.push(...openings.warnings);
   }
-  if (openings && openings.kind === "denial") {
-    warnings.push(denialWarning("the closed-openings count", openings.result));
+  if (openingsResult?.kind === "failed") {
+    warnings.push(openingsResult.warning);
   }
-  const openings_closed_by_hire: OpeningsClosedByHireCount = openings?.kind === "counts"
+  const openings_closed_by_hire: OpeningsClosedByHireCount = openings
     ? {
         ...base,
         value: openings.hireClosed,
@@ -698,8 +762,8 @@ export async function reconciliationLine(
         dated_from_fallback: 0,
         closed_with_no_reason: 0,
         closed_reason_unresolved: 0,
-        notes: openings?.kind === "denial"
-          ? [denialWarning("the closed-openings count", openings.result)]
+        notes: openingsResult?.kind === "failed"
+          ? [openingsResult.warning]
           : ["openings closed by a hire were not read"],
       };
 
@@ -807,18 +871,27 @@ async function readOpeningsClosedByHire(
     for (const rejected of outcome.dateParamsRejected) dateParamsRejected.add(rejected);
   }
 
-  const reasons = await readAllWithDateFallback<Record<string, unknown>>(
-    runtime,
-    exposedToolName,
-    "list_close_reasons",
-    sanitizeReadParams({}, runtime.limits, { allowedParamNames: HIRE_FACTS_ID_BRIDGE_READ_PARAM_NAMES }),
-    [],
-    deadline
-  );
-  if (reasons.read.kind === "denial") return { kind: "denial", result: reasons.read.result };
+  // No closed openings means no close_reason_id to resolve, so the dictionary read is skipped
+  // rather than paid for. An explicitly empty req scope must cost ZERO upstream reads, and this
+  // was the one call that still fired on it.
   const reasonNames = new Map<number, string>();
-  for (const row of reasons.read.rows) {
-    if (typeof row.id === "number" && typeof row.name === "string") reasonNames.set(row.id, row.name);
+  const reasonWarnings: string[] = [];
+  const reasonStatuses: ReadAllStatus[] = [];
+  if (rows.length > 0) {
+    const reasons = await readAllWithDateFallback<Record<string, unknown>>(
+      runtime,
+      exposedToolName,
+      "list_close_reasons",
+      sanitizeReadParams({}, runtime.limits, { allowedParamNames: HIRE_FACTS_ID_BRIDGE_READ_PARAM_NAMES }),
+      [],
+      deadline
+    );
+    if (reasons.read.kind === "denial") return { kind: "denial", result: reasons.read.result };
+    for (const row of reasons.read.rows) {
+      if (typeof row.id === "number" && typeof row.name === "string") reasonNames.set(row.id, row.name);
+    }
+    reasonWarnings.push(...reasons.read.warnings);
+    reasonStatuses.push(reasons.read.status);
   }
 
   let hireClosed = 0;
@@ -850,8 +923,8 @@ async function readOpeningsClosedByHire(
     windowAppliedLocally,
     dateParamsRejected: [...dateParamsRejected].sort(),
     rowsMissingField,
-    status: combineReadStatuses([...statuses, reasons.read.status]),
-    warnings: [...warnings, ...reasons.read.warnings],
+    status: combineReadStatuses([...statuses, ...reasonStatuses]),
+    warnings: [...warnings, ...reasonWarnings],
   };
 }
 
