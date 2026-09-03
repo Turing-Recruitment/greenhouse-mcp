@@ -281,8 +281,8 @@ describe("fold 2 item 5: a half-valid date object is a schema error, not a silen
       });
       assert.equal(result.isError ?? false, false);
       const call = calls.find((entry) => entry.toolName === "list_applications");
-      assert.equal(call?.params?.["created_at[gte]"], "2026-04-01");
-      assert.equal(call?.params?.["created_at[lte]"], "2026-06-30");
+      assert.equal(call?.params?.["created_at[gte]"], "2026-04-01T00:00:00Z");
+      assert.equal(call?.params?.["created_at[lte]"], "2026-06-30T23:59:59Z");
 
       const listed = await client.listTools();
       const applications = listed.tools.find((tool) => tool.name === "search_my_applications");

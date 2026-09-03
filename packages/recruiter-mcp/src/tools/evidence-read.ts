@@ -49,6 +49,7 @@ import {
   localWindowDisclosure,
   readAllWithDateFallback,
   type DateWindowSpec,
+  toWireDateTime,
 } from "./read-with-date-fallback.js";
 
 const APPLICATION_ID_BATCH_SIZE = 25;
@@ -263,11 +264,11 @@ function translateRangeParams(
       const [start, end] = value.split("..", 2);
       const spec: DateWindowSpec = { field: key };
       if (start) {
-        out[`${key}[gte]`] = start;
+        out[`${key}[gte]`] = toWireDateTime(start, "gte");
         spec.gte = start;
       }
       if (end) {
-        out[`${key}[lte]`] = end;
+        out[`${key}[lte]`] = toWireDateTime(end, "lte");
         spec.lte = end;
       }
       if (spec.gte || spec.lte) windowSpecs.push(spec);
@@ -277,8 +278,9 @@ function translateRangeParams(
       const spec: DateWindowSpec = { field: key };
       for (const [operator, bound] of Object.entries(value as Record<string, unknown>)) {
         if (RANGE_OPERATORS.has(operator) && typeof bound === "string") {
-          out[`${key}[${operator}]`] = bound;
-          spec[operator as "gte" | "lte" | "gt" | "lt"] = bound;
+          const op = operator as "gte" | "lte" | "gt" | "lt";
+          out[`${key}[${op}]`] = toWireDateTime(bound, op);
+          spec[op] = bound;
         }
       }
       if (spec.gte || spec.lte || spec.gt || spec.lt) windowSpecs.push(spec);
