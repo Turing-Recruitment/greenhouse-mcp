@@ -54,6 +54,22 @@ function customFieldAware(handler: (...args: never[]) => unknown): boolean {
   return handler.toString().includes("list_custom_fields");
 }
 
+/**
+ * Which of the scorecard recipes' TWO window reads a /v3/scorecards call is.
+ *
+ * The recipes select their window on `interviewed_at` and again on `submitted_at` (the second read is
+ * what catches a card carrying only a submission date), so a fake reader sees two calls. Real
+ * Greenhouse answers each with the rows THAT filter matches; a fake that answers both with the same
+ * rows doubles the read-cost counters the recipe reports. Handlers use this to answer only the read
+ * their fixture rows would actually match.
+ */
+export function scorecardWindowFilter(params?: Record<string, unknown>): "interviewed_at" | "submitted_at" | null {
+  if (!params) return null;
+  if (params["interviewed_at[gte]"] !== undefined) return "interviewed_at";
+  if (params["submitted_at[gte]"] !== undefined) return "submitted_at";
+  return null;
+}
+
 export function scopedSuccess<T>(
   toolName: string,
   data: T,

@@ -1,14 +1,22 @@
 import { SCORECARD_ANALYSIS_READ_PARAM_NAMES, assertWindowWithinLimit, hasExplicitAnalysisWindow, isToolEnabled, readNonNegativeFiniteNumber, readPositiveInt, resolveAnalysisWindow, sanitizeReadParams } from "../limits.js";
+import { SCORECARD_WINDOW_CLOCK } from "./analysis-window-copy.js";
+import {
+  SCORECARD_MISSING_BASIS_DISCLOSURE,
+  SCORECARD_WINDOW_BASIS_LABEL,
+  partitionScorecardByWindow,
+  readScorecardsForWindow,
+  scorecardWindowBasis,
+} from "./scorecard-window.js";
 import { createToolDeadline, deny, emitRequiredToolAudit, enforceUsageBudget, isToolCancelledError, isToolTimeoutError, type RecruiterToolRuntime, type ToolDeadline } from "../runtime.js";
 import { newCorrelationId } from "../audit.js";
 import { IdentityResolutionError } from "../identity.js";
 import { buildEvidencePack, stripEvidencePackParams } from "./evidence-pack.js";
-import { loadApplicationJobIdsFromScopedList, readScorecardRowsForJobScope } from "./application-job-lookup.js";
+import { loadApplicationJobIdsFromScopedList } from "./application-job-lookup.js";
 import { readScorecardPersonId } from "./application-shapes.js";
 import { resolveAnalysisContext } from "../resolution/analysis-context.js";
 import { attachAnalysisScope, buildAnalysisCompleteness } from "../resolution/analysis-result.js";
 import { detectDataProvenance } from "../resolution/provenance.js";
-import { classifyUpstreamError, readAllScopedRows, readStatusMessage } from "../read-all.js";
+import { classifyUpstreamError, readStatusMessage } from "../read-all.js";
 import { buildScorecardFacts } from "../facts.js";
 import { buildAnalysisFactMetricLayer } from "./analysis-fact-metrics.js";
 import type { RecruiterToolDefinition, RecruiterToolResult } from "../types.js";
@@ -17,7 +25,8 @@ export const INTERVIEW_FEEDBACK_DRAG_TOOL: RecruiterToolDefinition = {
   name: "analyze_interview_feedback_drag",
   kind: "analysis",
   description:
-    "Rank delayed or missing interview feedback across the authenticated recruiter's permitted jobs using scoped scorecards, submission timing, affected jobs, and evidence ids.",
+    "Rank delayed or missing interview feedback across the authenticated recruiter's permitted jobs using scoped scorecards, submission timing, affected jobs, and evidence ids. " +
+    SCORECARD_WINDOW_CLOCK,
 };
 
 interface ScorecardRow extends Record<string, unknown> {
@@ -82,19 +91,21 @@ export async function runInterviewFeedbackDrag(
     // /v3/scorecards has NO job_ids filter and Harvest v3 REJECTS it with 422 (it does not
     // ignore it), so job_ids is never forwarded to the scorecard read below. A narrowed scope
     // is bridged job -> application_ids and scorecards are read by application_ids
-    // (readScorecardRowsForJobScope). An undefined job_ids means "all permitted jobs", unchanged.
+    // (readScorecardsForWindow's one derive hop). An undefined job_ids means "all permitted jobs".
     const requestedJobIds = parseRequestedJobIds(params.job_ids);
     const window = resolveAnalysisWindow(params, runtime.now, 30);
-    // An EXPLICIT window runs free of maxLookbackDays (in-memory cap, guards no API cost).
+    // A caller-stated window (explicit params, or a time phrase in the question forwarded by the
+    // planner) runs free of maxLookbackDays (in-memory cap, guards no API cost).
     if (!hasExplicitAnalysisWindow(params)) assertWindowWithinLimit(window.windowStart, window.windowEnd, runtime.limits);
     const maxRankings = Math.min(readPositiveInt(params.max_rankings) ?? runtime.limits.maxRankings, runtime.limits.maxRankings);
     const maxEvidenceIds = runtime.limits.maxEvidenceIds;
     const dueDays = readNonNegativeFiniteNumber(params.due_days) ?? 2;
+    // No created_at floor: the recipe reports an INTERVIEW-date window, so it selects on one
+    // (readScorecardsForWindow adds the interviewed_at / submitted_at range bounds per read).
     const scorecardParams = sanitizeReadParams(
       {
         ...params,
         per_page: params.per_page,
-        created_at: `gte|${window.windowStart}`,
       },
       runtime.limits,
       { allowedParamNames: SCORECARD_ANALYSIS_READ_PARAM_NAMES }
@@ -107,32 +118,43 @@ export async function runInterviewFeedbackDrag(
     // Never send job_ids to /v3/scorecards (422s on it); the narrowed read bridges to application_ids.
     delete scorecardParams.job_ids;
 
-    const scorecards = requestedJobIds
-      ? await readScorecardRowsForJobScope<ScorecardRow>(runtime, toolName, [...requestedJobIds], scorecardParams, deadline)
-      : await readAllScopedRows<ScorecardRow>(runtime, toolName, "list_scorecards", scorecardParams, deadline);
+    const scorecards = await readScorecardsForWindow<ScorecardRow>(runtime, toolName, requestedJobIds, scorecardParams, window, deadline);
     if (scorecards.kind === "denial") {
       const auditDenied = await emitAnalysisAudit(runtime, startedAt, correlationId, scorecards.result, null, null, actAsUser);
       return auditDenied ?? scorecards.result;
     }
 
-    const windowed = scorecards.rows.filter((row) => scorecardInWindow(row, window.windowStart, window.windowEnd));
-    const outsideWindowCount = scorecards.rows.length - windowed.length;
-    const applicationJobIds = await loadApplicationJobIds(runtime, windowed, deadline);
+    // ONE partition per row, decided in a fixed precedence: missing_basis, then outside_window, then
+    // submitted_before_interview, then in_window. Every count below is therefore disjoint and they sum
+    // to the rows read, which is what makes the completeness identity
+    // total_records_in_scope === records_analyzed + records_excluded true. Counting the window
+    // partition and the submitted-before-interview drop independently gave a row TWO memberships (3
+    // rows, 4 memberships on the D2b fixture) and told the reader a card was both analysed in-window
+    // and excluded.
+    const partitions = partitionFeedbackRows(scorecards.rows, window);
+    const windowedEntries = partitions.inWindow;
+    const outsideWindowCount = partitions.outsideWindow;
+    const missingBasisCount = partitions.missingBasis;
+    const submittedBeforeInterview = partitions.submittedBeforeInterview;
+    const applicationJobIds = await loadApplicationJobIds(runtime, windowedEntries.map((entry) => entry.row), deadline);
     if (applicationJobIds.denial) {
       const result = deny(toolName, applicationJobIds.denial.code, applicationJobIds.denial.message);
       const auditDenied = await emitAnalysisAudit(runtime, startedAt, correlationId, result, null, null, actAsUser);
       return auditDenied ?? result;
     }
-    const resolvableToAnyJob = filterRowsWithResolvedApplicationJob(windowed, applicationJobIds);
-    const unresolvedAssociationCount = windowed.length - resolvableToAnyJob.length;
+    const resolvableToAnyJob = windowedEntries.filter((entry) =>
+      hasResolvedApplicationJob(entry.row, applicationJobIds)
+    );
+    const unresolvedAssociationCount = windowedEntries.length - resolvableToAnyJob.length;
     // Re-apply the resolved job scope: because /v3/scorecards could not filter by job, a
     // narrowed request would otherwise analyze every permitted job's scorecards.
-    const resolvableScorecards = requestedJobIds
-      ? resolvableToAnyJob.filter((row) =>
-          requestedJobIds.has(applicationJobIds.jobIdsByApplication.get(row.application_id as number) as number))
+    const inScopeEntries = requestedJobIds
+      ? resolvableToAnyJob.filter((entry) =>
+          requestedJobIds.has(applicationJobIds.jobIdsByApplication.get(entry.row.application_id as number) as number))
       : resolvableToAnyJob;
-    const outOfScopeCount = resolvableToAnyJob.length - resolvableScorecards.length;
-    const observations = buildObservations(resolvableScorecards, window.windowEnd, dueDays);
+    const outOfScopeCount = resolvableToAnyJob.length - inScopeEntries.length;
+    const resolvableScorecards = inScopeEntries.map((entry) => entry.row);
+    const observations = buildObservations(inScopeEntries, dueDays);
     const rankings = buildRankings(observations, applicationJobIds, dueDays)
       .slice(0, maxRankings)
       .map((entry, index) => ({
@@ -188,6 +210,19 @@ export async function runInterviewFeedbackDrag(
       rows_dropped_outside_requested_scope: outOfScopeCount,
       scoped_job_count: countScopedJobs(applicationJobIds, requestedJobIds),
       read_warnings: scorecards.warnings,
+      data_quality: {
+        window_basis: SCORECARD_WINDOW_BASIS_LABEL,
+        // Disjoint by construction: in_window counts the rows that are in-window AND carry a
+        // measurable feedback delay, so a submitted-before-interview card appears in exactly one of
+        // these and the four sum to rows_fetched.
+        in_window: windowedEntries.length,
+        outside_window: outsideWindowCount,
+        missing_basis: missingBasisCount,
+        submitted_before_interview: submittedBeforeInterview,
+        missing_basis_note: SCORECARD_MISSING_BASIS_DISCLOSURE,
+        submitted_before_interview_note:
+          "A scorecard whose submitted_at precedes its interviewed_at yields no measurable feedback delay, so it is excluded from the delay statistics rather than counted as instant feedback.",
+      },
     };
     const metrics = {
       scorecards_considered: observations.length,
@@ -231,6 +266,12 @@ export async function runInterviewFeedbackDrag(
         exclusionReasons: [
           ...(outsideWindowCount > 0
             ? [{ reason: "outside_analysis_window", count: outsideWindowCount }]
+            : []),
+          ...(missingBasisCount > 0
+            ? [{ reason: "missing_window_basis", count: missingBasisCount }]
+            : []),
+          ...(submittedBeforeInterview > 0
+            ? [{ reason: "submitted_before_interview", count: submittedBeforeInterview }]
             : []),
           ...(unresolvedAssociationCount > 0
             ? [{ reason: "unresolved_application_job_association", count: unresolvedAssociationCount }]
@@ -277,25 +318,68 @@ async function loadApplicationJobIds(runtime: RecruiterToolRuntime, scorecards: 
   return loadApplicationJobIdsFromScopedList(runtime, appIds, deadline);
 }
 
-function buildObservations(scorecards: ScorecardRow[], windowEnd: string, dueDays: number): FeedbackObservation[] {
-  return scorecards.flatMap((row) => {
-    const basis = row.interviewed_at ?? row.submitted_at;
-    if (!basis) return [];
-    const submitted = isSubmittedScorecard(row);
-    const delayDays = submitted && row.submitted_at
+interface WindowedFeedbackRow {
+  row: ScorecardRow;
+  /** Days from the interview (or submission) basis to submission, or to window_end when unsubmitted. */
+  delayDays: number;
+}
+
+interface FeedbackRowPartitions {
+  inWindow: WindowedFeedbackRow[];
+  outsideWindow: number;
+  missingBasis: number;
+  submittedBeforeInterview: number;
+}
+
+/**
+ * Assign every row read exactly one partition, in precedence order, and carry the measured delay
+ * forward so nothing downstream can drop a row without counting it.
+ *
+ * A card whose submitted_at PRECEDES its interviewed_at yields no measurable delay (daysBetween is
+ * null on a negative span). That is a property of the row itself, not of the job scope, so it is
+ * decided here — before the application -> job bridge — and the row never reaches the observations.
+ */
+function partitionFeedbackRows(
+  rows: ScorecardRow[],
+  window: { windowStart: string; windowEnd: string }
+): FeedbackRowPartitions {
+  const partitions: FeedbackRowPartitions = { inWindow: [], outsideWindow: 0, missingBasis: 0, submittedBeforeInterview: 0 };
+  for (const row of rows) {
+    const partition = partitionScorecardByWindow(row, window.windowStart, window.windowEnd);
+    if (partition === "missing_basis") {
+      partitions.missingBasis += 1;
+      continue;
+    }
+    if (partition === "outside_window") {
+      partitions.outsideWindow += 1;
+      continue;
+    }
+    const basis = scorecardWindowBasis(row)!;
+    const delayDays = isSubmittedScorecard(row) && row.submitted_at
       ? daysBetween(basis, row.submitted_at)
-      : daysBetween(basis, windowEnd);
-    if (delayDays === null) return [];
-    const unsubmitted = !submitted;
-    return [{
+      : daysBetween(basis, window.windowEnd);
+    if (delayDays === null) {
+      partitions.submittedBeforeInterview += 1;
+      continue;
+    }
+    partitions.inWindow.push({ row, delayDays });
+  }
+  return partitions;
+}
+
+/** Rows reaching here are in-window, in-scope, and already carry a measurable delay. */
+function buildObservations(entries: WindowedFeedbackRow[], dueDays: number): FeedbackObservation[] {
+  return entries.map(({ row, delayDays }) => {
+    const submitted = isSubmittedScorecard(row);
+    return {
       scorecardId: readPositiveNumber(row.id),
       applicationId: readPositiveNumber(row.application_id),
       personId: readScorecardPersonId(row),
       submitted,
       late: delayDays > dueDays,
-      unsubmitted,
+      unsubmitted: !submitted,
       delayDays,
-    }];
+    };
   });
 }
 
@@ -334,14 +418,12 @@ function buildRankings(
   return [...byPerson.values()].sort((a, b) => severityScore(b, dueDays) - severityScore(a, dueDays) || b.lateOrUnsubmitted - a.lateOrUnsubmitted || a.personKey.localeCompare(b.personKey));
 }
 
-function filterRowsWithResolvedApplicationJob(
-  scorecards: ScorecardRow[],
+function hasResolvedApplicationJob(
+  row: ScorecardRow,
   applications: { jobIdsByApplication: Map<number, number | null> }
-): ScorecardRow[] {
-  return scorecards.filter((row) => {
-    if (!isPositiveInteger(row.application_id)) return false;
-    return isPositiveInteger(applications.jobIdsByApplication.get(row.application_id));
-  });
+): boolean {
+  if (!isPositiveInteger(row.application_id)) return false;
+  return isPositiveInteger(applications.jobIdsByApplication.get(row.application_id));
 }
 
 function severityScore(entry: FeedbackAccumulator, dueDays: number): number {
@@ -349,13 +431,6 @@ function severityScore(entry: FeedbackAccumulator, dueDays: number): number {
   const volumeComponent = entry.lateOrUnsubmitted * 8;
   const delayComponent = Math.max(0, mean(entry.delayDays) - dueDays) * 5;
   return Math.round(rateComponent + volumeComponent + delayComponent);
-}
-
-function scorecardInWindow(row: ScorecardRow, startIso: string, endIso: string): boolean {
-  const basis = row.interviewed_at ?? row.submitted_at;
-  if (!basis) return true;
-  const at = Date.parse(basis);
-  return Number.isFinite(at) && at >= Date.parse(startIso) && at <= Date.parse(endIso);
 }
 
 function isSubmittedScorecard(row: ScorecardRow): boolean {

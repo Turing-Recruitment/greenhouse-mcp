@@ -3,7 +3,7 @@ import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { EVIDENCE_TOOL_DEFINITIONS, evidenceToolParamsSchema, runEvidenceTool } from "./evidence.js";
 import { INTERVIEW_FEEDBACK_DRAG_TOOL, runInterviewFeedbackDrag } from "./interview-feedback-drag.js";
 import { PIPELINE_QUALITY_TOOL, runPipelineQuality } from "./pipeline-quality.js";
-import { QUESTION_ANSWER_TOOL, runRecruitingQuestionAnswer } from "./question-answer.js";
+import { PLANNER_RECIPE_IDS, QUESTION_ANSWER_TOOL, runRecruitingQuestionAnswer } from "./question-answer.js";
 import { SCORECARD_ACCOUNTABILITY_TOOL, runScorecardAccountability } from "./scorecard-accountability.js";
 import { SOURCE_QUALITY_TOOL, runSourceQuality } from "./source-quality.js";
 import { REJECTION_REASON_DRIFT_TOOL, runRejectionReasonDrift } from "./rejection-reason-drift.js";
@@ -19,6 +19,12 @@ import {
   runGetRecruitingCapabilities,
   runResolveJobScope,
 } from "./job-scope/tools.js";
+import {
+  PIPELINE_WINDOW_END_PARAM,
+  PIPELINE_WINDOW_START_PARAM,
+  SCORECARD_WINDOW_END_PARAM,
+  SCORECARD_WINDOW_START_PARAM,
+} from "./analysis-window-copy.js";
 import { isActionToolGranted, isToolEnabled, validateRecruiterToolConfig } from "../limits.js";
 import { mcpTextResult, runActionTool, type RecruiterToolRuntime } from "../runtime.js";
 import { ACTION_DEFINITIONS } from "../../../action-mcp/dist/index.js";
@@ -187,6 +193,18 @@ const getJobScopeSchema = {
   scope_handle: z.string().describe("scope_handle to inspect."),
 };
 
+/**
+ * The tool TITLE a client shows in its picker, derived from the tool name ("search_my_jobs" ->
+ * "Search my jobs"). The SDK's `tool()` overload has no title parameter and passes `undefined`
+ * (mcp.js), so every tool listed as an unreadable snake_case identifier; `ToolAnnotations.title` is
+ * the documented carrier the same overload DOES forward into the listed definition, so the title
+ * rides there. Action tools override it with the title their own definition declares.
+ */
+export function titleFromToolName(name: string): string {
+  const words = name.replace(/_/g, " ").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
 export const RECRUITER_READ_ONLY_TOOL_ANNOTATIONS: ToolAnnotations = {
   readOnlyHint: true,
   destructiveHint: false,
@@ -239,6 +257,9 @@ function actionParamsShape(schema: z.ZodTypeAny): Record<string, z.ZodTypeAny> {
 export function registerRecruiterTools(server: McpToolRegistrar, runtime: RecruiterToolRuntime): string[] {
   validateRecruiterToolConfig(runtime.toolConfig, RECRUITER_TOOL_DEFINITIONS.map((tool) => tool.name));
   const pending: PendingToolRegistration[] = [];
+  // Action tools carry the title their own definition declares; every read tool derives one from its
+  // name at emit time.
+  const explicitTitles = new Map<string, string>();
   const catalogServer: McpToolRegistrar = {
     tool(name, description, paramsSchema, annotations, handler) {
       pending.push({ name, description, paramsSchema, annotations, handler, originalIndex: pending.length });
@@ -286,8 +307,8 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
       SCORECARD_ACCOUNTABILITY_TOOL.name,
       SCORECARD_ACCOUNTABILITY_TOOL.description,
       {
-        window_start: z.string().optional().describe("Inclusive ISO timestamp/date for the analysis window start. Defaults to 30 days before window_end."),
-        window_end: z.string().optional().describe("Inclusive ISO timestamp/date for the analysis window end. Defaults to now."),
+        window_start: z.string().optional().describe(SCORECARD_WINDOW_START_PARAM),
+        window_end: z.string().optional().describe(SCORECARD_WINDOW_END_PARAM),
         job_ids: z.string().optional().describe("Optional comma-separated job ids; still scoped by Greenhouse permissions."),
         max_rankings: z.number().int().positive().optional().describe("Maximum ranked people to return, capped by runtime limits."),
         per_page: z.number().int().positive().optional().describe("Scorecard page size, capped by runtime limits."),
@@ -303,8 +324,8 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
       INTERVIEW_FEEDBACK_DRAG_TOOL.name,
       INTERVIEW_FEEDBACK_DRAG_TOOL.description,
       {
-        window_start: z.string().optional().describe("Inclusive ISO timestamp/date for the analysis window start. Defaults to 30 days before window_end."),
-        window_end: z.string().optional().describe("Inclusive ISO timestamp/date for the analysis window end. Defaults to now."),
+        window_start: z.string().optional().describe(SCORECARD_WINDOW_START_PARAM),
+        window_end: z.string().optional().describe(SCORECARD_WINDOW_END_PARAM),
         job_ids: z.string().optional().describe("Optional comma-separated job ids; still scoped by Greenhouse permissions."),
         due_days: z.number().nonnegative().optional().describe("Feedback SLA in days. Defaults to 2."),
         max_rankings: z.number().int().positive().optional().describe("Maximum ranked people to return, capped by runtime limits."),
@@ -341,8 +362,8 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
       PIPELINE_QUALITY_TOOL.name,
       PIPELINE_QUALITY_TOOL.description,
       {
-        window_start: z.string().optional().describe("Inclusive ISO timestamp/date for freshness lookback. Defaults to 90 days before window_end, capped by runtime limits."),
-        window_end: z.string().optional().describe("Snapshot as-of timestamp/date. Defaults to now."),
+        window_start: z.string().optional().describe(PIPELINE_WINDOW_START_PARAM),
+        window_end: z.string().optional().describe(PIPELINE_WINDOW_END_PARAM),
         job_ids: z.string().optional().describe("Optional comma-separated job ids; still scoped by Greenhouse permissions."),
         status: z.string().optional().describe("Optional application status filter."),
         stale_days: z.number().nonnegative().optional().describe("Last-activity age counted as stale for active applications. Defaults to 14 days."),
@@ -404,7 +425,11 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
         role_families: z.array(z.string()).optional().describe("Optional role-family phrases to resolve before analysis."),
         requisition_ids: z.array(z.string()).optional().describe("Optional requisition ids to resolve before analysis."),
         greenhouse_job_ids: z.array(z.number().int().positive()).optional().describe("Optional exact Greenhouse job ids to validate and resolve before analysis."),
-        recipes: z.string().optional().describe("Optional comma-separated approved recipe aliases: scorecard_accountability, interview_feedback_drag, stage_latency, pipeline_quality, source_quality."),
+        // Generated from the planner's own executable list. The hand-written copy this replaces had
+        // gone stale: it omitted rejection_reason_drift, and the alias parser silently DROPS a token
+        // it does not know, so a model asking for the unlisted recipe got a different analysis with
+        // no error. Every id below round-trips through parseExplicitRecipes (locked by test D7).
+        recipes: z.string().optional().describe(`Optional comma-separated approved recipe ids: ${PLANNER_RECIPE_IDS.join(", ")}. Unrecognized tokens are ignored.`),
         max_recipes: z.number().int().positive().optional().describe("Maximum approved recipes to run, capped by the planner."),
         window_start: z.string().optional().describe("Inclusive ISO timestamp/date for recipe windows."),
         window_end: z.string().optional().describe("Inclusive ISO timestamp/date for recipe windows."),
@@ -463,10 +488,11 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
   if (runtime.actionPlane) {
     const service = runtime.actionPlane.buildService(runtime);
     for (const definition of ACTION_DEFINITIONS) {
-      for (const [tool, title, schema, annotations, run] of [
+      for (const [tool, title, toolTitle, schema, annotations, run] of [
         [
           definition.previewTool,
           definition.previewDescription,
+          definition.previewTitle,
           definition.catalogPreviewSchema ?? definition.previewSchema,
           RECRUITER_ACTION_PREVIEW_ANNOTATIONS,
           (params: Record<string, unknown>) => service.preview(definition.kind, params),
@@ -474,12 +500,14 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
         [
           definition.applyTool,
           definition.applyDescription,
+          definition.applyTitle,
           definition.catalogApplySchema ?? definition.applySchema,
           RECRUITER_ACTION_APPLY_ANNOTATIONS,
           (params: Record<string, unknown>) => service.apply(definition.kind, params),
         ],
       ] as const) {
         if (!isActionToolGranted(runtime.toolConfig, runtime.session.surface, tool)) continue;
+        explicitTitles.set(tool, toolTitle);
         catalogServer.tool(tool, title, actionParamsShape(schema), annotations, async (params) =>
           mcpTextResult(await runActionTool(runtime, tool, () => run(params)))
         );
@@ -495,7 +523,10 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
       registration.name,
       registration.description,
       registration.paramsSchema,
-      registration.annotations,
+      // A FRESH object per registration: the shared annotation constants are frozen contracts read
+      // by the container self-check and the distribution validator, and mutating one to add a title
+      // would retitle every tool that shares it.
+      { ...registration.annotations, title: explicitTitles.get(registration.name) ?? titleFromToolName(registration.name) },
       registration.handler
     );
   }

@@ -2,13 +2,15 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_LIMITS } from "../src/limits.js";
 import { runInterviewFeedbackDrag } from "../src/tools/interview-feedback-drag.js";
-import { analysisRuntime, fakeScopedReader, operatorInventory, scopedDenial, scopedSuccess, testRuntime } from "./test-helpers.js";
+import { analysisRuntime, fakeScopedReader, operatorInventory, scopedDenial, scopedSuccess, scorecardWindowFilter, testRuntime } from "./test-helpers.js";
 import { nestedScorecard } from "./fixtures-production-shapes.js";
 
 describe("interview feedback drag analysis", () => {
   it("attributes feedback drag by nested interviewer/submitter shape, not one 'unknown' bucket (production-shape lock — B1)", async () => {
-    const scopedReader = fakeScopedReader((toolName) => {
+    const scopedReader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_scorecards") {
+        // Answer only the interviewed_at read: these fixtures all carry an interviewed_at.
+        if (scorecardWindowFilter(params) === "submitted_at") return scopedSuccess(toolName, []);
         return scopedSuccess(toolName, [
           nestedScorecard({ id: 1, application_id: 10, interviewer: { id: 5 } }),
           nestedScorecard({ id: 2, application_id: 20, submitted_by: { id: 6 } }),
@@ -42,7 +44,13 @@ describe("interview feedback drag analysis", () => {
   it("ranks delayed and missing feedback with scoped evidence and affected jobs", async () => {
     const scopedReader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_scorecards") {
-        assert.equal(params?.created_at, "gte|2026-05-24T12:00:00.000Z");
+        // Answer only the interviewed_at read: these fixtures all carry an interviewed_at.
+        if (scorecardWindowFilter(params) === "submitted_at") return scopedSuccess(toolName, []);
+        // The window is now selected on the basis the recipe reports (interviewed_at, and again
+        // submitted_at for cards carrying only a submission date) — never a created_at floor.
+        assert.equal(params?.created_at, undefined);
+        assert.equal(params?.["interviewed_at[gte]"], "2026-05-24T12:00:00.000Z");
+        assert.equal(params?.["interviewed_at[lte]"], "2026-06-23T12:00:00.000Z");
         assert.equal(params?.detail_profile, undefined);
         assert.equal(params?.evidence_pack, undefined);
         assert.equal(params?.evidence_pack_limit, undefined);
@@ -122,6 +130,8 @@ describe("interview feedback drag analysis", () => {
       assert.equal(options?.actAsUser, 321);
       assert.ok(options?.signal instanceof AbortSignal);
       if (toolName === "list_scorecards") {
+        // Answer only the interviewed_at read: these fixtures all carry an interviewed_at.
+        if (scorecardWindowFilter(params) === "submitted_at") return scopedSuccess(toolName, []);
         return scopedSuccess(toolName, [], null, {
           actorId: 900,
           effectiveActorId: 321,
@@ -155,6 +165,8 @@ describe("interview feedback drag analysis", () => {
   it("drops feedback observations whose application job association cannot be resolved during analysis", async () => {
     const scopedReader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_scorecards") {
+        // Answer only the interviewed_at read: these fixtures all carry an interviewed_at.
+        if (scorecardWindowFilter(params) === "submitted_at") return scopedSuccess(toolName, []);
         return scopedSuccess(toolName, [
           { id: 1, application_id: 10, interviewer_id: 5, submitter_id: null, status: "pending", submitted_at: null, interviewed_at: "2026-06-10T00:00:00.000Z" },
           { id: 2, application_id: 20, interviewer_id: 6, submitter_id: null, status: "pending", submitted_at: null, interviewed_at: "2026-06-10T00:00:00.000Z" },
@@ -190,6 +202,8 @@ describe("interview feedback drag analysis", () => {
         return scopedSuccess(toolName, [{ id: 100 }, { id: 200 }]);
       }
       if (toolName === "list_scorecards") {
+        // Answer only the interviewed_at read: these fixtures all carry an interviewed_at.
+        if (scorecardWindowFilter(params) === "submitted_at") return scopedSuccess(toolName, []);
         return scopedSuccess(toolName, [
           { id: 1, application_id: 10, interviewer_id: 5, submitter_id: null, status: "pending", submitted_at: null, interviewed_at: "2026-06-15T00:00:00.000Z" },
           { id: 2, application_id: 20, interviewer_id: 6, submitter_id: null, status: "pending", submitted_at: null, interviewed_at: "2026-06-15T00:00:00.000Z" },
@@ -219,6 +233,8 @@ describe("interview feedback drag analysis", () => {
         return scopedSuccess(toolName, [{ id: 10, job_id: 9001004 }]);
       }
       if (toolName === "list_scorecards") {
+        // Answer only the interviewed_at read: these fixtures all carry an interviewed_at.
+        if (scorecardWindowFilter(params) === "submitted_at") return scopedSuccess(toolName, []);
         if (params?.job_ids !== undefined) {
           // Reproduce Harvest's 422 rejection of job_ids on /v3/scorecards.
           return scopedDenial(toolName, "TOOL_NOT_AVAILABLE");
@@ -243,8 +259,10 @@ describe("interview feedback drag analysis", () => {
   });
 
   it("fails closed when secondary application-job lookup is denied", async () => {
-    const scopedReader = fakeScopedReader((toolName) => {
+    const scopedReader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_scorecards") {
+        // Answer only the interviewed_at read: these fixtures all carry an interviewed_at.
+        if (scorecardWindowFilter(params) === "submitted_at") return scopedSuccess(toolName, []);
         return scopedSuccess(toolName, [
           { id: 1, application_id: 10, interviewer_id: 5, submitter_id: null, status: "pending", submitted_at: null, interviewed_at: "2026-06-10T00:00:00.000Z" },
         ], null, { rowCounts: { raw: 1, returned: 1 } });
@@ -260,15 +278,18 @@ describe("interview feedback drag analysis", () => {
 
     assert.equal(result.ok, false);
     assert.equal(result.ok === false && result.denial.code, "PERMISSION_LOOKUP_FAILED");
-    assert.deepStrictEqual(scopedReader.calls.map((call) => call.toolName), ["list_scorecards", "list_applications"]);
+    // Two scorecard reads: the window is selected on interviewed_at and again on submitted_at.
+    assert.deepStrictEqual(scopedReader.calls.map((call) => call.toolName), ["list_scorecards", "list_scorecards", "list_applications"]);
     assert.equal(auditSink.events[0]!.denialCode, "PERMISSION_LOOKUP_FAILED");
     assert.equal(auditSink.events[0]!.rowsRead, null);
   });
 
   it("drops feedback observations with unsafe application ids before secondary job lookup", async () => {
     const unsafeId = Number.MAX_SAFE_INTEGER + 1;
-    const scopedReader = fakeScopedReader((toolName) => {
+    const scopedReader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_scorecards") {
+        // Answer only the interviewed_at read: these fixtures all carry an interviewed_at.
+        if (scorecardWindowFilter(params) === "submitted_at") return scopedSuccess(toolName, []);
         return scopedSuccess(toolName, [
           { id: unsafeId, application_id: unsafeId, interviewer_id: unsafeId, submitter_id: null, status: "pending", submitted_at: null, interviewed_at: "2026-06-10T00:00:00.000Z" },
         ], null, { rowCounts: { raw: 1, returned: 1 } });
@@ -286,7 +307,7 @@ describe("interview feedback drag analysis", () => {
     assert.equal(data.summary.rows_dropped_unresolved_job_association, 1);
     assert.equal(data.metrics.scorecards_considered, 0);
     assert.deepStrictEqual(data.rankings, []);
-    assert.deepStrictEqual(scopedReader.calls.map((call) => call.toolName), ["list_scorecards"]);
+    assert.deepStrictEqual(scopedReader.calls.map((call) => call.toolName), ["list_scorecards", "list_scorecards"]);
     assert.doesNotMatch(JSON.stringify(data), /9007199254740992|9007199254740993/);
   });
 
@@ -304,8 +325,10 @@ describe("interview feedback drag analysis", () => {
   it("stops secondary application lookups when the analysis deadline is exhausted", async () => {
     const startedAt = Date.parse("2026-06-23T12:00:00.000Z");
     let now = startedAt;
-    const scopedReader = fakeScopedReader((toolName) => {
+    const scopedReader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_scorecards") {
+        // Answer only the interviewed_at read: these fixtures all carry an interviewed_at.
+        if (scorecardWindowFilter(params) === "submitted_at") return scopedSuccess(toolName, []);
         now = startedAt + 10;
         return scopedSuccess(toolName, [
           { id: 1, application_id: 10, interviewer_id: 5, status: "pending", submitted_at: null, interviewed_at: "2026-06-10T00:00:00.000Z" },

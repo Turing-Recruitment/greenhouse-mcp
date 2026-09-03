@@ -98,8 +98,14 @@ describe("Harvest v3 param contract — no scoped read sends an unsupported para
         assert.ok(endpoint, `no v3 endpoint mapping for scoped tool "${call.toolName}" — extend the registry map`);
         for (const param of Object.keys(call.params ?? {})) {
           if (NON_ENDPOINT_CONTROL_PARAMS.has(param)) continue;
+          // v3 expresses a date range as bracket params on the base filter
+          // (interviewed_at[gte]=...), which is what evidence-read.ts translates the model-facing
+          // shorthands into and what sanitizeReadParams admits by base name. Check the BASE, so a
+          // declared range filter passes while the F5 class — a param the endpoint does not declare
+          // at all, bracketed or not — still fails here.
+          const declaredName = param.replace(/\[(gte|lte|gt|lt)\]$/, "");
           assert.ok(
-            endpoint!.params.has(param),
+            endpoint!.params.has(declaredName),
             `${recipe.name}: read to ${endpoint!.path} sent "${param}", which the vendored v3 spec does not declare for that endpoint (declared: ${[...endpoint!.params].sort().join(", ")})`
           );
         }

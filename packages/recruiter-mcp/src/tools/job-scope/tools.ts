@@ -1,5 +1,6 @@
+import { ACTION_DEFINITIONS } from "../../../../action-mcp/dist/index.js";
 import { newCorrelationId } from "../../audit.js";
-import { isToolEnabled, readPositiveInt } from "../../limits.js";
+import { isActionToolGranted, isToolEnabled, readPositiveInt } from "../../limits.js";
 import {
   createToolDeadline,
   deny,
@@ -415,7 +416,7 @@ export async function runGetRecruitingCapabilities(
     ok: true,
     toolName,
     scoped: true,
-    data: getRecruitingCapabilities(activeAllowlistedTools(runtime)),
+    data: getRecruitingCapabilities(activeAllowlistedTools(runtime), grantedActionTools(runtime)),
     nextCursor: null,
   };
   const audited = await emitRequiredToolAudit(runtime, toolName, "analysis", startedAt, correlationId, result, null, null, actAsUser, { scopeAction: "capabilities" });
@@ -425,6 +426,31 @@ export async function runGetRecruitingCapabilities(
 function activeAllowlistedTools(runtime: RecruiterToolRuntime): Set<string> | undefined {
   if (!runtime.toolConfig.allowedTools) return undefined;
   return new Set([...runtime.toolConfig.allowedTools].filter((name) => !runtime.toolConfig.disabledTools.has(name)));
+}
+
+/**
+ * The write tools this session's catalog ACTUALLY mounts.
+ *
+ * `activeAllowlistedTools` above is built from `config.allowedTools` alone, and action tools never
+ * live there — they live in `config.grantedTools` and register through `isActionToolGranted`
+ * (register.ts). So on the entitled production session the capabilities tool received a set with no
+ * `apply_*` name in it, concluded there was no write plane, and told the model so while 22 write
+ * tools sat in the same catalog.
+ *
+ * This walks the registrar's OWN loop rather than the grant set: `ACTION_DEFINITIONS` is the catalog
+ * `registerRecruiterTools` iterates (register.ts), and `isActionToolGranted` is the per-name gate it
+ * applies (grant held, server not disabled, name not in GREENHOUSE_RECRUITER_DISABLE_TOOLS, surface
+ * enabled). Announcing the grant set instead announced names the catalog never mounted: a grant is
+ * only shape-checked (`preview_`/`apply_` + snake_case, action-tools.ts), so a name outside the action
+ * catalog passed straight through and was advertised as an available write tool.
+ */
+function grantedActionTools(runtime: RecruiterToolRuntime): ReadonlySet<string> {
+  if (!runtime.actionPlane) return new Set();
+  return new Set(
+    ACTION_DEFINITIONS
+      .flatMap((definition) => [definition.previewTool, definition.applyTool])
+      .filter((name) => isActionToolGranted(runtime.toolConfig, runtime.session.surface, name))
+  );
 }
 
 // ---------------------------------------------------------------------------

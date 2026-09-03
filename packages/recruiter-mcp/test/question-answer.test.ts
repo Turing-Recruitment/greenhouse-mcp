@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_LIMITS } from "../src/limits.js";
 import { BROAD_DIAGNOSTIC_RECIPES, PLANNER_RECIPE_IDS, runRecruitingQuestionAnswer } from "../src/tools/question-answer.js";
-import { fakeScopedReader, scopedSuccess, testRuntime } from "./test-helpers.js";
+import { fakeScopedReader, scopedSuccess, scorecardWindowFilter, testRuntime } from "./test-helpers.js";
 
 // The inventory loader now issues four enrichment reads (offices/departments/job posts/post
 // locations — the multi-signal matching joins, 2026-07-02) alongside list_jobs; planner tests
@@ -42,6 +42,8 @@ describe("recruiting question planner", () => {
       const ownerScope = ownedRecruiterScope(toolName, [10, 20]);
       if (ownerScope) return ownerScope;
       if (toolName === "list_scorecards") {
+        // Answer only the interviewed_at read: these fixtures all carry an interviewed_at.
+        if (scorecardWindowFilter(params) === "submitted_at") return scopedSuccess(toolName, []);
         return scopedSuccess(toolName, [
           { id: 501, application_id: 100, interviewer_id: 7, status: "pending", submitted_at: null, interviewed_at: "2026-06-10T00:00:00.000Z" },
           { id: 502, application_id: 101, interviewer_id: 7, status: "submitted", submitted_at: "2026-06-20T00:00:00.000Z", interviewed_at: "2026-06-19T00:00:00.000Z" },
@@ -77,6 +79,9 @@ describe("recruiting question planner", () => {
     assert.deepStrictEqual(data.summary.plan.requiredEndpoints, ["/v3/applications", "/v3/scorecards"]);
     assert.equal(data.summary.plan.requiredProjectionProfile, "recruiter_default");
     assert.equal(data.summary.plan.needsUserConfirmation, false);
+    // 6 = 3 scorecards + the application_ids bridge derive (3), which now runs ONCE for both
+    // window-basis reads instead of once per read. The ids cannot change between two reads inside
+    // one tool call, so the second derive was pure re-read cost (9 -> 6 on this fixture).
     assert.equal(data.summary.rows_read, 6);
     assert.equal(data.summary.rows_considered, 3);
     assert.equal(data.analyses.length, 1);
@@ -115,6 +120,8 @@ describe("recruiting question planner", () => {
         ]);
       }
       if (toolName === "list_scorecards") {
+        // Answer only the interviewed_at read: these fixtures all carry an interviewed_at.
+        if (scorecardWindowFilter(params) === "submitted_at") return scopedSuccess(toolName, []);
         return scopedSuccess(toolName, [
           { id: 501, application_id: 100, interviewer_id: 7, status: "pending", submitted_at: null, interviewed_at: "2026-06-10T00:00:00.000Z" },
         ]);

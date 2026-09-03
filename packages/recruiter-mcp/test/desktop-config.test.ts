@@ -109,7 +109,7 @@ describe("desktop distribution config generator", () => {
     assert.deepEqual(report.config, {
       type: "mcp",
       server_label: "greenhouse-recruiter",
-      server_description: "Recruiter-scoped Greenhouse read and analysis tools.",
+      server_description: "Recruiter-scoped Greenhouse evidence and analysis; write actions appear only for entitled sessions.",
       server_url: "https://greenhouse-recruiter.example.com/mcp",
       authorization: "durable-user-token",
       require_approval: "always",
@@ -130,7 +130,7 @@ describe("desktop distribution config generator", () => {
     assert.deepEqual(report.config, {
       type: "mcp",
       server_label: "greenhouse-recruiter-pilot",
-      server_description: "Recruiter-scoped Greenhouse read and analysis tools.",
+      server_description: "Recruiter-scoped Greenhouse evidence and analysis; write actions appear only for entitled sessions.",
       server_url: "https://greenhouse-recruiter.example.com/mcp",
       authorization: "durable-user-token",
       require_approval: "never",
