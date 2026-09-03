@@ -31,7 +31,7 @@ function listPaths(file: string): string[] {
  * someone must classify the new path as fenced or exempt, in writing, before the suite goes green.
  */
 const EXPECTED_READS: Readonly<Record<string, readonly string[]>> = {
-  "application-assignment.ts": ["/users"],
+  "application-assignment.ts": ["/user_job_permissions", "/users"],
   "application-attribution.ts": ["/referrers", "/sources"],
   "application-rejection.ts": ["/notes", "/rejection_details", "/rejection_reasons"],
   "application-stage-move.ts": ["/job_interview_stages"],
@@ -93,6 +93,12 @@ describe("fence structure (Phase 2c Slice 5)", () => {
     // custom-fields.ts sits outside actions/ but is read by four prepares; same rule.
     for (const path of listPaths(join(ACTION_SRC, "custom-fields.ts"))) {
       assert.ok(PATH_DISPOSITION[path], `custom-fields.ts reads ${path} with no disposition`);
+    }
+
+    // service.ts reads the actor's display name for the attribution disclosure (P4); a read added
+    // there must be classified like any prepare's read.
+    for (const path of listPaths(join(ACTION_SRC, "service.ts"))) {
+      assert.ok(PATH_DISPOSITION[path], `service.ts reads ${path} with no disposition`);
     }
   });
 
