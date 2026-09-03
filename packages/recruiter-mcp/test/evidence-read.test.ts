@@ -760,9 +760,31 @@ describe("evidence search time windows + continuation (live-pilot fix #2)", () =
 
     assert.equal(result.ok, true);
     const upstream = reader.calls[0]!.params as Record<string, unknown>;
-    assert.equal(upstream["resolved_at[gte]"], "2026-04-01", "range start becomes the gte bracket param");
-    assert.equal(upstream["resolved_at[lte]"], "2026-06-30", "range end becomes the lte bracket param");
+    assert.equal(upstream["resolved_at[gte]"], "2026-04-01T00:00:00Z", "range start becomes the gte bracket param, widened to the start of that day");
+    assert.equal(upstream["resolved_at[lte]"], "2026-06-30T23:59:59Z", "range end becomes the lte bracket param, widened to the end of that day");
     assert.equal("resolved_at" in upstream, false, "the raw range string never reaches Greenhouse");
+  });
+
+  // Live 2026-09-03: /v3/applications 422s a bare calendar date in a bracket param ("value does not
+  // match format: date-time"). Every wire form must carry an RFC 3339 instant; a bound that already
+  // has one passes through untouched.
+  it("sends date-only bounds to Greenhouse as RFC 3339 date-times in every range form", async () => {
+    const reader = fakeScopedReader((toolName) => scopedSuccess(toolName, offerRows(1, 1), null));
+    const { runtime } = testRuntime(reader);
+
+    await runEvidenceTool(runtime, "search_my_offers", { resolved_at: { gte: "2026-09-01", lte: "2026-09-04" } });
+    await runEvidenceTool(runtime, "search_my_offers", { resolved_at: { gt: "2026-09-01", lt: "2026-09-04" } });
+    await runEvidenceTool(runtime, "search_my_offers", { resolved_at: "2026-09-01.." });
+    await runEvidenceTool(runtime, "search_my_offers", { resolved_at: { gte: "2026-09-01T12:30:00Z" } });
+
+    const [inclusive, exclusive, openEnded, timed] = reader.calls.map((call) => call.params as Record<string, unknown>);
+    assert.equal(inclusive!["resolved_at[gte]"], "2026-09-01T00:00:00Z");
+    assert.equal(inclusive!["resolved_at[lte]"], "2026-09-04T23:59:59Z", "an inclusive upper bound covers the whole day");
+    assert.equal(exclusive!["resolved_at[gt]"], "2026-09-01T00:00:00Z");
+    assert.equal(exclusive!["resolved_at[lt]"], "2026-09-04T00:00:00Z", "an exclusive upper bound stops at the start of the day");
+    assert.equal(openEnded!["resolved_at[gte]"], "2026-09-01T00:00:00Z");
+    assert.equal("resolved_at[lte]" in openEnded!, false);
+    assert.equal(timed!["resolved_at[gte]"], "2026-09-01T12:30:00Z", "a bound that already carries a time is not rewritten");
   });
 
   it("translates the object range form ({gte,lte}) to bracket params", async () => {
@@ -790,7 +812,7 @@ describe("evidence search time windows + continuation (live-pilot fix #2)", () =
 
     assert.equal(result.ok, true);
     const upstream = reader.calls[0]!.params as Record<string, unknown>;
-    assert.equal(upstream["resolved_at[gte]"], "2026-04-01");
+    assert.equal(upstream["resolved_at[gte]"], "2026-04-01T00:00:00Z");
     assert.equal("resolved_at[junk]" in upstream, false, "unknown range operators are dropped");
     assert.equal(Object.keys(upstream).some((key) => key.startsWith("not_a_param")), false, "a disallowed base never smuggles through as a bracket param");
   });

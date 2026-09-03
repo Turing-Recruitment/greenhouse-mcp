@@ -75,12 +75,28 @@ export const LOCAL_WINDOW_NOTE =
  * filter builds the SAME shape (`resolved_at[gte]=…`) and the fallback leg can strip exactly what
  * it added.
  */
+const DATE_ONLY_BOUND = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * The value a bound takes ON THE WIRE. Harvest v3 validates bracket range params as RFC 3339
+ * date-times and 422s a bare calendar date (`created_at[gte]=2026-09-01` → "value does not match
+ * format: date-time", live 2026-09-03 on /v3/applications). Callers and the model think in
+ * calendar dates, so a date-only bound is widened to the instant it means: the start of that day
+ * for `gte`/`gt`/`lt`, the end of that day for the inclusive `lte`. A value that already carries a
+ * time passes through untouched. The DateWindowSpec keeps the caller's original text — the local
+ * window (applyLocalWindow) has its own calendar-date semantics and must not be fed wire strings.
+ */
+export function toWireDateTime(bound: string, operator: "gte" | "lte" | "gt" | "lt"): string {
+  if (!DATE_ONLY_BOUND.test(bound)) return bound;
+  return operator === "lte" ? `${bound}T23:59:59Z` : `${bound}T00:00:00Z`;
+}
+
 export function bracketParamsForWindows(specs: readonly DateWindowSpec[]): Record<string, string> {
   const params: Record<string, string> = {};
   for (const spec of specs) {
     for (const operator of ["gte", "lte", "gt", "lt"] as const) {
       const bound = spec[operator];
-      if (typeof bound === "string" && bound.length > 0) params[`${spec.field}[${operator}]`] = bound;
+      if (typeof bound === "string" && bound.length > 0) params[`${spec.field}[${operator}]`] = toWireDateTime(bound, operator);
     }
   }
   return params;

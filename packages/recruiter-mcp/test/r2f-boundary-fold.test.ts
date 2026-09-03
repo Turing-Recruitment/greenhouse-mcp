@@ -58,8 +58,8 @@ describe("R2 fold 5/23: the boundary accepts every date form its own guidance su
       });
       assert.equal(result.isError ?? false, false, "the object form must not be a -32602 boundary error");
       const call = calls.find((entry) => entry.toolName === "list_applications");
-      assert.equal(call?.params?.["created_at[gte]"], "2026-04-01");
-      assert.equal(call?.params?.["created_at[lte]"], "2026-06-30");
+      assert.equal(call?.params?.["created_at[gte]"], "2026-04-01T00:00:00Z");
+      assert.equal(call?.params?.["created_at[lte]"], "2026-06-30T23:59:59Z");
     });
   });
 
@@ -68,8 +68,8 @@ describe("R2 fold 5/23: the boundary accepts every date form its own guidance su
       await client.callTool({ name: "search_my_applications", arguments: { created_at: "2026-04-01..2026-06-30" } });
       await client.callTool({ name: "search_my_offers", arguments: { created_at: "2026-04-01T00:00:00Z" } });
       const application = calls.find((entry) => entry.toolName === "list_applications");
-      assert.equal(application?.params?.["created_at[gte]"], "2026-04-01");
-      assert.equal(application?.params?.["created_at[lte]"], "2026-06-30");
+      assert.equal(application?.params?.["created_at[gte]"], "2026-04-01T00:00:00Z");
+      assert.equal(application?.params?.["created_at[lte]"], "2026-06-30T23:59:59Z");
       const offer = calls.find((entry) => entry.toolName === "list_offers");
       assert.equal(offer?.params?.created_at, "2026-04-01T00:00:00Z");
     });
@@ -84,14 +84,14 @@ describe("R2 fold 5/23: the boundary accepts every date form its own guidance su
     assert.equal(result.ok, true);
     assert.deepEqual(result.ok ? result.read?.bounds_treated_inclusive : null, ["created_at"]);
     const call = reader.calls.find((entry) => entry.toolName === "list_applications");
-    assert.equal(call?.params?.["created_at[gte]"], "2026-04-01", "the marker never reaches the read");
+    assert.equal(call?.params?.["created_at[gte]"], "2026-04-01T00:00:00Z", "the marker never reaches the read");
   });
 
   it("marks gt/lt at the schema boundary and leaves gte/lte unmarked", async () => {
     await withClient(async (client, calls) => {
       await client.callTool({ name: "search_my_applications", arguments: { created_at: { gt: "2026-04-01" } } });
       const call = calls.find((entry) => entry.toolName === "list_applications");
-      assert.equal(call?.params?.["created_at[gte]"], "2026-04-01");
+      assert.equal(call?.params?.["created_at[gte]"], "2026-04-01T00:00:00Z");
       assert.equal(
         JSON.stringify(call?.params ?? {}).includes("inclusive-bounds:"),
         false,
