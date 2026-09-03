@@ -1,6 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { FactBuildResult, FactCompletenessStatus } from "../src/facts.js";
+import { projectEvidenceResult } from "../src/tools/evidence-projection.js";
+import { SCOPED_ENDPOINT_ADAPTERS_BY_EVIDENCE_TOOL } from "../src/tools/scoped-endpoint-adapters.js";
+import type { RecruiterProjectionMetadata } from "../src/types.js";
 import {
   METRIC_REGISTRY,
   METRIC_REGISTRY_BY_ID,
@@ -250,5 +253,130 @@ describe("metric registry", () => {
     const conversion = computeMetric("stage_conversion_rate", context);
     assert.equal(conversion.value, null);
     assert.equal(conversion.completeness, "failed_missing_fact");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H0a: what registering hire_count actually does to the GLOBAL blocks-answer map.
+//
+// METRIC_IDS_BY_REQUIRED_FIELD (evidence-projection.ts) is built from every
+// registered metric's requiredFields and consulted on EVERY endpoint projection:
+// an omitted field that is any metric's required field becomes a blocks_answer
+// omission on that endpoint, whatever the caller was asking for.
+//
+// The first version of this suite locked only the KEY SET and claimed from that
+// that "no endpoint gains a blocks_answer omission". That claim was FALSE, and
+// the test could not see it: buildProjectionMetadata pushes one omission PER
+// METRIC ID, so a projection dropping `status` now emits a hire_count entry
+// beside the five that were already there. What is locked below is therefore the
+// real projection output, and the claim is narrowed to what is true — no new
+// FIELD key, so no endpoint starts blocking on a field it did not block on, and
+// no projection flips from complete to incomplete.
+//
+// The decision to keep `status` anyway is argued at the registry entry
+// (metrics.ts): without it a status-dropping projection yields a confident,
+// complete hire count of ZERO.
+// ---------------------------------------------------------------------------
+describe("METRIC_IDS_BY_REQUIRED_FIELD key set", () => {
+  // Snapshot taken BEFORE hire_count was registered. Adding hire_count must leave
+  // it byte-identical; a diff here means some endpoint projection just started
+  // reporting blocks_answer for a field it never blocked on.
+  const REQUIRED_FIELD_KEYS_BEFORE_HIRE_COUNT = [
+    "application_stage_id",
+    "approval_status",
+    "availability_received_at",
+    "created_at",
+    "days_in_stage",
+    "exited_at",
+    "interviewed_at",
+    "open",
+    "pool_id",
+    "pool_stage_id",
+    "related_post_id",
+    "scheduled_at",
+    "scorecard_id",
+    "source_id",
+    "status",
+    "submitted_at",
+    "tracking_link_id",
+    "type",
+  ];
+
+  function requiredFieldKeys(): string[] {
+    return [...new Set(METRIC_REGISTRY.flatMap((metric) => metric.requiredFields))].sort();
+  }
+
+  // /v3/prospect_pools documents no `status` response field, so the contract allowlist drops it —
+  // a real projection that really omits `status`, not a hand-built stand-in.
+  function statusOmittingProjection() {
+    const adapter = SCOPED_ENDPOINT_ADAPTERS_BY_EVIDENCE_TOOL.get("search_my_prospect_pools");
+    assert.ok(adapter, "search_my_prospect_pools must be a projected evidence endpoint");
+    const projected = projectEvidenceResult(
+      {
+        ok: true,
+        toolName: "search_my_prospect_pools",
+        actorId: 1,
+        effectiveActorId: 1,
+        scoped: true,
+        permissionScope: { kind: "jobs", permittedJobCount: 1 },
+        data: [{ id: 1, name: "Inbound pool", status: "open" }],
+        nextCursor: null,
+      } as never,
+      adapter
+    );
+    const projection = (projected as unknown as { projection: RecruiterProjectionMetadata }).projection;
+    assert.ok(projection, "the adapter form of projectEvidenceResult attaches projection metadata");
+    return projection;
+  }
+
+  it("registers hire_count with the single field that adds no new key", () => {
+    const hireCount = METRIC_REGISTRY_BY_ID.get("hire_count");
+    assert.ok(hireCount, "hire_count must be registered");
+    assert.deepStrictEqual(hireCount!.requiredFields, ["status"]);
+    assert.equal(hireCount!.windowField, "resolved_at", "the clock a hire is windowed on is declared, not inferred");
+    assert.deepStrictEqual(hireCount!.requiredFacts, ["hire_fact"]);
+  });
+
+  it("adds no field key to the global blocks-answer map", () => {
+    assert.deepStrictEqual(
+      requiredFieldKeys(),
+      REQUIRED_FIELD_KEYS_BEFORE_HIRE_COUNT,
+      "a new key here makes some endpoint projection start blocking on a field it never blocked on"
+    );
+    assert.ok(
+      REQUIRED_FIELD_KEYS_BEFORE_HIRE_COUNT.includes("status"),
+      "hire_count's only required field was already a key, so its metric id joins an existing entry"
+    );
+  });
+
+  it("DOES add its own blocks_answer omission wherever status is dropped — on a projection already marked incomplete", () => {
+    const projection = statusOmittingProjection();
+    assert.deepStrictEqual(
+      projection.omittedFields.map((omission) => omission.field),
+      ["status"],
+      "the fixture omits exactly the field under test"
+    );
+    const metricIds = projection.requiredFieldOmissions.map((omission) => omission.metricOrFact);
+    assert.ok(metricIds.includes("hire_count"), "registering hire_count really does add an entry here — that is the honest claim");
+    // The five that were already there. hire_count joins them; it does not create the condition.
+    for (const existing of [
+      "scorecard_submission_rate",
+      "weekly_qualified_pipeline_movement",
+      "source_quality_by_outcome",
+      "opening_fill_status",
+      "offer_resolution",
+    ]) {
+      assert.ok(metricIds.includes(existing), `${existing} already blocked on a dropped status`);
+    }
+    assert.equal(
+      projection.incompleteProjection,
+      true,
+      "and it was ALREADY incomplete for this field, so hire_count changes the disclosure's length, not its verdict"
+    );
+    assert.deepStrictEqual(
+      [...new Set(projection.requiredFieldOmissions.map((omission) => omission.field))],
+      ["status"],
+      "no field other than the one omitted is implicated"
+    );
   });
 });

@@ -360,6 +360,155 @@ export function buildOfferFacts(
   });
 }
 
+/**
+ * One HIRE, as Harvest v3 can actually express it.
+ *
+ * There is no hire timestamp on the application row: `/v3/applications` carries `status`,
+ * `rejected_at`, `created_at` and `last_activity_at` and nothing named `hired_at`, and the `hired`
+ * status only appears once somebody calls the hire endpoint. So the hire IS the accepted offer, and
+ * its date is `offers.resolved_at` — the definition every published report on this tenant already
+ * uses.
+ *
+ * `hired_at` and `dated_from` exist together because `resolved_at` is not always written: on the TI
+ * census `sent_on` was populated on 53 of 62 accepted offers, and the reverse gap is real too. A
+ * hire with no `resolved_at` is dated from `sent_on` and SAYS so on the row rather than being
+ * dropped from the count — an approximation labeled as one, never a silent short number.
+ */
+export interface HireFact {
+  offer_id: number;
+  job_id: number;
+  application_id?: number;
+  candidate_id?: number;
+  opening_id?: number;
+  status: string;
+  /** The hire date this fact is counted on. */
+  hired_at: string;
+  /** Which field `hired_at` came from. `sent_on` is a labeled approximation of the hire date. */
+  dated_from: "resolved_at" | "sent_on";
+  resolved_at?: string;
+  sent_on?: string;
+  starts_on?: string;
+  version?: number;
+  /**
+   * The offer's custom fields — compensation among them. Values on definitions Greenhouse flags
+   * `private` are already stripped upstream (private-custom-fields.ts), so what arrives here is
+   * what this actor may see; withholding it again here would withhold twice for one permission.
+   */
+  custom_fields?: Record<string, unknown>;
+}
+
+/** The value the /v3/offers `status` filter is sent, verbatim, on the hire read's wire request. */
+export const HIRE_ACCEPTED_OFFER_STATUS = "Accepted";
+
+/**
+ * What an offer row's status MEANS, decided in exactly one place.
+ *
+ * Before this there were two answers in one report: the hire count matched `Accepted` exactly while
+ * the acceptance mix matched case-insensitively on a substring, so on a tenant that writes
+ * "accepted" or "Accepted - verbal" the lead sentence and the rate beneath it counted different
+ * offers and neither said so. Offer status vocabulary is TENANT-DEFINED (this tenant capitalizes:
+ * Accepted / Rejected / Created / Deprecated), so the tolerant reading is the correct one — but it
+ * has to be the ONLY one.
+ *
+ * `superseded` is checked first: a Deprecated row is a previous version of an offer, not an
+ * outcome, and it must never land in a rate's denominator.
+ */
+export type OfferStatusClass = "accepted" | "rejected" | "superseded" | "outstanding" | "unknown";
+
+export function classifyOfferStatus(status: unknown): OfferStatusClass {
+  const normalized = typeof status === "string" ? status.trim().toLowerCase() : "";
+  if (normalized.length === 0) return "unknown";
+  if (normalized.includes("deprecat")) return "superseded";
+  if (normalized.includes("reject") || normalized.includes("declin")) return "rejected";
+  if (normalized.includes("accept")) return "accepted";
+  return "outstanding";
+}
+
+/**
+ * Build hire facts from /v3/offers rows.
+ *
+ * Deliberately NOT `buildFacts`: three of its four exclusion classes are not data defects, and
+ * routing them through the shared dropped-row counter would report `failed_endpoint` — which
+ * `metricReadiness` turns into a null metric — for a read that simply contained offers that are not
+ * hires. Only a row with no stable ids is a defect here. Everything else is disclosed as an
+ * omission and the completeness stays honest.
+ */
+export function buildHireFacts(
+  rows: unknown,
+  projection?: RecruiterProjectionMetadata
+): FactBuildResult<HireFact> {
+  const records = asRecords(rows);
+  const facts: HireFact[] = [];
+  let missingIdentifiers = 0;
+  let notAccepted = 0;
+  let datedFromSentOn = 0;
+  let undated = 0;
+
+  for (const row of records) {
+    const offerId = positiveInteger(row.id);
+    const jobId = positiveInteger(row.job_id);
+    if (offerId === undefined || jobId === undefined) {
+      missingIdentifiers += 1;
+      continue;
+    }
+    const status = stringField(row.status);
+    if (classifyOfferStatus(status) !== "accepted") {
+      notAccepted += 1;
+      continue;
+    }
+    const resolvedAt = timestampField(row.resolved_at);
+    const sentOn = timestampField(row.sent_on);
+    const hiredAt = resolvedAt ?? sentOn;
+    if (hiredAt === undefined) {
+      undated += 1;
+      continue;
+    }
+    if (resolvedAt === undefined) datedFromSentOn += 1;
+    const fact: Record<string, unknown> = {
+      offer_id: offerId,
+      job_id: jobId,
+      application_id: positiveInteger(row.application_id),
+      candidate_id: positiveInteger(row.candidate_id),
+      opening_id: positiveInteger(row.opening_id),
+      status,
+      hired_at: hiredAt,
+      dated_from: resolvedAt === undefined ? "sent_on" : "resolved_at",
+      resolved_at: resolvedAt,
+      sent_on: sentOn,
+      starts_on: stringField(row.starts_on),
+      version: finiteNumber(row.version),
+      custom_fields: isRecord(row.custom_fields) ? row.custom_fields : undefined,
+    };
+    facts.push(compactFact(fact) as unknown as HireFact);
+  }
+
+  const projectionOmissions = projection?.requiredFieldOmissions ?? [];
+  const omissions = [
+    ...projectionOmissions.map((omission) => `${omission.metricOrFact}:${omission.endpointPath}.${omission.field}:${omission.impact}`),
+    ...(missingIdentifiers > 0 ? [`${missingIdentifiers} offer row(s) omitted because required identifiers were missing.`] : []),
+    ...(notAccepted > 0 ? [`${notAccepted} offer row(s) excluded because their status is not Accepted (only accepted offers count as hires).`] : []),
+    ...(datedFromSentOn > 0
+      ? [`${datedFromSentOn} hire(s) carried no resolved_at and were dated from sent_on instead — an approximation of the hire date, labeled on each row as dated_from: "sent_on".`]
+      : []),
+    ...(undated > 0
+      ? [`${undated} accepted offer(s) had no resolved_at and no sent_on, so they carry no hire date and are excluded from every windowed count.`]
+      : []),
+  ];
+
+  return {
+    facts,
+    requiredEndpoints: ["/v3/offers"],
+    requiredProjectionProfile: projection?.profile ?? "recruiter_default",
+    completeness: missingIdentifiers > 0
+      ? "failed_endpoint"
+      : projectionOmissions.length > 0
+        ? "incomplete_projection"
+        : "complete",
+    omissions,
+    projectionOmissions,
+  };
+}
+
 export interface ApprovalFlowFact {
   approval_flow_id: number;
   job_id?: number;
@@ -562,6 +711,17 @@ function positiveIntegerArray(value: unknown): number[] | undefined {
 
 function stringField(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * A timestamp only counts as one if it PARSES. An empty or malformed date string would otherwise
+ * date a hire to nothing at all and still read as present, which is how a hire count silently
+ * acquires rows that no window can place.
+ */
+function timestampField(value: unknown): string | undefined {
+  const text = stringField(value);
+  if (text === undefined) return undefined;
+  return Number.isFinite(Date.parse(text)) ? text : undefined;
 }
 
 function booleanField(value: unknown): boolean | undefined {

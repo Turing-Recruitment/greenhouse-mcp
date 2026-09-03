@@ -1,5 +1,4 @@
 import { newCorrelationId } from "../audit.js";
-import { httpErrorStatus } from "../upstream-error.js";
 import { isToolEnabled, readPositiveInt, sanitizeReadParams } from "../limits.js";
 import {
   combineReadStatuses,
@@ -46,6 +45,11 @@ import {
   SCOPED_ENDPOINT_ADAPTERS_BY_PATH,
   type EvidenceEndpointAdapter,
 } from "./scoped-endpoint-adapters.js";
+import {
+  localWindowDisclosure,
+  readAllWithDateFallback,
+  type DateWindowSpec,
+} from "./read-with-date-fallback.js";
 
 const APPLICATION_ID_BATCH_SIZE = 25;
 
@@ -125,30 +129,22 @@ export async function runEvidenceListRead(
       bridgeEnvelope = bridged.bridge;
       scopeEnvelope = buildScopeEnvelope(scope);
     } else {
-      let readAll: Awaited<ReturnType<typeof readAllScopedRows<Record<string, unknown>>>>;
-      try {
-        readAll = await readAllScopedRows<Record<string, unknown>>(runtime, exposedToolName, adapter.scopedToolName, safeParams, deadline);
-      } catch (error) {
-        // Self-healing docs-vs-live divergence (live demo, 2026-07-02): some LIVE endpoints 422
-        // date filters the vendored contract advertises (offers rejects resolved_at/created_at/
-        // updated_at; applications accepts them). Native filtering stays the first attempt —
-        // cheap where supported — and a 422 with range params in play re-reads WITHOUT them and
-        // applies the window locally to the complete scoped set, disclosed below.
-        if (windowSpecs.length === 0 || httpErrorStatus(error) !== 422) throw error;
-        const stripped = Object.fromEntries(
-          Object.entries(safeParams).filter(([key]) => !/\[(gte|lte|gt|lt)\]$/.test(key))
-        );
-        readAll = await readAllScopedRows<Record<string, unknown>>(runtime, exposedToolName, adapter.scopedToolName, stripped, deadline);
-        if (readAll.kind !== "denial") {
-          const windowed = applyLocalWindow(readAll.rows, windowSpecs);
-          windowAppliedLocally = {
-            fields: windowSpecs.map((spec) => spec.field),
-            rows_missing_field: windowed.missing,
-            note: "Upstream rejected the date filter (422 — this endpoint does not support it live); the window was applied locally to the complete scoped set. Rows lacking the field were excluded.",
-          };
-          readAll = { ...readAll, rows: windowed.rows };
-        }
-      }
+      // Self-healing docs-vs-live divergence (live demo, 2026-07-02): some LIVE endpoints 422
+      // date filters the vendored contract advertises (offers rejects resolved_at/created_at/
+      // updated_at; applications accepts them). Native filtering stays the first attempt —
+      // cheap where supported — and a 422 with range params in play re-reads WITHOUT them and
+      // applies the window locally to the complete scoped set, disclosed below. The two legs now
+      // live in readAllWithDateFallback so the recipes and the planner reach the same self-heal.
+      const outcome = await readAllWithDateFallback<Record<string, unknown>>(
+        runtime,
+        exposedToolName,
+        adapter.scopedToolName,
+        safeParams,
+        windowSpecs,
+        deadline
+      );
+      const readAll = outcome.read;
+      windowAppliedLocally = localWindowDisclosure(outcome);
       if (readAll.kind === "denial") return auditDenial(readAll.result);
       rows = readAll;
       if (bridgeSpec) {
@@ -255,14 +251,6 @@ const DATE_PARAM_PATTERN = /(_at|_on)$/;
  * passed through, and Greenhouse 400'd (live-pilot finding #2). Bare scalars pass through unchanged;
  * a base param not in the endpoint's allowlist keeps its original shape so sanitize drops it.
  */
-interface DateWindowSpec {
-  field: string;
-  gte?: string;
-  lte?: string;
-  gt?: string;
-  lt?: string;
-}
-
 function translateRangeParams(
   params: Record<string, unknown>,
   allowedParamNames: ReadonlySet<string> | undefined
@@ -299,36 +287,6 @@ function translateRangeParams(
     out[key] = value;
   }
   return { translated: out, windowSpecs };
-}
-
-// Date-only bounds (YYYY-MM-DD) are END-of-day inclusive for upper bounds under local windowing —
-// a timestamp ON the lte date must stay in-window, matching the upstream filters' semantics.
-const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
-
-function upperBound(bound: string): string {
-  return DATE_ONLY_PATTERN.test(bound) ? `${bound}T23:59:59.999Z` : bound;
-}
-
-function applyLocalWindow(
-  rows: Array<Record<string, unknown>>,
-  specs: DateWindowSpec[]
-): { rows: Array<Record<string, unknown>>; missing: number } {
-  let missing = 0;
-  const kept = rows.filter((row) => {
-    for (const spec of specs) {
-      const value = row[spec.field];
-      if (typeof value !== "string" || value.length === 0) {
-        missing += 1;
-        return false;
-      }
-      if (spec.gte && value < spec.gte) return false;
-      if (spec.gt && value <= upperBound(spec.gt)) return false;
-      if (spec.lte && value > upperBound(spec.lte)) return false;
-      if (spec.lt && value >= spec.lt) return false;
-    }
-    return true;
-  });
-  return { rows: kept, missing };
 }
 
 // An explicit caller per_page is a RESULT cap on list reads (upstream paging always runs at the
