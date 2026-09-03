@@ -41,6 +41,7 @@ const DESKTOP_USER_TEST_REPORT_FIELDS = new Set([
   "catalogAttestation",
   "catalogToolCount",
   "catalogToolNamesHash",
+  "observedToolNames",
   "containsTokens",
   "taskOutcome",
   "taskOutcomeReason",
@@ -302,6 +303,8 @@ export interface BuildDesktopUserTestEvidenceOptions {
   sessionPersistedAcrossRestart: boolean;
   routineReverificationPrompted: boolean;
   catalogAttestation: string;
+  /** The ordered tool names the tested client's tools/list returned. Recorded, then compared. */
+  observedToolNames?: string[];
   taskOutcome?: "useful" | "not_useful" | "could_not_use";
   taskOutcomeReason?: "wrong_scope" | "timeout_error" | "installation_blocked" | "answer_received" | "not_yet_needed";
   clientVersion?: string;
@@ -346,15 +349,60 @@ const ACTION_TOOL_NAMES: readonly string[] = ACTION_DEFINITIONS.flatMap((definit
  * The attestation token carries no count on purpose (a count baked into the vocabulary invalidated
  * recorded evidence on every catalog change and forced a rename across nine files). That left the
  * evidence unable to say WHICH catalog the tester saw, so a copied file stayed green through the next
- * catalog change — the exact staleness the release gate exists to catch. The hash is recorded here,
- * at build time, and the rollout gate recomputes it from the CURRENT catalog and requires a match:
+ * catalog change — the exact staleness the release gate exists to catch. The hash is recorded at
+ * build time, and the rollout gate recomputes it from the CURRENT catalog and requires a match:
  * change the catalog and yesterday's evidence stops passing, which is the point.
+ *
+ * This function is the CANONICAL side of that comparison — the catalog this build ships. What the
+ * tester saw comes in as `observedToolNames` and is hashed by `observedCatalogToolNamesHash`; the
+ * two meeting is the check. Hashing the source constants and calling the result "observed" was the
+ * fold: it recorded what the repo believed, whatever the deployment had actually served.
  */
 export function catalogToolNamesHash(attestation: DesktopCatalogAttestation): string {
-  const names = attestation === "write_entitled_full_catalog"
+  return observedCatalogToolNamesHash(canonicalCatalogToolNames(attestation));
+}
+
+/** The ordered names the tester's client returned from tools/list, hashed as recorded. */
+export function observedCatalogToolNamesHash(names: readonly string[]): string {
+  return createHash("sha256").update(names.join("\n")).digest("hex");
+}
+
+function canonicalCatalogToolNames(attestation: DesktopCatalogAttestation): string[] {
+  return attestation === "write_entitled_full_catalog"
     ? [...PILOT_TOOL_NAMES, ...ACTION_TOOL_NAMES]
     : [...PILOT_TOOL_NAMES];
-  return createHash("sha256").update(names.join("\n")).digest("hex");
+}
+
+/**
+ * The catalog the tester actually saw, checked against the one this build ships.
+ *
+ * Required, and compared position by position. A tester running current tooling against a stale or
+ * reordered deployment used to record the CURRENT hash regardless — the evidence said "I saw the
+ * shipping catalog" because the builder had looked it up rather than been told it. Now the ordered
+ * names come from the client's own tools/list, and a deployment serving anything else fails here, at
+ * record time, with the position that diverged named.
+ */
+function normalizeObservedToolNames(
+  values: string[] | undefined,
+  attestation: DesktopCatalogAttestation
+): string[] {
+  const names = (values ?? []).flatMap((value) => value.split(",").map((token) => token.trim()).filter(Boolean));
+  if (names.length === 0) {
+    throw new Error(
+      "--observed-tools is required: paste the ordered tool names the tested client's tools/list returned."
+    );
+  }
+  const expected = canonicalCatalogToolNames(attestation);
+  const divergence = names.findIndex((name, index) => name !== expected[index]);
+  if (names.length !== expected.length || divergence !== -1) {
+    const at = divergence === -1 ? Math.min(names.length, expected.length) : divergence;
+    throw new Error(
+      `Observed tool catalog does not match the ${attestation} catalog this build ships: `
+      + `expected ${expected.length} tools, saw ${names.length}; first difference at position ${at + 1} `
+      + `(expected ${expected[at] ?? "nothing"}, saw ${names[at] ?? "nothing"}).`
+    );
+  }
+  return names;
 }
 
 export interface DesktopUserTestReport {
@@ -379,6 +427,8 @@ export interface DesktopUserTestReport {
   catalogToolCount: number;
   /** sha256 of the ordered catalog names this evidence was recorded against (see catalogToolNamesHash). */
   catalogToolNamesHash: string;
+  /** The ordered names the tester's client actually listed. The hash above is of THESE. */
+  observedToolNames: string[];
   containsTokens: false;
   taskOutcome: "useful" | "not_useful" | "could_not_use";
   taskOutcomeReason: "wrong_scope" | "timeout_error" | "installation_blocked" | "answer_received" | "not_yet_needed";
@@ -448,6 +498,7 @@ export async function buildDesktopUserTestEvidenceFromManifests(
     throw new Error("Post-restart issued-at timestamp must match the issued durable session timestamp.");
   }
 
+  const observedToolNames = normalizeObservedToolNames(options.observedToolNames, catalogAttestation);
   const exercisedTools = normalizeExercisedTools(options.exercisedTools);
   const taskOutcome = normalizeTaskOutcome(options.taskOutcome, options.taskOutcomeReason);
   const clientVersion = normalizeVersion(options.clientVersion, "clientVersion");
@@ -475,8 +526,9 @@ export async function buildDesktopUserTestEvidenceFromManifests(
     attachmentMethod,
     exercisedTools,
     catalogAttestation,
-    catalogToolCount: EXPECTED_CATALOG_TOOL_COUNTS[catalogAttestation],
-    catalogToolNamesHash: catalogToolNamesHash(catalogAttestation),
+    catalogToolCount: observedToolNames.length,
+    catalogToolNamesHash: observedCatalogToolNamesHash(observedToolNames),
+    observedToolNames,
     containsTokens: false,
     ...taskOutcome,
     clientVersion,
@@ -507,6 +559,17 @@ export function validateDesktopRoutingAttestation(value: unknown): { ok: boolean
   }
   if (value.warning !== DESKTOP_USER_TEST_EVIDENCE_WARNING) {
     problems.push("routing_attestation_warning_invalid");
+  }
+  // The evidence must say what the tester SAW, not merely which enum they picked: without the
+  // observed names the recorded hash is unverifiable and the gate has nothing to compare against.
+  const observedToolNames = Array.isArray(value.observedToolNames) ? value.observedToolNames : null;
+  if (
+    observedToolNames === null
+    || observedToolNames.length === 0
+    || observedToolNames.some((name) => typeof name !== "string" || name.trim().length === 0)
+    || new Set(observedToolNames as string[]).size !== observedToolNames.length
+  ) {
+    problems.push("observed_tool_names_missing_or_invalid");
   }
   const rawExercisedTools = Array.isArray(value.exercisedTools) ? value.exercisedTools : [];
   let exercisedTools: string[] = [];
@@ -595,6 +658,7 @@ export async function startDesktopUserTestEvidenceCli(
       sessionPersistedAcrossRestart: parsed.attestSessionPersistedAcrossRestart,
       routineReverificationPrompted: !parsed.attestNoRoutineReverification,
       catalogAttestation: parsed.catalogAttestation ?? "",
+      observedToolNames: parsed.observedToolNames,
       taskOutcome: parsed.taskOutcome as BuildDesktopUserTestEvidenceOptions["taskOutcome"],
       taskOutcomeReason: parsed.taskOutcomeReason as BuildDesktopUserTestEvidenceOptions["taskOutcomeReason"],
       clientVersion: parsed.clientVersion,
@@ -631,6 +695,7 @@ function parseArgs(args: string[]): {
   attestSessionPersistedAcrossRestart: boolean;
   attestNoRoutineReverification: boolean;
   catalogAttestation?: string;
+  observedToolNames: string[];
   taskOutcome?: string;
   taskOutcomeReason?: string;
   clientVersion?: string;
@@ -640,6 +705,7 @@ function parseArgs(args: string[]): {
 } {
   const values = new Map<string, string>();
   const exercisedTools: string[] = [];
+  const observedToolNames: string[] = [];
   const routingChecks: DesktopRoutingCheckInput[] = [];
   let attestDurableSessionAccess = false;
   let attestSessionPersistedAcrossRestart = false;
@@ -667,7 +733,9 @@ function parseArgs(args: string[]): {
     const next = args[index + 1];
     if (!next || next.startsWith("--")) continue;
     const key = arg.slice(2);
-    if (key === "exercised-tool") {
+    if (key === "observed-tool") {
+      observedToolNames.push(next);
+    } else if (key === "exercised-tool") {
       exercisedTools.push(next);
     } else if (key === "routing-check") {
       routingChecks.push(parseRoutingCheck(next));
@@ -678,6 +746,8 @@ function parseArgs(args: string[]): {
   }
   const csvTools = values.get("exercised-tools");
   if (csvTools) exercisedTools.push(...csvTools.split(","));
+  const csvObserved = values.get("observed-tools");
+  if (csvObserved) observedToolNames.push(...csvObserved.split(","));
   return {
     surface: values.get("surface"),
     client: values.get("client"),
@@ -696,6 +766,7 @@ function parseArgs(args: string[]): {
     attestSessionPersistedAcrossRestart,
     attestNoRoutineReverification,
     catalogAttestation: values.get("attest-catalog"),
+    observedToolNames,
     taskOutcome: values.get("task-outcome"),
     taskOutcomeReason: values.get("task-outcome-reason"),
     clientVersion: values.get("client-version"),

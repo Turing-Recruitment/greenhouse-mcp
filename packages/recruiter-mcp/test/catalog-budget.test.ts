@@ -19,13 +19,18 @@ import type { AuthenticatedSession } from "../src/types.js";
  *   after R2c,     70 tools       120,918 B      +  5,046 B              = 125,964 B (~31.5k tokens)
  *   after R2d,     81 tools       139,220 B      +  5,046 B              = 144,266 B (~36.1k tokens)
  *   after the fold, 82 tools      140,255 B      +  5,173 B              = 145,428 B (~36.4k tokens)
+ *   after fold 2,  82 tools       140,255 B      +  5,173 B              = 145,428 B (unchanged)
  *
  * The fold added one reader (get_my_bulk_request, +821 B), the date preprocess (0 B — the advertised
  * schema is the same string), and the copy corrections (+341 B across descriptions and instructions).
+ * Fold 2 costs nothing: the date validation is a superRefine INSIDE the same preprocess, so the
+ * advertised parameter is still `{"type":"string"}`, and its remaining fixes are off the catalog.
  *
- * So the surface ends at 81 read tools — 37 more than a recruiter could reach before week two — for
- * 8,654 B LESS than the 66-tool catalog cost, and 20,743 B less than the 44 mounted tools plus the
- * 22 that were hidden. With a full write entitlement the 103-tool catalog is 182,821 B (~45.7k).
+ * So the surface ends at 82 read tools — 38 more than a recruiter could reach before week two — for
+ * 7,492 B LESS than the 66-tool catalog cost, and 19,581 B less than the 44 mounted tools plus the
+ * 22 that were hidden. With a full write entitlement the catalog is 104 tools. (The 81/103 this
+ * comment used to state was arithmetic from before get_my_bulk_request was bound in the same fold:
+ * the measurement four lines above already said 82.)
  *
  * Where the 66-tool baseline went (measured per parameter name, 619 params over 66 tools):
  *   created_at + updated_at   35,700 B   the anyOf date-range union on 117 params

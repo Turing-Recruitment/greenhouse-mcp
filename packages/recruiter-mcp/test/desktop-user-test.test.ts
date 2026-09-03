@@ -13,6 +13,17 @@ import {
   writeDesktopUserTestEvidenceFile,
 } from "../src/desktop-user-test.js";
 import { PILOT_TOOL_NAMES } from "../src/tools/register.js";
+import { ACTION_DEFINITIONS } from "../../action-mcp/dist/index.js";
+
+/**
+ * What a tester's client actually lists. Fold 2: the evidence records the ORDERED names the tester
+ * saw and the builder hashes those, so every call here has to hand over a catalog, not just an enum.
+ */
+const OBSERVED_READ_ONLY = [...PILOT_TOOL_NAMES];
+const OBSERVED_WRITE_ENTITLED = [
+  ...PILOT_TOOL_NAMES,
+  ...ACTION_DEFINITIONS.flatMap((definition: { previewTool: string; applyTool: string }) => [definition.previewTool, definition.applyTool]),
+];
 
 const ROUTING_CHECKS = DESKTOP_ROUTING_CASES.flatMap((routingCase) => Array.from(
   { length: MIN_ROUTING_RUNS },
@@ -88,6 +99,7 @@ describe("desktop user-test evidence", () => {
       sessionPersistedAcrossRestart: true,
       routineReverificationPrompted: false,
       catalogAttestation: "read_only_full_catalog",
+      observedToolNames: OBSERVED_READ_ONLY,
       taskOutcome: "useful",
       taskOutcomeReason: "answer_received",
       ...ROUTING_ATTESTATION,
@@ -151,6 +163,7 @@ describe("desktop user-test evidence", () => {
       sessionPersistedAcrossRestart: true,
       routineReverificationPrompted: false,
       catalogAttestation: "read_only_full_catalog",
+      observedToolNames: OBSERVED_READ_ONLY,
       taskOutcome: "useful",
       taskOutcomeReason: "answer_received",
       ...ROUTING_ATTESTATION,
@@ -189,6 +202,7 @@ describe("desktop user-test evidence", () => {
       sessionPersistedAcrossRestart: true,
       routineReverificationPrompted: false,
       catalogAttestation: "write_entitled_full_catalog",
+      observedToolNames: OBSERVED_WRITE_ENTITLED,
       taskOutcome: "useful",
       taskOutcomeReason: "answer_received",
       ...ROUTING_ATTESTATION,
@@ -224,6 +238,7 @@ describe("desktop user-test evidence", () => {
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
         catalogAttestation: "no_write_admin_tools",
+        observedToolNames: OBSERVED_READ_ONLY,
         taskOutcome: "useful",
         taskOutcomeReason: "answer_received",
         ...ROUTING_ATTESTATION,
@@ -254,6 +269,7 @@ describe("desktop user-test evidence", () => {
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
         catalogAttestation: "read_only_full_catalog",
+        observedToolNames: OBSERVED_READ_ONLY,
       }),
       /Post-restart token id must match/
     );
@@ -281,6 +297,7 @@ describe("desktop user-test evidence", () => {
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
         catalogAttestation: "read_only_full_catalog",
+        observedToolNames: OBSERVED_READ_ONLY,
       }),
       /sessionTokenIdAfterRestart.*token id/
     );
@@ -300,6 +317,7 @@ describe("desktop user-test evidence", () => {
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
         catalogAttestation: "read_only_full_catalog",
+        observedToolNames: OBSERVED_READ_ONLY,
       }),
       /sessionIssuedAtAfterRestart.*issued-at/
     );
@@ -331,6 +349,7 @@ describe("desktop user-test evidence", () => {
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
         catalogAttestation: "read_only_full_catalog",
+        observedToolNames: OBSERVED_READ_ONLY,
       }),
       /session issuance manifest tokenId.*token id/
     );
@@ -350,6 +369,7 @@ describe("desktop user-test evidence", () => {
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
         catalogAttestation: "read_only_full_catalog",
+        observedToolNames: OBSERVED_READ_ONLY,
       }),
       /desktop config manifest issuedAt.*issued-at/
     );
@@ -390,6 +410,7 @@ describe("desktop user-test evidence", () => {
           sessionPersistedAcrossRestart: true,
           routineReverificationPrompted: false,
           catalogAttestation: "read_only_full_catalog",
+          observedToolNames: OBSERVED_READ_ONLY,
         }),
         error
       );
@@ -428,6 +449,7 @@ describe("desktop user-test evidence", () => {
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
         catalogAttestation: "read_only_full_catalog",
+        observedToolNames: OBSERVED_READ_ONLY,
       }),
       /portable relative path/
     );
@@ -447,6 +469,7 @@ describe("desktop user-test evidence", () => {
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
         catalogAttestation: "read_only_full_catalog",
+        observedToolNames: OBSERVED_READ_ONLY,
       }),
       /portable relative path/
     );
@@ -474,6 +497,7 @@ describe("desktop user-test evidence", () => {
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: true,
         catalogAttestation: "read_only_full_catalog",
+        observedToolNames: OBSERVED_READ_ONLY,
       }),
       /no-routine-reverification/
     );
@@ -501,6 +525,7 @@ describe("desktop user-test evidence", () => {
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
         catalogAttestation: "read_only_full_catalog",
+        observedToolNames: OBSERVED_READ_ONLY,
       }),
       /analytical tool/
     );
@@ -528,6 +553,7 @@ describe("desktop user-test evidence", () => {
         sessionPersistedAcrossRestart: true,
         routineReverificationPrompted: false,
         catalogAttestation: "read_only_full_catalog",
+        observedToolNames: OBSERVED_READ_ONLY,
       }),
       /evidence tool/
     );
@@ -554,6 +580,7 @@ describe("desktop user-test evidence", () => {
       sessionPersistedAcrossRestart: true,
       routineReverificationPrompted: false,
       catalogAttestation: "read_only_full_catalog",
+      observedToolNames: OBSERVED_READ_ONLY,
     };
     await assert.rejects(buildDesktopUserTestEvidenceFromManifests(base), /taskOutcome and taskOutcomeReason are required/);
     await assert.rejects(buildDesktopUserTestEvidenceFromManifests({ ...base, taskOutcome: "useful" }), /taskOutcomeReason is invalid/);
@@ -579,6 +606,7 @@ describe("desktop user-test evidence", () => {
       sessionPersistedAcrossRestart: true,
       routineReverificationPrompted: false,
       catalogAttestation: "read_only_full_catalog",
+      observedToolNames: OBSERVED_READ_ONLY,
       taskOutcome: "useful" as const,
       taskOutcomeReason: "answer_received" as const,
       ...ROUTING_ATTESTATION,
@@ -758,6 +786,7 @@ describe("desktop user-test evidence", () => {
       sessionPersistedAcrossRestart: true,
       routineReverificationPrompted: false,
       catalogAttestation: "read_only_full_catalog",
+      observedToolNames: OBSERVED_READ_ONLY,
       taskOutcome: "useful",
       taskOutcomeReason: "answer_received",
       ...ROUTING_ATTESTATION,
@@ -840,3 +869,84 @@ function validObservedTools(routingCase: (typeof DESKTOP_ROUTING_CASES)[number],
     return Array.from({ length: count }, () => tool);
   });
 }
+
+describe("fold 2 item 3: the recorded hash is of what the tester SAW", () => {
+  async function options(overrides: Record<string, unknown> = {}) {
+    const tmp = await mkdtemp(join(tmpdir(), "greenhouse-desktop-observed-"));
+    const sessionManifestPath = join(tmp, "issued-sessions-manifest.json");
+    const desktopManifestPath = join(tmp, "desktop-config-manifest.json");
+    await writeSessionManifest(sessionManifestPath);
+    await writeDesktopManifest(desktopManifestPath);
+    return {
+      surface: "chatgpt_desktop" as const,
+      testerEmail: "recruiter.one@company.com",
+      mcpUrl: "https://greenhouse-recruiter.example.com/mcp",
+      attachmentMethod: "chatgpt_developer_mode_remote_mcp" as const,
+      sessionIssuanceManifestPath: sessionManifestPath,
+      desktopConfigManifestPath: desktopManifestPath,
+      sessionTokenIdAfterRestart: "chatgpt-token-id",
+      sessionIssuedAtAfterRestart: "2026-06-23T00:00:00.000Z",
+      exercisedTools: ROUTING_TOOLS,
+      testedAt: "2026-06-23T00:00:00.000Z",
+      durableSessionAccess: true,
+      sessionPersistedAcrossRestart: true,
+      routineReverificationPrompted: false,
+      catalogAttestation: "read_only_full_catalog",
+      observedToolNames: OBSERVED_READ_ONLY,
+      taskOutcome: "useful" as const,
+      taskOutcomeReason: "answer_received" as const,
+      ...ROUTING_ATTESTATION,
+      ...overrides,
+    };
+  }
+
+  it("records the observed catalog and hashes THOSE names", async () => {
+    const { createHash } = await import("node:crypto");
+    const { observedCatalogToolNamesHash } = await import("../src/desktop-user-test.js");
+    const report = await buildDesktopUserTestEvidenceFromManifests(await options());
+    assert.deepEqual(report.observedToolNames, OBSERVED_READ_ONLY, "the evidence says what the client listed");
+    assert.equal(
+      report.catalogToolNamesHash,
+      createHash("sha256").update(OBSERVED_READ_ONLY.join("\n")).digest("hex"),
+      "the hash is derived from the observed names, not looked up from the source constants"
+    );
+    assert.equal(report.catalogToolNamesHash, observedCatalogToolNamesHash(report.observedToolNames));
+    assert.equal(report.catalogToolCount, report.observedToolNames.length);
+  });
+
+  it("refuses to record evidence with no observed catalog at all", async () => {
+    await assert.rejects(
+      buildDesktopUserTestEvidenceFromManifests(await options({ observedToolNames: undefined })),
+      /observed-tools is required/
+    );
+  });
+
+  it("refuses a reordered or short observed catalog, naming the position", async () => {
+    await assert.rejects(
+      buildDesktopUserTestEvidenceFromManifests(await options({ observedToolNames: [...OBSERVED_READ_ONLY].reverse() })),
+      /first difference at position 1/
+    );
+    await assert.rejects(
+      buildDesktopUserTestEvidenceFromManifests(await options({ observedToolNames: OBSERVED_READ_ONLY.slice(0, 5) })),
+      /expected \d+ tools, saw 5/
+    );
+  });
+
+  it("refuses the read catalog under a write-entitled attestation", async () => {
+    await assert.rejects(
+      buildDesktopUserTestEvidenceFromManifests(
+        await options({ catalogAttestation: "write_entitled_full_catalog", observedToolNames: OBSERVED_READ_ONLY })
+      ),
+      /write_entitled_full_catalog/
+    );
+  });
+
+  it("flags an attestation report that carries no observed catalog", async () => {
+    const report = await buildDesktopUserTestEvidenceFromManifests(await options());
+    const { observedToolNames: _dropped, ...withoutObserved } = report;
+    const validation = validateDesktopRoutingAttestation(withoutObserved);
+    assert.equal(validation.ok, false);
+    assert.equal(validation.problems.includes("observed_tool_names_missing_or_invalid"), true);
+    assert.deepEqual(validateDesktopRoutingAttestation(report), { ok: true, problems: [] });
+  });
+});

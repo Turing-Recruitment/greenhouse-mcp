@@ -502,14 +502,13 @@ export function projectEvidenceResult(
   activePrivateCustomFieldKeys = privateCustomFieldKeys;
   privateCustomFieldKeysKnown = privateCustomFieldKeys !== undefined;
   try {
+    if (isRoleGatedRead(result.toolName)) return roleGateDeniedResult(result, adapter);
     const projected = projector ? projector(result.data) : result.data;
     const data = stripPrivateCustomFields(projected);
-    const roleGated = isRoleGatedRead(result.toolName);
     return {
       ...result,
       data,
-      ...(roleGated ? zeroedRoleGateEnvelope(result) : {}),
-      ...(adapter ? { projection: buildProjectionMetadata(adapter, result.data, data, roleGated) } : {}),
+      ...(adapter ? { projection: buildProjectionMetadata(adapter, result.data, data) } : {}),
     };
   } finally {
     activeProjectionProfile = previousProfile;
@@ -519,46 +518,71 @@ export function projectEvidenceResult(
 }
 
 /**
- * Every count a gated caller receives, recomputed from what they actually got: nothing.
+ * The denied envelope is ONE object, built from scratch, identical for every gated call.
  *
- * The row totals, the read envelope's totals and the truncation block are all derived upstream from
- * the UNFILTERED page, so leaving them alone leaves the caller holding an exact count of the rows
- * they were refused. With this, the envelope for `user_ids=<a colleague who has a row>` is identical
- * to the envelope for `user_ids=<an id nobody has>` — which is the property the gate needs and the
- * one the previous shape did not have. `pages_read`, `per_page`, `complete` and `status` are left
- * alone on purpose: one page is read either way, so they say nothing about the target, and faking
- * `status` would claim a completeness the read may not have had.
+ * Zeroing the counts was half a fix: everything that was not a count went on describing the read.
+ * `pages_read` and `per_page` said how much upstream work the filter caused; `pagination_truncated`
+ * and `next_cursor` said whether there was more of it; `cache_hits` and `rate_limit_retries` varied
+ * with it; `complete`/`status` could report a truncation that only a matching row could cause; and
+ * `projection.omittedFields` was derived from the SOURCE row, so an existing id spelled out
+ * `["email","id","user_id","verified"]` while a missing one returned `[]` — the withheld row's own
+ * field names, handed to the caller who may not see the row.
+ *
+ * So nothing here is carried over from the read. The envelope is composed of constants plus the
+ * caller's own identity and permission scope (their own, never the target's), which makes the reply
+ * to `user_ids=<a colleague who holds a row>`, to `user_ids=<an id nobody holds>` and to a match
+ * spanning three pages the same object, field for field. That is the property the gate needs; a
+ * shape assembled by subtraction from the real result can only ever approach it.
+ *
+ * The pagination and cost fields are ABSENT rather than zeroed: there is no honest zero for "pages
+ * this caller is not being told about", and an absent field claims nothing. `complete: true` /
+ * `status: "complete"` are the truth of what the caller received — a complete answer to a refused
+ * question — not a claim about the upstream page.
+ *
+ * NOT canonicalized, deliberately: the operator's own audit record (`evidence-read.ts`, emitted from
+ * the pre-projection result). It keeps the raw counts. It is the operator's log of what the service
+ * did on Greenhouse's behalf, never returned to the model, and an audit trail that lied about the
+ * rows a read touched would be useless for exactly the review this gate exists to survive.
  */
-function zeroedRoleGateEnvelope(result: RecruiterToolSuccess): Partial<RecruiterToolSuccess> {
+function roleGateDeniedResult(
+  result: RecruiterToolSuccess,
+  adapter?: EvidenceEndpointAdapter
+): RecruiterToolResult {
   return {
-    ...(result.rowCounts
+    ok: true,
+    toolName: result.toolName,
+    ...(result.actorId === undefined ? {} : { actorId: result.actorId }),
+    ...(result.effectiveActorId === undefined ? {} : { effectiveActorId: result.effectiveActorId }),
+    scoped: result.scoped,
+    ...(result.permissionScope ? { permissionScope: result.permissionScope } : {}),
+    rowCounts: { raw: 0, returned: 0, permissionExcluded: 0, unresolved: 0, status: "complete" },
+    data: [],
+    nextCursor: null,
+    read: { ...ROLE_GATE_DENIED_READ, warnings: [] },
+    ...(adapter
       ? {
-          rowCounts: {
-            ...result.rowCounts,
-            raw: 0,
-            returned: 0,
-            permissionExcluded: 0,
-            unresolved: 0,
+          projection: {
+            endpointPath: adapter.endpointPath,
+            profile: activeProjectionProfile,
+            omittedFields: [],
+            requiredFieldOmissions: [],
+            incompleteProjection: false,
+            roleGatedRowsWithheld: { reason: "privacy" as const, note: ROLE_GATE_NOTE },
           },
         }
       : {}),
-    ...(result.read ? { read: zeroedReadEnvelope(result.read) } : {}),
   };
 }
 
-function zeroedReadEnvelope(read: EvidenceReadEnvelope): EvidenceReadEnvelope {
-  // privacy_withheld and result_truncated are REMOVED, not zeroed: both are present only when they
-  // have something to report, so a zeroed one would still say "there was something here".
-  const { privacy_withheld: _withheld, result_truncated: _truncated, ...rest } =
-    read as typeof read & { result_truncated?: unknown };
-  return {
-    ...rest,
-    rows_returned: 0,
-    raw_rows_read: 0,
-    permission_excluded: 0,
-    unresolved_scope_rows: 0,
-  };
-}
+const ROLE_GATE_DENIED_READ: EvidenceReadEnvelope = {
+  complete: true,
+  status: "complete",
+  rows_returned: 0,
+  raw_rows_read: 0,
+  permission_excluded: 0,
+  unresolved_scope_rows: 0,
+  warnings: [],
+};
 
 function projectJobData(value: unknown): unknown {
   return projectData(value, projectJobRow);
@@ -685,12 +709,17 @@ let activeProjectionProfile: RecruiterProjectionProfileName = DEFAULT_PROJECTION
  *
  * `kind: "operator"` IS proven: it is reached only for an actor id in the operator allowlist
  * (scoped-core checks `operatorActorIds` before any provider runs), so it needs no extra stamp.
+ *
+ * The flag is read on a JOB scope too, and that is the second half of the same point: a site admin
+ * narrowed to explicit grants (the site-admin wrapper's fail-closed when it cannot read which jobs
+ * Greenhouse restricts) is still a site admin. Kind answers "which jobs"; the stamp answers "which
+ * role"; each gate reads the one it means.
  */
 export function profileForPermissionScope(
   scope: { kind?: string; siteAdmin?: boolean } | undefined
 ): RecruiterProjectionProfileName {
   if (scope?.kind === "operator") return "operator_site_admin";
-  if (scope?.kind === "all" && scope.siteAdmin === true) return "operator_site_admin";
+  if (scope?.siteAdmin === true) return "operator_site_admin";
   return DEFAULT_PROJECTION_PROFILE;
 }
 
@@ -1083,11 +1112,13 @@ function projectJobNoteRow(row: Record<string, unknown>): Record<string, unknown
   return projected;
 }
 
+// Only a read the caller is ALLOWED to see reaches this: a role-gated denial gets the canonical
+// envelope above, whose omission list is empty because the source row's field names are the row's
+// existence spelled out.
 function buildProjectionMetadata(
   adapter: EvidenceEndpointAdapter,
   sourceData: unknown,
-  projectedData: unknown,
-  roleGated = false
+  projectedData: unknown
 ): RecruiterProjectionMetadata {
   // Record EVERY top-level field present in the source but dropped from the projection, not just the
   // hand-curated policy fields. Policy reasons are applied where known; a visibility-gated note body
@@ -1104,14 +1135,10 @@ function buildProjectionMetadata(
       endpointPath: adapter.endpointPath,
       field,
       reason:
-        // A row the ROLE gate withheld took every one of its fields with it, and the reason for all
-        // of them is the gate — not "not_projected", which reads as an incidental field-shape drop.
-        roleGated
-          ? ("privacy" as RecruiterProjectionOmissionReason)
-          : policyReasonByField.get(field)
-            ?? ((adapter.endpointPath === "/v3/notes" || adapter.endpointPath === "/v3/job_notes") && NOTE_VISIBILITY_GATED_FIELDS.has(field)
-              ? ("privacy" as RecruiterProjectionOmissionReason)
-              : ("not_projected" as RecruiterProjectionOmissionReason)),
+        policyReasonByField.get(field)
+          ?? ((adapter.endpointPath === "/v3/notes" || adapter.endpointPath === "/v3/job_notes") && NOTE_VISIBILITY_GATED_FIELDS.has(field)
+            ? ("privacy" as RecruiterProjectionOmissionReason)
+            : ("not_projected" as RecruiterProjectionOmissionReason)),
     }));
   // An omission BLOCKS the answer only when a registered metric actually requires that field.
   const requiredFieldOmissions: RecruiterProjectionRequiredFieldOmission[] = [];
@@ -1131,9 +1158,6 @@ function buildProjectionMetadata(
     omittedFields,
     requiredFieldOmissions,
     incompleteProjection: requiredFieldOmissions.length > 0,
-    ...(roleGated
-      ? { roleGatedRowsWithheld: { reason: "privacy" as const, note: ROLE_GATE_NOTE } }
-      : {}),
   };
 }
 

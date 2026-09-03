@@ -15,6 +15,7 @@ const distributionExamples = [
   "distribution-claude-desktop.example.json",
   "distribution-claude-code.example.json",
 ].map((name) => JSON.parse(readFileSync(`examples/rollout-evidence/${name}`, "utf8")));
+const productionEnvCheckExample = JSON.parse(readFileSync("examples/rollout-evidence/production-env-check.example.json", "utf8"));
 
 describe("hosted deployment artifacts", () => {
   it("keeps static boundary guards in the package verify path", () => {
@@ -258,6 +259,36 @@ describe("hosted deployment artifacts", () => {
       assert.equal(example.expectedChecks.find((check: { name?: string }) => check.name === "exact_tool_catalog")?.status, "pass");
       assert.equal(example.expectedChecks.find((check: { name?: string }) => check.name === "read_only_tool_annotations")?.status, "pass");
     }
+  });
+});
+
+describe("committed example evidence counts", () => {
+  /**
+   * Fold 2: three examples said "catalog exactly matched 81 unique approved tools" while their own
+   * toolNames arrays carried 82 — the count-bearing SUMMARY was never compared to anything, so it
+   * went stale the moment a reader was bound. Every number a committed example states about the
+   * catalog is now derived from the artifact next to it.
+   */
+  it("states a catalog count equal to the catalog the example actually lists", () => {
+    for (const example of distributionExamples) {
+      const summary = String(
+        example.expectedChecks.find((check: { name?: string }) => check.name === "exact_tool_catalog")?.summary ?? ""
+      );
+      const stated = Number(summary.match(/\b(\d+)\b/)?.[1]);
+      assert.equal(
+        stated,
+        example.toolNames.length,
+        `example summary says ${stated} tools, its own catalog lists ${example.toolNames.length}`
+      );
+      assert.equal(stated, PILOT_TOOL_NAMES.length, "and the catalog it lists is the one this build mounts");
+    }
+  });
+
+  it("states the shipping catalog size in the production env-check example", () => {
+    const summary = String(
+      productionEnvCheckExample.expectedChecks.find((check: { name?: string }) => check.name === "tool_catalog")?.summary ?? ""
+    );
+    assert.equal(Number(summary.match(/(\d+)-tool/)?.[1]), PILOT_TOOL_NAMES.length);
   });
 });
 

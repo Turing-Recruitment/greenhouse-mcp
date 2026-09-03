@@ -18,7 +18,7 @@ import type { SessionRevocationDrillReport } from "./revocation-drill.js";
 import type { SessionRevocationWriteReport } from "./session-revocation.js";
 import { isClientSurfaceCompatible, isRecruiterClient, normalizeSessionTokenId } from "./auth.js";
 import { containsTokenOrConfigPayload } from "./evidence-hygiene.js";
-import { EXPECTED_CATALOG_TOOL_COUNTS, MIN_ROUTING_RUNS, ROUTING_TEST_VERSION, catalogToolNamesHash, validateDesktopRoutingAttestation } from "./desktop-user-test.js";
+import { EXPECTED_CATALOG_TOOL_COUNTS, MIN_ROUTING_RUNS, ROUTING_TEST_VERSION, catalogToolNamesHash, observedCatalogToolNamesHash, validateDesktopRoutingAttestation } from "./desktop-user-test.js";
 import { isSafePositiveGreenhouseUserId } from "./identity.js";
 import { RECRUITER_MCP_READINESS_CHECK_NAMES } from "./readiness.js";
 import { classifyNonProductionHostname } from "./production-host.js";
@@ -177,6 +177,7 @@ interface DesktopUserTestReport {
   catalogAttestation?: string;
   catalogToolCount?: unknown;
   catalogToolNamesHash?: unknown;
+  observedToolNames?: unknown;
   containsTokens?: boolean;
   taskOutcome?: "useful" | "not_useful" | "could_not_use";
   taskOutcomeReason?: "wrong_scope" | "timeout_error" | "installation_blocked" | "answer_received" | "not_yet_needed";
@@ -1484,6 +1485,13 @@ async function validateDesktopUserEvidence(
     distributionEvidence
   );
   const tokenPayloadPresent = manifestContainsTokenPayload(evidence);
+  // The ordered names the tester's client listed. Null when the evidence does not carry them, which
+  // is itself a failure: the recorded hash would then be unverifiable.
+  const observedCatalogNames = Array.isArray(evidence.observedToolNames)
+    && evidence.observedToolNames.length > 0
+    && evidence.observedToolNames.every((name) => typeof name === "string" && name.length > 0)
+    ? (evidence.observedToolNames as string[])
+    : null;
   const routing = validateDesktopRoutingAttestation(evidence);
   const routingDetails = {
     clientVersion: safeRoutingVersion(evidence.clientVersion),
@@ -1520,6 +1528,10 @@ async function validateDesktopUserEvidence(
     // the ordered-name hash of the catalog it was taken against; this recomputes it from the current
     // one and requires a match, so a catalog change invalidates yesterday's desktop evidence.
     && evidence.catalogToolNamesHash === catalogToolNamesHash(evidence.catalogAttestation)
+    // ...and that hash must be of the names the TESTER recorded, not of anything this build looked
+    // up for them. Evidence with no observedToolNames cannot be checked at all and fails here.
+    && observedCatalogNames !== null
+    && evidence.catalogToolNamesHash === observedCatalogToolNamesHash(observedCatalogNames)
     && evidence.catalogToolCount === EXPECTED_CATALOG_TOOL_COUNTS[evidence.catalogAttestation]
     && evidence.containsTokens === false
     && exercisedTools.length > 0
@@ -1530,7 +1542,7 @@ async function validateDesktopUserEvidence(
     && !tokenPayloadPresent;
   return [pass
     ? { name: checkName, status: "pass", summary: "Real desktop user test evidence passed with a useful answer, client/model attribution, repeated candidate routing conformance evidence, candidate-endpoint binding, durable at-will access, restart persistence, and exercised evidence plus analysis tools.", details: { path: entry.path, testerEmail, client, taskOutcome: evidence.taskOutcome, taskOutcomeReason: evidence.taskOutcomeReason, testedAt: evidence.testedAt, mcpUrl: productionUrl.url, sessionTokenId, sessionTokenIdAfterRestart, sessionIssuedAt, sessionIssuedAtAfterRestart, attachmentMethod, exercisedTools, ...routingDetails } }
-    : { name: checkName, status: "fail", summary: "Real desktop user test evidence is missing a useful answer, required client/model attribution, repeated candidate routing conformance proof, candidate-endpoint binding, durable restart proof, issued-session binding, exercised tools, an exact catalog attestation (read_only_full_catalog or write_entitled_full_catalog), a no-token attestation, or token-free evidence hygiene.", details: { path: entry.path, testerEmail, client, clientMatchesManifest, clientMatchesSurface, clientMatchesAttachment, taskOutcome: evidence.taskOutcome, taskOutcomeReason: evidence.taskOutcomeReason, taskOutcomeValid, taskOutcomeReasonValid, taskOutcomeSuccessful, testedAt: evidence.testedAt, testedAtFresh, maxEvidenceAgeDays: DYNAMIC_EVIDENCE_MAX_AGE_DAYS, testerInPreflightRoster, sessionTokenId, sessionTokenIdAfterRestart, sessionIssuedAt, sessionIssuedAtAfterRestart, postRestartTokenMatches, postRestartIssuedAtMatches, attachmentMethod, allowedAttachmentMethods, attachmentMethodAllowed, catalogAttestation: evidence.catalogAttestation, catalogToolCount: evidence.catalogToolCount, catalogToolNamesHash: evidence.catalogToolNamesHash, expectedCatalogToolNamesHash: typeof evidence.catalogAttestation === "string" && (evidence.catalogAttestation === "read_only_full_catalog" || evidence.catalogAttestation === "write_entitled_full_catalog") ? catalogToolNamesHash(evidence.catalogAttestation) : null, containsTokens: evidence.containsTokens, tokenBindingMissing: tokenBinding.ok ? [] : tokenBinding.missing, endpointBindingMissing: endpointBinding.ok ? [] : endpointBinding.missing, mcpUrlReason: productionUrl.ok ? undefined : productionUrl.reason, exercisedTools, missingEvidence, missingAnalysis, tokenPayloadPresent, ...routingDetails } }];
+    : { name: checkName, status: "fail", summary: "Real desktop user test evidence is missing a useful answer, required client/model attribution, repeated candidate routing conformance proof, candidate-endpoint binding, durable restart proof, issued-session binding, exercised tools, an exact catalog attestation (read_only_full_catalog or write_entitled_full_catalog), a no-token attestation, or token-free evidence hygiene.", details: { path: entry.path, testerEmail, client, clientMatchesManifest, clientMatchesSurface, clientMatchesAttachment, taskOutcome: evidence.taskOutcome, taskOutcomeReason: evidence.taskOutcomeReason, taskOutcomeValid, taskOutcomeReasonValid, taskOutcomeSuccessful, testedAt: evidence.testedAt, testedAtFresh, maxEvidenceAgeDays: DYNAMIC_EVIDENCE_MAX_AGE_DAYS, testerInPreflightRoster, sessionTokenId, sessionTokenIdAfterRestart, sessionIssuedAt, sessionIssuedAtAfterRestart, postRestartTokenMatches, postRestartIssuedAtMatches, attachmentMethod, allowedAttachmentMethods, attachmentMethodAllowed, catalogAttestation: evidence.catalogAttestation, catalogToolCount: evidence.catalogToolCount, catalogToolNamesHash: evidence.catalogToolNamesHash, observedToolCount: observedCatalogNames?.length ?? null, observedCatalogToolNamesHash: observedCatalogNames ? observedCatalogToolNamesHash(observedCatalogNames) : null, expectedCatalogToolNamesHash: typeof evidence.catalogAttestation === "string" && (evidence.catalogAttestation === "read_only_full_catalog" || evidence.catalogAttestation === "write_entitled_full_catalog") ? catalogToolNamesHash(evidence.catalogAttestation) : null, containsTokens: evidence.containsTokens, tokenBindingMissing: tokenBinding.ok ? [] : tokenBinding.missing, endpointBindingMissing: endpointBinding.ok ? [] : endpointBinding.missing, mcpUrlReason: productionUrl.ok ? undefined : productionUrl.reason, exercisedTools, missingEvidence, missingAnalysis, tokenPayloadPresent, ...routingDetails } }];
 }
 
 function safeRoutingVersion(value: unknown): string | null {

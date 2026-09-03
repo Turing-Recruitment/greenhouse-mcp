@@ -102,7 +102,13 @@ export function createSiteAdminAwarePermissionProvider(
           // jobs Greenhouse restricts, we must not hand out an unrestricted org-wide read. Falling
           // back to the admin's explicit per-job grants withholds rather than widens, and it is not
           // an outage — every job they are actually on still resolves.
-          return options.base.getPermittedJobIds(greenhouseUserId, signal);
+          //
+          // The ROLE, though, is not in question here and must not fall with the job scope: /users
+          // answered, and it said site admin. Discarding the proof on an unrelated /jobs failure
+          // demoted a proven admin to the line-recruiter projection — the staff directory, standing
+          // permission grants, template recipients and teammate work emails all vanished — for a
+          // narrowing that has nothing to do with who they are. Job scope narrows; the role stays.
+          return withSiteAdminProof(await options.base.getPermittedJobIds(greenhouseUserId, signal));
         }
         if (confidentialJobIds.size === 0) {
           // No base call: widening to `all` needs nothing from it, and a /user_job_permissions
@@ -158,6 +164,19 @@ export function createSiteAdminAwarePermissionProvider(
       return options.base.getPermittedJobIds(greenhouseUserId, signal);
     },
   };
+}
+
+/**
+ * Stamp the proven role onto whatever shape the base provider answered with.
+ *
+ * The base provider's job answer is a bare Set, a `{kind:"jobs"}` scope or an org-wide scope; the
+ * flag rides on all three. This is still the ONE place the flag is stamped — the proof is the
+ * `/v3/users.site_admin` read a few lines above, and this function is only reached inside the branch
+ * that read returned `true` for.
+ */
+function withSiteAdminProof(result: PermissionLookupResult): PermissionLookupResult {
+  if (!("kind" in result)) return { kind: "jobs", jobIds: new Set(result), siteAdmin: true };
+  return { ...result, siteAdmin: true };
 }
 
 /**

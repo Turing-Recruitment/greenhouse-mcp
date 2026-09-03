@@ -206,6 +206,10 @@ export async function runEvidenceTool(
   // them for this projection rather than guessing — the fail-closed direction on a permission gate.
   const privateCustomFieldKeys = await resolvePrivateCustomFieldKeys(runtime).catch(() => undefined);
   const projected = projectEvidenceResult(result, adapter, privateCustomFieldKeys);
+  // A role-gated denial's envelope is CANONICAL — one object for every gated call, whatever was
+  // asked — so nothing is appended to it here. There is no answer to be one row wider than: the
+  // caller received no rows, and the single roleGatedRowsWithheld note is the whole reply.
+  if (projected.ok && projected.projection?.roleGatedRowsWithheld) return projected;
   if (boundsTreatedInclusive.length === 0 || !projected.ok || !projected.read) return projected;
   // v3's bracket filters do take gt/lt, but the tool advertises one string and this surface does not
   // re-advertise the object union it deleted. So the bound is widened by one instant and SAID so —
@@ -304,6 +308,17 @@ export const EXCLUSIVE_BOUND_MARKER = "inclusive-bounds:";
 const RANGE_OPERATOR_KEYS = ["gte", "lte", "gt", "lt"] as const;
 
 /**
+ * The marker a MALFORMED date object carries to the schema, so the error can name the key.
+ *
+ * A preprocess step cannot raise a Zod issue of its own, and returning the bad object produced
+ * "Expected string, received object" — true, and useless to a model that got one key wrong out of
+ * two. So the problem travels as a string the inner schema recognizes and refuses, and the message
+ * the caller sees names the key. A caller who literally types this prefix into a date filter is
+ * refused too, which is correct: it is not a date.
+ */
+export const INVALID_DATE_RANGE_MARKER = "invalid-date-range:";
+
+/**
  * Accept the three forms a model actually sends for a date window, emit the one the read layer takes.
  *
  *   "2026-04-01T00:00:00Z"                 -> unchanged (an exact value)
@@ -311,16 +326,40 @@ const RANGE_OPERATOR_KEYS = ["gte", "lte", "gt", "lt"] as const;
  *   {gte: "2026-04-01", lte: "2026-06-30"} -> "2026-04-01..2026-06-30"
  *   {gt: "2026-04-01"}                     -> "inclusive-bounds:2026-04-01.." + a disclosure
  *
- * Anything else is returned untouched so the string schema — not this function — produces the error,
- * which keeps the boundary's rejection message the one the model can act on.
+ * A PARTIALLY malformed object is refused, not repaired. Ignoring the members it could not read left
+ * `{gte: 5, lte: "2026-06-30"}` normalising to `"..2026-06-30"` — a half-window the caller never
+ * asked for, silently one bound wider than the question, and `{gte: "2026-04-01", foo: 1}` was
+ * accepted with the unknown key dropped. Both are the fabrication line: an answer built on a filter
+ * the model did not send. `gte` with `gt` (or `lte` with `lt`) is refused for the same reason — the
+ * old code picked the inclusive one and discarded the other without a word.
+ *
+ * A non-object value is returned untouched so the string schema — not this function — produces the
+ * error, which keeps the boundary's rejection message the one the model can act on.
  */
 export function normalizeDateRangeParamInput(value: unknown): unknown {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
   const source = value as Record<string, unknown>;
+  const operators = new Set<string>(RANGE_OPERATOR_KEYS);
+  const unknownKeys = Object.keys(source).filter((key) => !operators.has(key));
+  if (unknownKeys.length > 0) {
+    return invalidDateRange(
+      `unknown key${unknownKeys.length > 1 ? "s" : ""} ${unknownKeys.sort().map((key) => `"${key}"`).join(", ")}`
+    );
+  }
   const bounds: Partial<Record<(typeof RANGE_OPERATOR_KEYS)[number], string>> = {};
   for (const key of RANGE_OPERATOR_KEYS) {
+    if (!(key in source)) continue;
     const bound = source[key];
-    if (typeof bound === "string" && bound.length > 0) bounds[key] = bound;
+    if (typeof bound !== "string" || bound.length === 0) {
+      return invalidDateRange(`"${key}" must be a non-empty ISO date-time string`);
+    }
+    bounds[key] = bound;
+  }
+  if (bounds.gte !== undefined && bounds.gt !== undefined) {
+    return invalidDateRange(`"gte" and "gt" are two lower bounds; send one`);
+  }
+  if (bounds.lte !== undefined && bounds.lt !== undefined) {
+    return invalidDateRange(`"lte" and "lt" are two upper bounds; send one`);
   }
   const lower = bounds.gte ?? bounds.gt;
   const upper = bounds.lte ?? bounds.lt;
@@ -328,6 +367,10 @@ export function normalizeDateRangeParamInput(value: unknown): unknown {
   const exclusive = (bounds.gte === undefined && bounds.gt !== undefined)
     || (bounds.lte === undefined && bounds.lt !== undefined);
   return `${exclusive ? EXCLUSIVE_BOUND_MARKER : ""}${lower ?? ""}..${upper ?? ""}`;
+}
+
+function invalidDateRange(problem: string): string {
+  return `${INVALID_DATE_RANGE_MARKER}${problem}. Send an ISO date-time, the range "2026-04-01..2026-06-30", or {gte, lte}.`;
 }
 
 /**
@@ -371,7 +414,19 @@ function zodSchemaForParameter(parameter: ParameterSpec): z.ZodTypeAny {
     return z
       .preprocess(
         normalizeDateRangeParamInput,
-        z.string().describe("ISO date-time, or a range 2026-04-01..2026-06-30 (either side may be empty).")
+        z
+          .string()
+          .describe("ISO date-time, or a range 2026-04-01..2026-06-30 (either side may be empty).")
+          .superRefine((value, ctx) => {
+            // A malformed date object arrives here carrying its own problem statement (see
+            // normalizeDateRangeParamInput): raise it as the schema issue so the -32602 the model
+            // reads names the key it got wrong, instead of "Expected string, received object".
+            if (!value.startsWith(INVALID_DATE_RANGE_MARKER)) return;
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: value.slice(INVALID_DATE_RANGE_MARKER.length),
+            });
+          })
       )
       .optional();
   }

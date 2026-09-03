@@ -131,6 +131,17 @@ export type PermissionScope =
        * those jobs are visible, which is the distinction Greenhouse itself draws.
        */
       privateCapableJobIds?: ReadonlySet<number>;
+      /**
+       * The same proof as on the `all` branch, on a scope that is NOT org-wide.
+       *
+       * A site admin whose role `/v3/users.site_admin` established can still end up job-scoped: the
+       * site-admin wrapper narrows to the admin's explicit grants when it cannot read which jobs
+       * Greenhouse restricts (`recruiter-mcp/src/site-admin-permission.ts`). The JOB narrowing is a
+       * correct fail-closed; the ROLE was never in question, and dropping it demoted a proven admin
+       * to the line-recruiter projection because of an unrelated `/jobs` outage. Job scope and role
+       * are two answers, so they are carried as two fields.
+       */
+      siteAdmin?: boolean;
     };
 
 export type PermissionLookupResult = ReadonlySet<number> | PermissionScope;
@@ -138,7 +149,7 @@ export type PermissionLookupResult = ReadonlySet<number> | PermissionScope;
 export type AppliedPermissionScope =
   | { kind: "operator"; permittedJobCount: null; privateCandidatesWithheld?: true }
   | { kind: "all"; permittedJobCount: null; privateCandidatesWithheld?: true; siteAdmin?: true }
-  | { kind: "jobs"; permittedJobCount: number };
+  | { kind: "jobs"; permittedJobCount: number; siteAdmin?: true };
 
 /**
  * `privateCandidatesWithheld` is the org-wide branch's disclosure, and it appears ONLY there.
@@ -1090,7 +1101,13 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
               ...(allAccessAttested ? {} : { privateCandidatesWithheld: true as const }),
               ...(permissionScope.siteAdmin === true ? { siteAdmin: true as const } : {}),
             }
-          : { kind: "jobs", permittedJobCount: permissionScope.jobIds.size },
+          : {
+              kind: "jobs",
+              permittedJobCount: permissionScope.jobIds.size,
+              // A proven site admin narrowed to explicit job grants stays a proven site admin on the
+              // envelope: the projection layer keys the admin view off this flag, never off `kind`.
+              ...(permissionScope.siteAdmin === true ? { siteAdmin: true as const } : {}),
+            },
         rowCounts,
         data: scopedResponse.data,
         nextCursor: scopedResponse.nextCursor,
@@ -3516,21 +3533,25 @@ function clonePermissionScope(scope: PermissionScope): PermissionScope {
         : {}),
     };
   }
-  return scope.privateCapableJobIds
-    ? {
-        kind: "jobs",
-        jobIds: new Set(scope.jobIds),
-        privateCapableJobIds: new Set(scope.privateCapableJobIds),
-      }
-    : { kind: "jobs", jobIds: new Set(scope.jobIds) };
+  // Same field-by-field rule as the all-branch: a proven site-admin role narrowed to explicit job
+  // grants is still a proven role, and a clone that dropped it would demote the admin on every
+  // permission refresh.
+  return {
+    kind: "jobs",
+    jobIds: new Set(scope.jobIds),
+    ...(scope.privateCapableJobIds ? { privateCapableJobIds: new Set(scope.privateCapableJobIds) } : {}),
+    ...(scope.siteAdmin === true ? { siteAdmin: true } : {}),
+  };
 }
 
-// A bare Set is still the accepted shape from a custom provider, but it cannot carry the
-// private-capable subset — so a scope that HAS one is returned as the object form. Returning the
-// Set here would silently drop private capability every time the answer came from the cache.
+// A bare Set is still the accepted shape from a custom provider, but it can carry neither the
+// private-capable subset nor the proven site-admin role — so a scope that HAS either is returned as
+// the object form. Returning the Set here would silently drop them every time the answer came from
+// the cache: private candidates withheld from an actor Greenhouse grants them to, or a proven admin
+// demoted to the line-recruiter projection.
 function clonePermissionLookupResult(scope: PermissionScope): PermissionLookupResult {
   if (scope.kind === "all") return clonePermissionScope(scope);
-  return scope.privateCapableJobIds ? clonePermissionScope(scope) : new Set(scope.jobIds);
+  return scope.privateCapableJobIds || scope.siteAdmin === true ? clonePermissionScope(scope) : new Set(scope.jobIds);
 }
 
 function isPermissionScope(value: unknown): value is PermissionScope {
@@ -3551,7 +3572,9 @@ function isPermissionScope(value: unknown): value is PermissionScope {
     }
     return value.privateCapableJobIds === undefined || isSetLike(value.privateCapableJobIds);
   }
-  return value.kind === "jobs" && isSetLike(value.jobIds);
+  if (value.kind !== "jobs" || !isSetLike(value.jobIds)) return false;
+  // Same rule as the all-branch: a stringy `siteAdmin` out of a JSON config is not a proven role.
+  return value.siteAdmin === undefined || typeof value.siteAdmin === "boolean";
 }
 
 function isSetLike(value: unknown): value is ReadonlySet<number> {

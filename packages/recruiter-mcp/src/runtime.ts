@@ -836,9 +836,9 @@ function normalizeAuditJobIds(value: RecruiterAuditEvent["resolvedJobIds"]): num
 
 function auditReadMetric(result: RecruiterToolResult, metric: "pages" | "retries" | "cache"): number | null {
   if (!result.ok) return null;
-  if (metric === "pages" && result.read) return result.read.pages_read;
-  if (metric === "retries" && result.read) return result.read.rate_limit_retries;
-  if (metric === "cache" && result.read) return result.read.cache_hits;
+  if (metric === "pages" && result.read) return result.read.pages_read ?? null;
+  if (metric === "retries" && result.read) return result.read.rate_limit_retries ?? null;
+  if (metric === "cache" && result.read) return result.read.cache_hits ?? null;
   if (metric === "pages" && result.meta) return 1;
   if (metric === "retries" && result.meta) return result.meta.retry.rateLimitRetries;
   if (metric === "cache" && result.meta) return result.meta.cacheHits ?? 0;
