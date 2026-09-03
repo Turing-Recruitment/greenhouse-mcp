@@ -55,7 +55,10 @@ describe("site-admin-aware permission provider", () => {
 
     const scope = await provider.getPermittedJobIds(5236917004);
 
-    assert.deepEqual(scope, { kind: "all" });
+    // `siteAdmin: true` is the PROOF the projection layer keys the admin view off. The base
+    // provider answers `{ kind: "all" }` for a non-admin holding an all-jobs grant, so the flag —
+    // not the kind — is what separates the two (evidence-projection profileForPermissionScope).
+    assert.deepEqual(scope, { kind: "all", siteAdmin: true });
     assert.equal(baseCalls.length, 0, "base provider must not be consulted for a site admin");
   });
 
@@ -110,7 +113,7 @@ describe("site-admin-aware permission provider", () => {
 
     const scope = await provider.getPermittedJobIds(42);
 
-    assert.deepEqual(scope, { kind: "all" }, "no exclusions means the fast, unfiltered read path");
+    assert.deepEqual(scope, { kind: "all", siteAdmin: true }, "no exclusions means the fast, unfiltered read path");
     assert.deepEqual(baseCalls, [], "and no reason to consult the base provider at all");
   });
 
@@ -118,6 +121,10 @@ describe("site-admin-aware permission provider", () => {
     // Same direction as the site-admin probe's own failure handling: if we cannot establish what
     // Greenhouse restricts, we must not hand out an unrestricted org-wide read. Falling back to the
     // admin's real per-job grants withholds rather than widens, and is not an outage.
+    //
+    // Fold 2: the JOB narrowing stands, the ROLE does not fall with it. /users answered and said
+    // site admin; a /jobs outage is not evidence about who this person is, and dropping the proof
+    // demoted a proven admin out of the admin projection entirely.
     const provider = createSiteAdminAwarePermissionProvider({
       base: baseProvider(new Set([7, 8])),
       rawReader: rawReader((path) => {
@@ -128,7 +135,7 @@ describe("site-admin-aware permission provider", () => {
 
     const scope = await provider.getPermittedJobIds(42);
 
-    assert.deepEqual(scope, new Set([7, 8]));
+    assert.deepEqual(scope, { kind: "jobs", jobIds: new Set([7, 8]), siteAdmin: true });
   });
 
   it("ignores a confidential filter the server did not honour", async () => {

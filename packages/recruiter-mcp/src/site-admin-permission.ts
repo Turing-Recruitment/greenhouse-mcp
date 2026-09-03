@@ -5,6 +5,16 @@ import type {
 } from "../../scoped-core/src/index.js";
 
 /**
+ * THE one place `siteAdmin: true` is stamped.
+ *
+ * Every all-access answer this wrapper returns carries it, and no other code path may: the flag is
+ * what tells the projection layer that the org-wide scope came from Greenhouse's own
+ * `/v3/users.site_admin` flag rather than from an all-jobs job-admin grant, which the BASE provider
+ * answers with the same `{ kind: "all" }` shape. Downstream, the staff directory, standing
+ * permission grants, teammate work emails and email-template recipients are gated on the flag — so
+ * omitting it here withholds (fail-closed), and adding it anywhere else would grant the site-admin
+ * view to someone whose site-admin status nobody read.
+ *
  * Wraps a base PermissionProvider so that Greenhouse site admins receive
  * all-job access (`{ kind: "all" }`), matching their real Greenhouse authority:
  * a site admin has implicit access to every non-confidential job.
@@ -92,14 +102,20 @@ export function createSiteAdminAwarePermissionProvider(
           // jobs Greenhouse restricts, we must not hand out an unrestricted org-wide read. Falling
           // back to the admin's explicit per-job grants withholds rather than widens, and it is not
           // an outage — every job they are actually on still resolves.
-          return options.base.getPermittedJobIds(greenhouseUserId, signal);
+          //
+          // The ROLE, though, is not in question here and must not fall with the job scope: /users
+          // answered, and it said site admin. Discarding the proof on an unrelated /jobs failure
+          // demoted a proven admin to the line-recruiter projection — the staff directory, standing
+          // permission grants, template recipients and teammate work emails all vanished — for a
+          // narrowing that has nothing to do with who they are. Job scope narrows; the role stays.
+          return withSiteAdminProof(await options.base.getPermittedJobIds(greenhouseUserId, signal));
         }
         if (confidentialJobIds.size === 0) {
           // No base call: widening to `all` needs nothing from it, and a /user_job_permissions
           // sweep here would be paid by every site admin on every permission refresh. The
           // attestation stamp asks for the actor's private-capable grants only when it needs them
           // (an UNATTESTED actor), which is the one case where that sweep buys something.
-          return { kind: "all" };
+          return { kind: "all", siteAdmin: true };
         }
         // An admin explicitly on a confidential job's hiring team keeps it: those grants DO appear
         // in /v3/user_job_permissions, which is what the base provider reads.
@@ -134,20 +150,33 @@ export function createSiteAdminAwarePermissionProvider(
             "kind" in granted && granted.kind === "all" && granted.privateCapableJobIds
               ? { privateCapableJobIds: new Set(granted.privateCapableJobIds) }
               : {};
-          return { kind: "all", ...inherited };
+          return { kind: "all", siteAdmin: true, ...inherited };
         }
         const excludedJobIds = new Set<number>();
         for (const jobId of confidentialJobIds) {
           if (!grantedJobIds.has(jobId)) excludedJobIds.add(jobId);
         }
         return excludedJobIds.size === 0
-          ? { kind: "all", ...carry }
-          : { kind: "all", excludedJobIds, ...carry };
+          ? { kind: "all", siteAdmin: true, ...carry }
+          : { kind: "all", siteAdmin: true, excludedJobIds, ...carry };
       }
       signal?.throwIfAborted();
       return options.base.getPermittedJobIds(greenhouseUserId, signal);
     },
   };
+}
+
+/**
+ * Stamp the proven role onto whatever shape the base provider answered with.
+ *
+ * The base provider's job answer is a bare Set, a `{kind:"jobs"}` scope or an org-wide scope; the
+ * flag rides on all three. This is still the ONE place the flag is stamped — the proof is the
+ * `/v3/users.site_admin` read a few lines above, and this function is only reached inside the branch
+ * that read returned `true` for.
+ */
+function withSiteAdminProof(result: PermissionLookupResult): PermissionLookupResult {
+  if (!("kind" in result)) return { kind: "jobs", jobIds: new Set(result), siteAdmin: true };
+  return { ...result, siteAdmin: true };
 }
 
 /**

@@ -25,7 +25,13 @@ export type ReadAllStatus =
   | "incomplete_scope_resolution"
   | "incomplete_timeout"
   | "incomplete_rate_limited"
-  | "incomplete_page_cap";
+  | "incomplete_page_cap"
+  // A read made of several legs where one leg FAILED outright (not a deadline, not a rate limit):
+  // the rows that came back are real, the set they came from is not the one that was asked for.
+  // Never produced by a single-leg readAllScopedRows — it is how a multi-leg caller
+  // (readAllWithDateFallback's fallback-field legs) says "part of this population was never read"
+  // instead of reporting a short set as complete.
+  | "incomplete_upstream";
 
 export type ReadAllRowsResult<T extends Record<string, unknown>> =
   | {
@@ -274,6 +280,9 @@ function abortError(): Error {
 }
 
 export function combineReadStatuses(statuses: ReadAllStatus[]): ReadAllStatus {
+  // First: a leg that failed outright is worse news than a leg that ran out of time, because
+  // nothing about it is recoverable by asking again with a longer deadline.
+  if (statuses.includes("incomplete_upstream")) return "incomplete_upstream";
   if (statuses.includes("incomplete_scope_resolution")) return "incomplete_scope_resolution";
   if (statuses.includes("incomplete_rate_limited")) return "incomplete_rate_limited";
   if (statuses.includes("incomplete_timeout")) return "incomplete_timeout";
@@ -296,8 +305,22 @@ export function denialTruncationStatus(result: RecruiterToolResult): ReadAllStat
   return null;
 }
 
+/**
+ * Is this denial a CANCELLATION — the client request ended?
+ *
+ * read-all turns a cancellation into a DENIAL rather than an exception, so every caller that
+ * degrades an optional read's denial into "we could not read that part" has to check this first,
+ * or it answers a caller that has already gone and keeps working after the client hung up.
+ */
+export function isCancellationDenial(result: RecruiterToolResult): boolean {
+  return result.ok === false && result.denial.code === "CANCELLED";
+}
+
 export function readStatusMessage(status: ReadAllStatus): string | undefined {
   if (status === "complete") return undefined;
+  if (status === "incomplete_upstream") {
+    return "The read is incomplete because one of the reads it is made of failed upstream and its rows are missing.";
+  }
   if (status === "incomplete_rate_limited") {
     return "The read stopped before all cursor pages were fetched because the upstream rate-limit reset exceeded the remaining deadline.";
   }

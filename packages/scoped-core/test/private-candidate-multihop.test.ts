@@ -819,6 +819,12 @@ describe("the privacy tool sets are checked against the registry's endpoints, no
       "/attachments",
       "/candidate_educations",
       "/candidate_employments",
+      // R2b: a tag row is (candidate_id, candidate_tag_id) — it names a candidate, so it is
+      // candidate substance and the private gate must cover it.
+      "/applied_candidate_tags",
+      // R2d: the row carries an interviewer's free-text `note` about one candidate, reached through
+      // its scorecard.
+      "/scorecard_candidate_attributes",
       "/scorecard_question_answers",
       "/scorecard_question_answer_options",
     ]);
@@ -861,6 +867,30 @@ describe("the privacy tool sets are checked against the registry's endpoints, no
       "/job_boards",
       "/custom_field_departments",
       "/custom_field_offices",
+      // R2b. Post-level location (city/region/lat-long) reached through job_post_id; the permission
+      // role dictionary (id, name, role_type), which names no user; and the org's email templates.
+      // None can carry a candidate row.
+      "/job_post_searchable_locations",
+      "/user_roles",
+      "/email_templates",
+      // R2d. Rubric CONFIGURATION and org diagnostics. The attribute family below describes what a
+      // scorecard rates and which question maps to which trait — the ratings themselves live on
+      // /scorecard_candidate_attributes, which is classified as candidate substance above. The
+      // permission, staff-directory, bulk-request, spam and board-location rows describe people who
+      // work here or the org's own configuration, never an applicant.
+      "/job_candidate_attributes",
+      "/candidate_attribute_types",
+      "/focus_candidate_attributes",
+      "/scorecard_question_candidate_attributes",
+      "/user_job_permissions",
+      "/future_job_permissions",
+      "/user_emails",
+      "/bulk_requests",
+      // R2e fold. The single bulk request, read by uuid: the same org-diagnostic row as the list,
+      // plus signed result-file URLs the projection drops. No applicant appears on it.
+      "/bulk_requests/{bulk_action_uuid}",
+      "/blocked_spam_sources",
+      "/job_board_custom_locations",
     ]);
 
     const problems: string[] = [];

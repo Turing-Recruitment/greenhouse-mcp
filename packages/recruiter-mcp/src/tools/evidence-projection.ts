@@ -1,9 +1,11 @@
 import type {
+  EvidenceReadEnvelope,
   RecruiterProjectionMetadata,
   RecruiterProjectionOmissionReason,
   RecruiterProjectionProfileName,
   RecruiterProjectionRequiredFieldOmission,
   RecruiterToolResult,
+  RecruiterToolSuccess,
 } from "../types.js";
 import { readApplicationJobId } from "./application-shapes.js";
 import type { EvidenceEndpointAdapter } from "./scoped-endpoint-adapters.js";
@@ -128,7 +130,91 @@ const EVIDENCE_PROJECTORS = new Map<string, Projector>([
   ["search_my_job_boards", denylistProjector("/v3/job_boards")],
   ["search_my_custom_field_departments", denylistProjector("/v3/custom_field_departments")],
   ["search_my_custom_field_offices", denylistProjector("/v3/custom_field_offices")],
+  // R2b. Post locations, applied tags and the role dictionary are id/label rows with no contact
+  // field on the v3 contract (locked by the PII sweep in test/evidence.test.ts), so the shared
+  // denylist projector carries every documented field through. Email templates go through it too;
+  // their one sensitive field has an omission policy below.
+  ["search_my_job_post_searchable_locations", denylistProjector("/v3/job_post_searchable_locations")],
+  ["search_my_applied_candidate_tags", denylistProjector("/v3/applied_candidate_tags")],
+  ["search_my_user_roles", denylistProjector("/v3/user_roles")],
+  ["search_my_email_templates", denylistProjector("/v3/email_templates")],
+  // R2d. Requisition permissions, the candidate-attribute rubric family, and the two org-diagnostic
+  // dictionaries: id/label/FK rows with no contact field on the v3 contract (locked by the PII sweep
+  // in test/evidence.test.ts). The scorecard-attribute row's free-text `note` passes through — it is
+  // interviewer feedback, the same class as scorecard notes, and the private-candidate gate covers
+  // the row upstream.
+  ["search_my_user_job_permissions", denylistProjector("/v3/user_job_permissions")],
+  ["search_my_job_candidate_attributes", denylistProjector("/v3/job_candidate_attributes")],
+  ["search_my_candidate_attribute_types", denylistProjector("/v3/candidate_attribute_types")],
+  ["search_my_scorecard_candidate_attributes", denylistProjector("/v3/scorecard_candidate_attributes")],
+  ["search_my_focus_candidate_attributes", denylistProjector("/v3/focus_candidate_attributes")],
+  ["search_my_scorecard_question_candidate_attributes", denylistProjector("/v3/scorecard_question_candidate_attributes")],
+  ["search_my_bulk_requests", denylistProjector("/v3/bulk_requests")],
+  ["get_my_bulk_request", denylistProjector("/v3/bulk_requests/{bulk_action_uuid}")],
+  ["search_my_blocked_spam_sources", denylistProjector("/v3/blocked_spam_sources")],
+  ["search_my_job_board_custom_locations", denylistProjector("/v3/job_board_custom_locations")],
+  // Staff permission configuration and the staff email directory. Neither row carries a job_id, so
+  // there is nothing to bound them to — the gate is the reader's ROLE instead of their requisitions.
+  ["search_my_future_job_permissions", operatorOnlyProjector("/v3/future_job_permissions")],
+  ["search_my_user_emails", operatorOnlyProjector("/v3/user_emails")],
 ]);
+
+/**
+ * A ROW gate, not a field gate.
+ *
+ * Greenhouse restricts its own permission settings and staff-directory pages to site admins. These
+ * two endpoints are those pages' API, and their rows carry no job_id, so the job-scoping every other
+ * read relies on has nothing to bind to — dropping fields would leave a job-scoped recruiter holding
+ * a row of ids that still discloses that a colleague holds a grant. So the whole row is withheld for
+ * anyone but a site admin or an allowlisted operator, and the tool description says so rather than
+ * returning an unexplained empty list.
+ *
+ * This is the ONE narrowing in R2d, and its citation is the second line of the charter: never
+ * silently grant access the org's own Greenhouse permissions deny. It is not a fail-closed on an
+ * unknown question — the same read, run by the site admin who administers the directory, returns
+ * every row.
+ */
+function operatorOnlyProjector(endpointPath: string): (value: unknown) => unknown {
+  return (value) => {
+    if (!isRoleGateAdmitted()) return Array.isArray(value) ? [] : null;
+    return projectData(value, (row) => projectRowWithDenylist(row, endpointPath));
+  };
+}
+
+/**
+ * The tools whose GATE is the caller's role rather than their requisitions.
+ *
+ * Named as a set, not inferred from the projector, because the envelope has to be rewritten too:
+ * emptying `data` after `runEvidenceListRead` has already counted the unfiltered rows leaves
+ * `rowCounts.raw`, `read.raw_rows_read` and `result_truncated.rows_in_scoped_set` describing rows
+ * the caller may not see — so a job-scoped recruiter filtering `user_ids=<colleague>` learns from
+ * `raw: 1` vs `raw: 0` whether that colleague holds a staff-email row or a standing grant. The
+ * counts ARE the disclosure; blanking only the rows does not close it.
+ *
+ * The read itself cannot be skipped at this layer and that is deliberate rather than lazy: the
+ * caller's permission scope — the thing the gate keys off — is established BY the read (scoped-core
+ * resolves the actor's scope inside `scopedRead` and reports it on the envelope), so "gate before the
+ * read" would mean a second permission round-trip on every call to every tool. The rows are dropped,
+ * every count is recomputed from what the caller actually receives, and the withholding is stated.
+ */
+const ROLE_GATED_ROW_TOOLS: ReadonlySet<string> = new Set([
+  "search_my_future_job_permissions",
+  "search_my_user_emails",
+]);
+
+const ROLE_GATE_NOTE =
+  "This endpoint is Greenhouse's own site-admin surface (the staff directory / permission settings), "
+  + "and its rows carry no job to bound them to, so it is returned to site admins and allowlisted "
+  + "operators only. No rows were returned and every count in this envelope is zero — for every "
+  + "caller outside that role, on every call, whatever the filter.";
+
+function isRoleGateAdmitted(): boolean {
+  return activeProjectionProfile === "operator_site_admin";
+}
+
+function isRoleGatedRead(toolName: string): boolean {
+  return ROLE_GATED_ROW_TOOLS.has(toolName) && !isRoleGateAdmitted();
+}
 
 function denylistProjector(endpointPath: string): (value: unknown) => unknown {
   return (value) => projectData(value, (row) => projectRowWithDenylist(row, endpointPath));
@@ -190,9 +276,11 @@ const DEFAULT_OMISSION_POLICIES_BY_ENDPOINT = new Map<string, FieldOmissionPolic
     // read_my_resume obtains a fresh URL after a new permission-scoped lookup.
     { field: "url", reason: "privacy" },
   ]],
-  ["/v3/interviews", [
-    { field: "video_conferencing_url", reason: "privacy" },
-  ]],
+  // /v3/interviews drops nothing. `video_conferencing_url` is the JOIN LINK for an interview this
+  // recruiter coordinates — the same link Greenhouse shows them on the interview record and the same
+  // one their calendar invite carries. It was dropped as "privacy" with no permission behind it:
+  // there is no Greenhouse gate on the meeting URL of an interview you can already see, and without
+  // it "send me the link for tomorrow's onsite" is unanswerable from the tool.
   ["/v3/scorecards", [
     { field: "private_notes", reason: "privacy" },
     { field: "private_notes_with_tags", reason: "privacy" },
@@ -204,22 +292,77 @@ const DEFAULT_OMISSION_POLICIES_BY_ENDPOINT = new Map<string, FieldOmissionPolic
     { field: "email_to", reason: "privacy" },
   ]],
   ["/v3/tracking_links", [
-    // `token` is the public attribution slug, but its key name trips the centralized evidence
-    // payload-hygiene boundary (no key ending in "token" may reach a projected payload), so it is
-    // dropped to satisfy that guard — a real external constraint, not a richness clamp. `url` is not
-    // a v3 tracking-link field and can embed the same token in a query string, so it is dropped too.
-    { field: "token", reason: "privacy" },
-    { field: "url", reason: "privacy" },
+    // `token` is RESTORED (R2a) — see EVIDENCE_HYGIENE_EXEMPTIONS below. A tracking-link token is a
+    // public attribution slug that appears in the job-board URL a candidate clicks; it is not a
+    // credential, and dropping it left the row unable to answer the one question it exists for
+    // ("which link did this application come from"). It was only ever dropped because its KEY NAME
+    // ends in "token" and trips the credential-hygiene substring rule.
+    //
+    // `url` stays dropped, and for a reason that survives: /v3/tracking_links documents no `url`
+    // response field at all, so a `url` key on a row is an undocumented shape the contract allowlist
+    // would reject anyway.
+    { field: "url", reason: "not_material" },
   ]],
   ["/v3/job_owners", [
     { field: "email", reason: "privacy" },
     { field: "phone", reason: "privacy" },
   ]],
-  ["/v3/rejection_reasons", [
-    // Reference-catalog admin annotation — private-labeled content, near-zero analytic value.
-    { field: "private_note", reason: "privacy" },
+  // /v3/rejection_reasons drops nothing. `private_note` was withheld from recruiters for
+  // "near-zero analytic value" — an editorial judgement, not a permission. It is an admin-authored
+  // annotation ON A REFERENCE CATALOG ("use this reason only for agency submissions"), not candidate
+  // data, and Greenhouse shows the rejection-reason catalogue to every job admin.
+  //
+  // The policy was also INERT, which is worth saying because it is why removing it changes no row:
+  // the v3 contract documents exactly `created_at, id, name, type, updated_at` on this endpoint, and
+  // projectRowWithDenylist allows only documented fields — so `private_note` never reached the
+  // denylist. What the removal changes is the reason the model is told. An omission labelled
+  // "privacy" claims a permission is withholding the field; the truth is that v3 does not return it,
+  // which is what "not_projected" says. If a contract refresh ever documents it, nothing here stands
+  // in the way of a job-scoped recruiter reading it.
+  ["/v3/email_templates", [
+    // `recipients` is free text that in this tenant holds colleague addresses (the cc list a
+    // template sends to). Sam's 2026-09-02 ruling puts teammate email behind the same line as the
+    // staff directory: site admins and operators see it, a job-scoped line recruiter does not. It is
+    // restored for that profile in PROFILE_FIELD_RESTORES, exactly like /v3/users.primary_email.
+    //
+    // Nothing ELSE on the row is withheld. `body`, `subject` and `html_body` are company copy every
+    // recruiter already sends, and `user_id` is an id, not contact data. The legacy control-plane
+    // package still gates this endpoint behind its Tier-3 doctrine (its own list_email_templates
+    // registration): that gate cited an "expanded access" posture rather than a Greenhouse
+    // permission, and it does not govern this scoped recruiter surface, where the recruiter's own
+    // permissions are enforced per read. (Naming that package's file by PATH in this comment trips
+    // the raw-client import boundary in scripts/verify-guards.mjs, which greps source text for it.)
+    { field: "recipients", reason: "privacy" },
   ]],
+  ["/v3/bulk_requests", [
+    // An integration endpoint the org's own automation posts back to, in the same credential-hygiene
+    // class as a token: a callback URL frequently carries its own auth in the query string, and a
+    // model reading the recruiter surface has no use for the address a vendor calls. The tool's
+    // description promises "whether a bulk job ran, when, and how much of it failed" — the counts,
+    // the status, and the timestamps, all of which still pass.
+    { field: "callback_url", reason: "privacy" },
+    // An arbitrary vendor payload echoed back from that callback: unbounded, unschematized, and
+    // outside the contract's own field list in everything but name.
+    { field: "callback_response", reason: "not_material" },
+  ]],
+  ["/v3/bulk_requests/{bulk_action_uuid}", [
+    // The single read adds two SIGNED, EXPIRING result-file URLs to the list row. Same class as an
+    // attachment's signed download URL and dropped for the same reason: a capability to fetch a file
+    // must not be handed to a model as data. `results_urls_expire_at` / `results_urls_expire_in` are
+    // kept — they say how long the files remain fetchable in Greenhouse itself.
+    { field: "success_results_url", reason: "privacy" },
+    { field: "failure_results_url", reason: "privacy" },
+    // Same two integration fields the list read drops, for the same reasons.
+    { field: "callback_url", reason: "privacy" },
+    { field: "callback_response", reason: "not_material" },
+  ]],
+  // /v3/blocked_spam_sources drops nothing, INCLUDING `value` on an email_address row. The address
+  // IS the blocklist entry the recruiter maintains — the spammer they blocked — not a candidate's
+  // or a colleague's contact detail, and withholding it leaves the tool unable to answer the one
+  // question it exists for ("why did this application never arrive").
   ["/v3/users", [
+    // Restored for site admins and operators by PROFILE_FIELD_RESTORES below — they administer the
+    // staff directory. A job-scoped line recruiter gets names and ids. (Sam's ruling, 2026-09-02.)
     { field: "primary_email", reason: "privacy" },
     { field: "emails", reason: "privacy" },
     { field: "email", reason: "privacy" },
@@ -256,7 +399,7 @@ const ADMIN_NOTE_VISIBILITY = "admin_only_visible";
 // through a nested embed — and are re-allowed ONLY on /v3/users (projectUserRow), where a teammate's
 // name is operational. The bare `candidate` embed key is dropped everywhere: the row's own candidate
 // projection is canonical, the embed is denormalized PII-bearing noise.
-const GLOBAL_PII_FIELD_NAMES = new Set([
+export const GLOBAL_PII_FIELD_NAMES: ReadonlySet<string> = new Set([
   "email",
   "emails",
   "email_addresses",
@@ -292,20 +435,42 @@ function isGlobalPiiFieldName(key: string): boolean {
 }
 
 // Single source of truth for "this omitted field would block a real metric": the registered
-// metrics' requiredFields. Prior code cited facts that don't exist (candidate_profile_fact,
-// rejection_reason_fact, job_org_dimension) or that never read the field (scorecard_fact.notes,
-// note_activity_fact.body), so honest reads were falsely flagged incomplete. Field -> metric ids.
-const METRIC_IDS_BY_REQUIRED_FIELD: ReadonlyMap<string, string[]> = (() => {
+// metrics' requiredFields, keyed by the ENDPOINT each metric reads them from. Prior code cited
+// facts that don't exist (candidate_profile_fact, rejection_reason_fact, job_org_dimension) or
+// that never read the field (scorecard_fact.notes, note_activity_fact.body), so honest reads were
+// falsely flagged incomplete. (endpoint, field) -> metric ids.
+const METRIC_IDS_BY_ENDPOINT_FIELD: ReadonlyMap<string, string[]> = (() => {
   const map = new Map<string, string[]>();
   for (const metric of METRIC_REGISTRY) {
-    for (const field of metric.requiredFields) {
-      const ids = map.get(field) ?? [];
-      ids.push(metric.id);
-      map.set(field, ids);
+    for (const endpointPath of metric.requiredFieldEndpoints) {
+      for (const field of metric.requiredFields) {
+        const key = `${endpointPath}\u0000${field}`;
+        const ids = map.get(key) ?? [];
+        ids.push(metric.id);
+        map.set(key, ids);
+      }
     }
   }
   return map;
 })();
+
+/**
+ * Which registered metrics an omitted field actually BLOCKS on THIS endpoint.
+ *
+ * The map used to be keyed by field ALONE and consulted on every endpoint's projection, so a
+ * projection that dropped `status` from `/v3/prospect_pools` — an endpoint that carries no offers
+ * at all — announced that the HIRE COUNT could not be answered. A false blocker on a read that was
+ * fine is how an operator learns to ignore the disclosure block, which costs more than the noise.
+ *
+ * There is no field-global fallback any more. Every metric declares the endpoint its required
+ * fields are read from — its single fact builder's own `requiredEndpoints` (facts.ts) — so the
+ * "we don't know, assume everywhere" branch has nothing left to serve and is gone. Endpoint paths
+ * are matched VERBATIM: `/offers` is not `/v3/offers`, and every production caller is a canonical
+ * registry adapter.
+ */
+export function metricsBlockedByOmittedField(endpointPath: string, field: string): string[] {
+  return METRIC_IDS_BY_ENDPOINT_FIELD.get(`${endpointPath}\u0000${field}`) ?? [];
+}
 
 /**
  * Custom-field VALUES restricted by Greenhouse's "View Private" permission.
@@ -355,10 +520,11 @@ export function projectEvidenceResult(
   const previousProfile = activeProjectionProfile;
   const previousKeys = activePrivateCustomFieldKeys;
   const previousKnown = privateCustomFieldKeysKnown;
-  activeProjectionProfile = profileForPermissionScope(result.permissionScope?.kind);
+  activeProjectionProfile = profileForPermissionScope(result.permissionScope);
   activePrivateCustomFieldKeys = privateCustomFieldKeys;
   privateCustomFieldKeysKnown = privateCustomFieldKeys !== undefined;
   try {
+    if (isRoleGatedRead(result.toolName)) return roleGateDeniedResult(result, adapter);
     const projected = projector ? projector(result.data) : result.data;
     const data = stripPrivateCustomFields(projected);
     return {
@@ -372,6 +538,73 @@ export function projectEvidenceResult(
     privateCustomFieldKeysKnown = previousKnown;
   }
 }
+
+/**
+ * The denied envelope is ONE object, built from scratch, identical for every gated call.
+ *
+ * Zeroing the counts was half a fix: everything that was not a count went on describing the read.
+ * `pages_read` and `per_page` said how much upstream work the filter caused; `pagination_truncated`
+ * and `next_cursor` said whether there was more of it; `cache_hits` and `rate_limit_retries` varied
+ * with it; `complete`/`status` could report a truncation that only a matching row could cause; and
+ * `projection.omittedFields` was derived from the SOURCE row, so an existing id spelled out
+ * `["email","id","user_id","verified"]` while a missing one returned `[]` — the withheld row's own
+ * field names, handed to the caller who may not see the row.
+ *
+ * So nothing here is carried over from the read. The envelope is composed of constants plus the
+ * caller's own identity and permission scope (their own, never the target's), which makes the reply
+ * to `user_ids=<a colleague who holds a row>`, to `user_ids=<an id nobody holds>` and to a match
+ * spanning three pages the same object, field for field. That is the property the gate needs; a
+ * shape assembled by subtraction from the real result can only ever approach it.
+ *
+ * The pagination and cost fields are ABSENT rather than zeroed: there is no honest zero for "pages
+ * this caller is not being told about", and an absent field claims nothing. `complete: true` /
+ * `status: "complete"` are the truth of what the caller received — a complete answer to a refused
+ * question — not a claim about the upstream page.
+ *
+ * NOT canonicalized, deliberately: the operator's own audit record (`evidence-read.ts`, emitted from
+ * the pre-projection result). It keeps the raw counts. It is the operator's log of what the service
+ * did on Greenhouse's behalf, never returned to the model, and an audit trail that lied about the
+ * rows a read touched would be useless for exactly the review this gate exists to survive.
+ */
+function roleGateDeniedResult(
+  result: RecruiterToolSuccess,
+  adapter?: EvidenceEndpointAdapter
+): RecruiterToolResult {
+  return {
+    ok: true,
+    toolName: result.toolName,
+    ...(result.actorId === undefined ? {} : { actorId: result.actorId }),
+    ...(result.effectiveActorId === undefined ? {} : { effectiveActorId: result.effectiveActorId }),
+    scoped: result.scoped,
+    ...(result.permissionScope ? { permissionScope: result.permissionScope } : {}),
+    rowCounts: { raw: 0, returned: 0, permissionExcluded: 0, unresolved: 0, status: "complete" },
+    data: [],
+    nextCursor: null,
+    read: { ...ROLE_GATE_DENIED_READ, warnings: [] },
+    ...(adapter
+      ? {
+          projection: {
+            endpointPath: adapter.endpointPath,
+            profile: activeProjectionProfile,
+            omittedFields: [],
+            requiredFieldOmissions: [],
+            incompleteProjection: false,
+            roleGatedRowsWithheld: { reason: "privacy" as const, note: ROLE_GATE_NOTE },
+          },
+        }
+      : {}),
+  };
+}
+
+const ROLE_GATE_DENIED_READ: EvidenceReadEnvelope = {
+  complete: true,
+  status: "complete",
+  rows_returned: 0,
+  raw_rows_read: 0,
+  permission_excluded: 0,
+  unresolved_scope_rows: 0,
+  warnings: [],
+};
 
 function projectJobData(value: unknown): unknown {
   return projectData(value, projectJobRow);
@@ -471,14 +704,45 @@ function projectData(value: unknown, projector: (row: Record<string, unknown>) =
 const PROFILE_FIELD_RESTORES: ReadonlyMap<RecruiterProjectionProfileName, ReadonlyMap<string, ReadonlySet<string>>> = new Map([
   ["operator_site_admin", new Map([
     ["/v3/users", new Set(["primary_email", "emails", "email"])],
-    ["/v3/rejection_reasons", new Set(["private_note"])],
+    ["/v3/email_templates", new Set(["recipients"])],
+    // The staff directory's whole payload. `email` is in GLOBAL_PII_FIELD_NAMES, so without this
+    // entry the row gate admitted the site admin and the field guard then handed them
+    // `{user_id, verified}` — a directory read with no addresses in it, while the tool description
+    // promised the address. Same line as /v3/users.primary_email: the admin who administers the
+    // directory sees it, and nobody else receives the row at all.
+    ["/v3/user_emails", new Set(["email"])],
   ])],
 ]);
 
 let activeProjectionProfile: RecruiterProjectionProfileName = DEFAULT_PROJECTION_PROFILE;
 
-export function profileForPermissionScope(kind: string | undefined): RecruiterProjectionProfileName {
-  return kind === "operator" || kind === "all" ? "operator_site_admin" : DEFAULT_PROJECTION_PROFILE;
+/**
+ * The projection profile, decided by a PROVEN role signal — never by the scope's `kind`.
+ *
+ * `kind: "all"` is not a role. Two different actors reach it: a Greenhouse site admin, whose
+ * `/v3/users.site_admin` flag the site-admin provider read (it stamps `siteAdmin: true` on the scope
+ * it returns), and an ordinary job admin holding an all-jobs grant on `/v3/user_job_permissions`,
+ * whom the base provider widens to the same shape with no role behind it (scoped-core
+ * `rowGrantsAllJobAccess`). Keying the admin projection off `kind` handed the second actor the
+ * first's view — the staff email directory, standing permission grants, and email-template
+ * recipients — which is exactly the side door around Greenhouse's own permissions this surface must
+ * never open. (It also fixes the week-one `users.primary_email` restore, which had the same bug with
+ * less exposure.)
+ *
+ * `kind: "operator"` IS proven: it is reached only for an actor id in the operator allowlist
+ * (scoped-core checks `operatorActorIds` before any provider runs), so it needs no extra stamp.
+ *
+ * The flag is read on a JOB scope too, and that is the second half of the same point: a site admin
+ * narrowed to explicit grants (the site-admin wrapper's fail-closed when it cannot read which jobs
+ * Greenhouse restricts) is still a site admin. Kind answers "which jobs"; the stamp answers "which
+ * role"; each gate reads the one it means.
+ */
+export function profileForPermissionScope(
+  scope: { kind?: string; siteAdmin?: boolean } | undefined
+): RecruiterProjectionProfileName {
+  if (scope?.kind === "operator") return "operator_site_admin";
+  if (scope?.siteAdmin === true) return "operator_site_admin";
+  return DEFAULT_PROJECTION_PROFILE;
 }
 
 function isRestoredForActiveProfile(endpointPath: string, key: string): boolean {
@@ -507,6 +771,36 @@ function isEndpointPassthrough(endpointPath: string, key: string): boolean {
   return ENDPOINT_PII_PASSTHROUGH.get(endpointPath)?.has(key) ?? false;
 }
 
+/**
+ * The endpoint+field pairs exempt from the credential-hygiene key rule.
+ *
+ * `isForbiddenEvidencePayloadKey` (evidence-hygiene.ts) drops any key ending in "token" — a
+ * substring rule, deliberately blunt, because it guards against a Bearer credential or a session
+ * token reaching a model payload from anywhere. Two documented v3 fields are caught by that rule and
+ * are not credentials at all; a sweep of the whole generated contract (test/evidence.test.ts) finds
+ * exactly these two and fails if a third appears:
+ *
+ *   /v3/tracking_links.token   the public attribution slug in the job-board URL a candidate clicks;
+ *                              the field the endpoint exists to return.
+ *   /v3/job_boards.url_token   the public slug in that board's own public URL, and the join between
+ *                              a board and the applications that came through it — without it
+ *                              `search_my_job_boards`'s promised "post-attribution analysis" cannot
+ *                              be done at all.
+ *
+ * The guard itself is NOT relaxed — it still runs on every other key, at every nesting depth, on
+ * every endpoint including these two — because a nested `token` on a tracking-link row would not be
+ * a slug. Only these exact top-level pairs are exempt, so a future endpoint whose row carries a real
+ * token cannot inherit the exemption by accident.
+ */
+export const EVIDENCE_HYGIENE_EXEMPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["/v3/tracking_links", new Set(["token"])],
+  ["/v3/job_boards", new Set(["url_token"])],
+]);
+
+function isHygieneExempt(endpointPath: string, key: string): boolean {
+  return EVIDENCE_HYGIENE_EXEMPTIONS.get(endpointPath)?.has(key) ?? false;
+}
+
 function projectRowWithDenylist(
   row: Record<string, unknown>,
   endpointPath: string
@@ -523,7 +817,7 @@ function projectRowWithDenylist(
     const restored = isRestoredForActiveProfile(endpointPath, key) || isEndpointPassthrough(endpointPath, key);
     if (denylist?.has(key) && !restored) continue;
     if (isGlobalPiiFieldName(key) && !restored) continue;
-    if (isForbiddenEvidencePayloadKey(key)) continue;
+    if (isForbiddenEvidencePayloadKey(key) && !isHygieneExempt(endpointPath, key)) continue;
     const projectedValue = NUMERIC_ID_FIELD_NAMES.has(key)
       ? projectNumericId(value)
       : NUMERIC_ID_ARRAY_FIELD_NAMES.has(key)
@@ -840,7 +1134,19 @@ function projectJobNoteRow(row: Record<string, unknown>): Record<string, unknown
   return projected;
 }
 
-function buildProjectionMetadata(
+// Only a read the caller is ALLOWED to see reaches this: a role-gated denial gets the canonical
+// envelope above, whose omission list is empty because the source row's field names are the row's
+// existence spelled out.
+/**
+ * The omission manifest for one projection: what the source row carried, what the projection kept,
+ * and which registered metrics the difference blocks.
+ *
+ * Exported so the blocker wiring can be tested at the level it actually runs — a real adapter, a
+ * real row, one field really absent from the projected copy. Asserting `metricsBlockedByOmittedField`
+ * alone proved the map and not the manifest, which is how four metrics kept naming fact fields the
+ * source row never carries: blockers that could never fire on real data.
+ */
+export function buildProjectionMetadata(
   adapter: EvidenceEndpointAdapter,
   sourceData: unknown,
   projectedData: unknown
@@ -861,14 +1167,15 @@ function buildProjectionMetadata(
       field,
       reason:
         policyReasonByField.get(field)
-        ?? ((adapter.endpointPath === "/v3/notes" || adapter.endpointPath === "/v3/job_notes") && NOTE_VISIBILITY_GATED_FIELDS.has(field)
-          ? ("privacy" as RecruiterProjectionOmissionReason)
-          : ("not_projected" as RecruiterProjectionOmissionReason)),
+          ?? ((adapter.endpointPath === "/v3/notes" || adapter.endpointPath === "/v3/job_notes") && NOTE_VISIBILITY_GATED_FIELDS.has(field)
+            ? ("privacy" as RecruiterProjectionOmissionReason)
+            : ("not_projected" as RecruiterProjectionOmissionReason)),
     }));
   // An omission BLOCKS the answer only when a registered metric actually requires that field.
   const requiredFieldOmissions: RecruiterProjectionRequiredFieldOmission[] = [];
   for (const omitted of omittedFields) {
-    for (const metricId of METRIC_IDS_BY_REQUIRED_FIELD.get(omitted.field) ?? []) {
+    // Keyed by (endpoint, field), not by field alone: see metricsBlockedByOmittedField.
+    for (const metricId of metricsBlockedByOmittedField(adapter.endpointPath, omitted.field)) {
       requiredFieldOmissions.push({
         metricOrFact: metricId,
         endpointPath: adapter.endpointPath,

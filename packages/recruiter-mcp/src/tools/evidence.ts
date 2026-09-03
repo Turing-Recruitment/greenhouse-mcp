@@ -6,6 +6,7 @@ import {
   getHarvestEndpointForEvidenceTool,
   getModelExposedParametersForEndpoint,
   getModelParamNamesForEvidenceTool,
+  getPathParametersForEvidenceTool,
   type HarvestScopeClass,
   type ParameterSpec,
 } from "../harvest-v3-registry.js";
@@ -26,6 +27,18 @@ const EVIDENCE_TOOL_PARAM_NAMES = new Map<string, ReadonlySet<string>>(
 
 export function evidenceToolParamsSchema(toolName: string): Record<string, z.ZodTypeAny> {
   if (toolName.startsWith("get_")) {
+    const pathParams = getPathParametersForEvidenceTool(toolName);
+    if (pathParams.length > 0) {
+      // One endpoint selects its row by a path segment rather than a numeric id
+      // (/v3/bulk_requests/{bulk_action_uuid}). Advertising `id: number` for it would have asked the
+      // model for a value the endpoint has no use for.
+      return Object.fromEntries(
+        pathParams.map((param) => [
+          param.name,
+          z.string().min(1).describe(describeParameter(param)),
+        ])
+      );
+    }
     return {
       id: z.number().int().positive().describe("Greenhouse record id."),
     };
@@ -43,9 +56,7 @@ export function evidenceToolParamsSchema(toolName: string): Record<string, z.Zod
     .int()
     .positive()
     .optional()
-    .describe(
-      "Skip this many rows of the complete scoped set before returning results. Use result_truncated.next_offset from a prior call to page onward (pairs with per_page)."
-    );
+    .describe("Rows to skip; follow result_truncated.next_offset to page onward.");
   // Bridgeable endpoints have NO job_ids filter, so a confirmed requisition scope is otherwise inert on
   // them: application-backed (application_stages/scorecards/rejection_details/notes/attachments) bridge
   // to application_ids (L1); the R2 siblings bridge to their own id filter (scorecard_question_answers ->
@@ -57,15 +68,11 @@ export function evidenceToolParamsSchema(toolName: string): Record<string, z.Zod
     schema.scope_handle = z
       .string()
       .optional()
-      .describe(
-        "Signed scope_handle from resolve_job_scope/confirm_job_scope. When present, this read is auto-bridged to the confirmed scope's ids on this endpoint's own id filter and constrained to them (this endpoint has no job_ids filter). Preferred over job_ids."
-      );
+      .describe("Signed handle from resolve_job_scope; wins over job_ids.");
     schema.job_ids = z
       .string()
       .optional()
-      .describe(
-        "Comma-separated Greenhouse job ids to scope this read to. Validated against your permissions, then auto-bridged to this endpoint's id filter for those jobs. scope_handle wins if both are present."
-      );
+      .describe("Comma-separated Greenhouse job ids to scope this read to.");
   }
   return schema;
 }
@@ -91,7 +98,7 @@ export const EVIDENCE_TOOL_DEFINITIONS: RecruiterToolDefinition[] = [
   { name: "search_my_sources", kind: "evidence", description: "Search projected application-source reference data (id, name, and source type). Domain class: global_reference; not job-filtered. Resolves source ids returned by analyses into human-readable source names." },
   { name: "search_my_referrers", kind: "evidence", description: "Search projected referrer reference data (id, name, and the linking user_id). Domain class: global_reference; not job-filtered. The user_id is the Greenhouse user who made the referral — an id, not contact data — so employee-referral yield can be attributed. Resolves referrer ids returned by analyses into referrer names." },
   { name: "search_my_notes", kind: "evidence", description: "Search public notes scoped to applications/candidates on permitted jobs. Domain class: application_backed. Pass scope_handle or job_ids to narrow to a requisition (auto-bridged to that scope's application_ids; application-keyed notes only — candidate-level notes with no application_id are not part of a req-scoped read); without one it spans all your permitted jobs. Returns the complete scoped set in one call." },
-  { name: "search_my_tracking_links", kind: "evidence", description: "Search projected tracking-link metadata for permitted jobs. Domain class: job_scoped; token/url fields are not exposed." },
+  { name: "search_my_tracking_links", kind: "evidence", description: "Search tracking links for permitted jobs — which link a click came through. Domain class: job_scoped; rows carry a permitted job_id. The row's `token` IS returned: it is the public attribution slug in the job-board URL a candidate clicks, and it is what an application's source is matched on." },
   { name: "search_my_offers", kind: "evidence", description: "Search projected offer metadata for permitted jobs. Domain class: job_scoped; rows carry a permitted job_id. Compensation custom fields pass through unless the field definition is flagged private in Greenhouse; if the definitions cannot be read at all, every custom field is withheld for that read rather than guessed at." },
   { name: "search_my_departments", kind: "evidence", description: "Search projected department reference data (id, name, parent_id, external_id). Domain class: global_reference; not job-filtered. Resolves department ids returned by analyses into department names and supports department rollups." },
   { name: "search_my_offices", kind: "evidence", description: "Search projected office reference data (id, name, location, parent_id). Domain class: global_reference; not job-filtered. Resolves office ids into office names/locations and supports office rollups." },
@@ -125,6 +132,22 @@ export const EVIDENCE_TOOL_DEFINITIONS: RecruiterToolDefinition[] = [
   { name: "search_my_job_boards", kind: "evidence", description: "Search job boards (id, company_name, status, internal, introduction/conclusion copy). Domain class: global_reference; not job-filtered. Which boards the org publishes to, for post-attribution analysis." },
   { name: "search_my_custom_field_departments", kind: "evidence", description: "Search custom-field department scoping rows (custom_field_id -> department_id). Domain class: global_reference; not job-filtered. Which custom fields apply to which departments." },
   { name: "search_my_custom_field_offices", kind: "evidence", description: "Search custom-field office scoping rows (custom_field_id -> office_id). Domain class: global_reference; not job-filtered. Which custom fields apply to which offices." },
+  { name: "search_my_job_post_searchable_locations", kind: "evidence", description: "Search the structured locations a job post is searchable in — city, county, region, country, postal code and lat/long. Domain class: join_backed; each row is bounded through job_post_id -> the post's job. The finer location source behind this tenant's coarse country-level office tags: use it when a location question needs the city a req is actually posted to." },
+  { name: "search_my_applied_candidate_tags", kind: "evidence", description: "Search which candidates carry which tags (candidate_id -> candidate_tag_id). Domain class: candidate_backed; scoped through the candidate's permitted applications, and private candidates pass the same gate as every other candidate read. The pool behind a tag name — pair with search_my_candidate_tags to turn tag ids into names." },
+  { name: "search_my_user_roles", kind: "evidence", description: "Search the permission-role dictionary (id, name, role_type). Domain class: global_reference; not job-filtered and it names no user. Decodes the role_id on requisition-permission rows. role_type carries only two values — job_admin and site_admin — and is what actually determines access; the role NAME is a cosmetic label an org can rename freely, so read the type, not the name." },
+  { name: "search_my_user_job_permissions", kind: "evidence", description: "Search who has access to your requisitions (user_id, job_id, role_id, automated). Domain class: admin_reference, but bounded exactly like a job-scoped read — rows must carry a permitted job_id, so you see permission rows for YOUR reqs and never an org-wide access map. Answers 'who else can see this req'; decode role_id with search_my_user_roles, and read role_type rather than the role name. `automated` marks a grant a rule made rather than a person." },
+  { name: "search_my_future_job_permissions", kind: "evidence", description: "Search standing grants that apply to requisitions not yet created, by department and office (user_id, role_id, department_id, office_id). Domain class: admin_reference; the row carries no job_id, so it cannot be bounded to your requisitions — it is returned to site admins and allowlisted operators only, the same line Greenhouse draws around its own permission settings. A job-scoped recruiter gets an empty result." },
+  { name: "search_my_job_candidate_attributes", kind: "evidence", description: "Search the candidate attributes configured on a requisition — the named traits its scorecards rate (id, job_id, candidate_attribute_type_id, name, sort_order, active). Domain class: job_scoped; rows must carry a permitted job_id. The rubric dimension behind an attribute rating." },
+  { name: "search_my_candidate_attribute_types", kind: "evidence", description: "Search the org's candidate-attribute type definitions (id, job_id, name, sort_order, active, is_draft). Domain class: job_scoped; rows must carry a permitted job_id. Note the endpoint has no job_ids filter of its own, so a scope is applied to the rows after the read rather than upstream." },
+  { name: "search_my_scorecard_candidate_attributes", kind: "evidence", description: "Search the per-scorecard attribute ratings an interviewer recorded (scorecard_id, job_candidate_attribute_id, candidate_attribute_rating, note). Domain class: scorecard_backed; each row is scoped through its scorecard to a permitted application, and the free-text `note` is one interviewer's written judgement of one candidate, so private candidates pass the same gate as every other candidate read." },
+  { name: "search_my_focus_candidate_attributes", kind: "evidence", description: "Search which candidate attributes an interview kit focuses on (interview_kit_id, job_candidate_attribute_id). Domain class: join_backed; bounded through interview_kit_id -> job_id. Says which traits a given interview is meant to assess." },
+  { name: "search_my_scorecard_question_candidate_attributes", kind: "evidence", description: "Search which rubric question maps to which focused attribute (scorecard_question_id, focus_candidate_attribute_id). Domain class: join_backed; bounded through the rubric question and its interview kit to a permitted job. The link between a scorecard question and the trait it scores." },
+  { name: "search_my_user_emails", kind: "evidence", description: "Search the staff email directory (user_id, email, verified). Domain class: sensitive_personal; returned to site admins and allowlisted operators only, who administer the directory — a job-scoped recruiter gets an empty result. Use search_my_users for a colleague's name and id." },
+  { name: "search_my_bulk_requests", kind: "evidence", description: "Search the org's bulk API requests and their outcomes (bulk_action_uuid, api_endpoint, status, record_count, success_count, failure_count, requested_by_user_id, timestamps). Domain class: admin_reference; not job-filtered and it carries no candidate data. Whether a bulk job ran, when, and how much of it failed. Signed result-file URLs are not exposed." },
+  { name: "get_my_bulk_request", kind: "evidence", description: "Get one bulk API request by its bulk_action_uuid, with the same outcome counts search_my_bulk_requests returns. Domain class: admin_reference; not job-filtered and it carries no candidate data. Use it when you already hold the uuid of a bulk update and want its status. The signed result-file URLs are not exposed — download them from Greenhouse." },
+  { name: "search_my_blocked_spam_sources", kind: "evidence", description: "Search the org's blocked spam sources (source_type, value, note). Domain class: admin_reference; not job-filtered. The IPs, CIDR blocks, email addresses and domains the org blocks from applying — spammers, not colleagues or candidates. Explains an application that never arrived." },
+  { name: "search_my_job_board_custom_locations", kind: "evidence", description: "Search the custom location labels a job board offers (greenhouse_job_board_id, value, active). Domain class: global_reference; the row carries no job_id and is board configuration, not a requisition row. Pair with search_my_job_boards." },
+  { name: "search_my_email_templates", kind: "evidence", description: "Search the org's email templates (id, name, subject, body, email_type, from_type, user_id). Domain class: global_reference; not job-filtered. The company copy a rejection, an availability request or a scorecard reminder sends, and the template id such a send needs. Colleague addresses in `recipients` are returned to site admins and operators only." },
 ];
 
 export type EvidenceDomainClass = HarvestScopeClass | "unsafe_unavailable";
@@ -167,62 +190,256 @@ export async function runEvidenceTool(
     return auditDenied ?? denied;
   }
   const allowedParamNames = EVIDENCE_TOOL_PARAM_NAMES.get(exposedToolName);
+  // Exclusive bounds arrive marked from the schema boundary (normalizeDateRangeParamInput). The
+  // marker never reaches the read; the disclosure it stands for is attached to the answer below.
+  const { params: readParams, boundsTreatedInclusive } = takeExclusiveBoundDisclosure(params);
   // get_* single-record reads, and internal SAMPLE reads (probe/leakage diagnostics that want a
   // bounded page), use the single-read path. Model-facing list search_my_* reads return the COMPLETE
   // scoped set through the read-all engine (L2) so the model never hits the 100-row wall, with an
   // honest completeness/truncation envelope, and auto-bridge a confirmed scope (L1).
   const singleRead = exposedToolName.startsWith("get_") || options.sample === true;
   const result = singleRead
-    ? await runScopedTool(runtime, exposedToolName, adapter.scopedToolName, params, "evidence", allowedParamNames)
-    : await runEvidenceListRead(runtime, adapter, params, allowedParamNames);
+    ? await runScopedTool(runtime, exposedToolName, adapter.scopedToolName, readParams, "evidence", allowedParamNames)
+    : await runEvidenceListRead(runtime, adapter, readParams, allowedParamNames);
   // Custom-field VALUES restricted by Greenhouse's "View Private" permission are withheld. If the
   // definitions cannot be read we cannot tell which are private, so `undefined` withholds all of
   // them for this projection rather than guessing — the fail-closed direction on a permission gate.
   const privateCustomFieldKeys = await resolvePrivateCustomFieldKeys(runtime).catch(() => undefined);
-  return projectEvidenceResult(result, adapter, privateCustomFieldKeys);
+  const projected = projectEvidenceResult(result, adapter, privateCustomFieldKeys);
+  // A role-gated denial's envelope is CANONICAL — one object for every gated call, whatever was
+  // asked — so nothing is appended to it here. There is no answer to be one row wider than: the
+  // caller received no rows, and the single roleGatedRowsWithheld note is the whole reply.
+  if (projected.ok && projected.projection?.roleGatedRowsWithheld) return projected;
+  if (boundsTreatedInclusive.length === 0 || !projected.ok || !projected.read) return projected;
+  // v3's bracket filters do take gt/lt, but the tool advertises one string and this surface does not
+  // re-advertise the object union it deleted. So the bound is widened by one instant and SAID so —
+  // an answer that quietly returns a row the caller excluded is the fabrication line, not a rounding.
+  return { ...projected, read: { ...projected.read, bounds_treated_inclusive: boundsTreatedInclusive } };
+}
+
+/**
+ * R2c: the per-parameter text is a POINTER, not a paragraph.
+ *
+ * Measured on the 66-tool catalog this replaces: 619 parameters cost 109,622 B of JSON Schema, and
+ * three sentences accounted for 83,170 B of it — the date-range blurb on 117 params (41,780 B), the
+ * pagination convention on 157 (32,490 B), and the scope-carrier convention on 71 (14,980 B). Every
+ * recruiter paid for all three on every call, at initialize, before asking anything.
+ *
+ * Each of those conventions is now stated ONCE, in SERVER_INSTRUCTIONS, ahead of the ~2,048-character
+ * boundary several clients truncate at (test/catalog-budget.test.ts asserts both the placement and
+ * the total). What stays here is the field-specific part: which id, which enum, which date.
+ *
+ * The bar for a description below is ~60 characters. That is not terseness for its own sake — a
+ * bare parameter is worse than a short one (the model guesses), and a paragraph is worse than a
+ * sentence (it displaces the answer).
+ */
+const PARAM_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  // Pagination and result shaping. The full convention is in SERVER_INSTRUCTIONS.
+  cursor: "Resume an incomplete read with read.next_cursor.",
+  per_page: "Max rows returned; the upstream read is unaffected.",
+  ids: "Comma-separated ids of the rows this tool returns.",
+  // Filters whose NAME does not say what they mean.
+  active: "Only rows currently active.",
+  current: "Only the row that is current now (not history).",
+  open: "Only open rows.",
+  live: "Only posts currently live on a board.",
+  internal: "Only internal-only rows.",
+  featured: "Only featured posts.",
+  default: "Only the default row.",
+  verified: "Only verified rows.",
+  is_draft: "Only draft rows.",
+  deactivated: "Only deactivated users (departed or disabled).",
+  confidential: "Only confidential requisitions.",
+  current_only: "Only the current version of each offer, not superseded ones.",
+  show_service_accounts: "Include service accounts, which are excluded by default.",
+  private: "Only private candidates.",
+  email: "Exact email address to match.",
+  tag: "Exact candidate tag name to match.",
+  token: "Exact tracking-link slug to match.",
+  primary_email: "Exact work email address to match.",
+  value: "Exact value to match.",
+  status: "Filter to one status.",
+  external_event_id: "Exact calendar event id from the external system.",
+  requisition_id: "Exact requisition id as your org writes it (e.g. REQ-1234).",
+  external_office_id: "Exact office id in your HRIS, not Greenhouse's.",
+  external_department_id: "Exact department id in your HRIS, not Greenhouse's.",
+  bulk_action_uuid: "Exact bulk-request uuid.",
+  related_post_type: "Kind of record the link points at.",
+  source_type: "Kind of blocked source.",
+  email_type: "Greenhouse email type; see the enum for the legal values.",
+  from_type: "Which sender address the template uses.",
+  stage_name: "Exact interview-stage name as configured on the job.",
+  scheduling_type: "How the interview is scheduled.",
+};
+
+/** A last-resort description derived from the parameter's own name and type, so none is ever bare. */
+function derivedParameterDescription(parameter: ParameterSpec): string {
+  const subject = parameter.name.replace(/_ids?$/, "").replace(/_/g, " ");
+  if (parameter.type === "array" || parameter.name.endsWith("_ids")) {
+    return `Comma-separated ${subject} ids to filter by.`;
+  }
+  if (parameter.name.endsWith("_id")) {
+    return `Exact ${subject} id to filter by.`;
+  }
+  if (parameter.type === "boolean") {
+    return `Filter on ${parameter.name.replace(/_/g, " ")}.`;
+  }
+  return `Filter by ${parameter.name.replace(/_/g, " ")}.`;
+}
+
+function describeParameter(parameter: ParameterSpec): string {
+  return PARAM_DESCRIPTIONS[parameter.name] ?? derivedParameterDescription(parameter);
+}
+
+/**
+ * The marker an exclusive bound carries from the schema boundary to the read.
+ *
+ * `{gt}`/`{lt}` are mapped to the inclusive form — v3's bracket params take both, but the tool
+ * advertises one cheap string and re-advertising exclusivity would put the object union back in the
+ * catalog. Mapping silently would be the fabrication line: the model asked for "after but not
+ * including" and got "at or after". So the normalized value carries this prefix, `runEvidenceTool`
+ * strips it before the read, and the result says `bounds_treated_inclusive` for the fields involved.
+ *
+ * A caller who literally types the marker into a date string loses nothing: the prefix is stripped
+ * and the read is identical — the only effect is a disclosure that is true anyway.
+ */
+export const EXCLUSIVE_BOUND_MARKER = "inclusive-bounds:";
+
+const RANGE_OPERATOR_KEYS = ["gte", "lte", "gt", "lt"] as const;
+
+/**
+ * The marker a MALFORMED date object carries to the schema, so the error can name the key.
+ *
+ * A preprocess step cannot raise a Zod issue of its own, and returning the bad object produced
+ * "Expected string, received object" — true, and useless to a model that got one key wrong out of
+ * two. So the problem travels as a string the inner schema recognizes and refuses, and the message
+ * the caller sees names the key. A caller who literally types this prefix into a date filter is
+ * refused too, which is correct: it is not a date.
+ */
+export const INVALID_DATE_RANGE_MARKER = "invalid-date-range:";
+
+/**
+ * Accept the three forms a model actually sends for a date window, emit the one the read layer takes.
+ *
+ *   "2026-04-01T00:00:00Z"                 -> unchanged (an exact value)
+ *   "2026-04-01..2026-06-30"               -> unchanged (already the advertised shorthand)
+ *   {gte: "2026-04-01", lte: "2026-06-30"} -> "2026-04-01..2026-06-30"
+ *   {gt: "2026-04-01"}                     -> "inclusive-bounds:2026-04-01.." + a disclosure
+ *
+ * A PARTIALLY malformed object is refused, not repaired. Ignoring the members it could not read left
+ * `{gte: 5, lte: "2026-06-30"}` normalising to `"..2026-06-30"` — a half-window the caller never
+ * asked for, silently one bound wider than the question, and `{gte: "2026-04-01", foo: 1}` was
+ * accepted with the unknown key dropped. Both are the fabrication line: an answer built on a filter
+ * the model did not send. `gte` with `gt` (or `lte` with `lt`) is refused for the same reason — the
+ * old code picked the inclusive one and discarded the other without a word.
+ *
+ * A non-object value is returned untouched so the string schema — not this function — produces the
+ * error, which keeps the boundary's rejection message the one the model can act on.
+ */
+export function normalizeDateRangeParamInput(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const source = value as Record<string, unknown>;
+  const operators = new Set<string>(RANGE_OPERATOR_KEYS);
+  const unknownKeys = Object.keys(source).filter((key) => !operators.has(key));
+  if (unknownKeys.length > 0) {
+    return invalidDateRange(
+      `unknown key${unknownKeys.length > 1 ? "s" : ""} ${unknownKeys.sort().map((key) => `"${key}"`).join(", ")}`
+    );
+  }
+  const bounds: Partial<Record<(typeof RANGE_OPERATOR_KEYS)[number], string>> = {};
+  for (const key of RANGE_OPERATOR_KEYS) {
+    if (!(key in source)) continue;
+    const bound = source[key];
+    if (typeof bound !== "string" || bound.length === 0) {
+      return invalidDateRange(`"${key}" must be a non-empty ISO date-time string`);
+    }
+    bounds[key] = bound;
+  }
+  if (bounds.gte !== undefined && bounds.gt !== undefined) {
+    return invalidDateRange(`"gte" and "gt" are two lower bounds; send one`);
+  }
+  if (bounds.lte !== undefined && bounds.lt !== undefined) {
+    return invalidDateRange(`"lte" and "lt" are two upper bounds; send one`);
+  }
+  const lower = bounds.gte ?? bounds.gt;
+  const upper = bounds.lte ?? bounds.lt;
+  if (lower === undefined && upper === undefined) return value;
+  const exclusive = (bounds.gte === undefined && bounds.gt !== undefined)
+    || (bounds.lte === undefined && bounds.lt !== undefined);
+  return `${exclusive ? EXCLUSIVE_BOUND_MARKER : ""}${lower ?? ""}..${upper ?? ""}`;
+}
+
+function invalidDateRange(problem: string): string {
+  return `${INVALID_DATE_RANGE_MARKER}${problem}. Send an ISO date-time, the range "2026-04-01..2026-06-30", or {gte, lte}.`;
+}
+
+/**
+ * Strip the exclusive-bound markers before the read and name the fields they were on, so the answer
+ * can say which windows were widened by an instant.
+ */
+export function takeExclusiveBoundDisclosure(
+  params: Record<string, unknown>
+): { params: Record<string, unknown>; boundsTreatedInclusive: string[] } {
+  const boundsTreatedInclusive: string[] = [];
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(params)) {
+    if (typeof value === "string" && value.startsWith(EXCLUSIVE_BOUND_MARKER)) {
+      boundsTreatedInclusive.push(key);
+      out[key] = value.slice(EXCLUSIVE_BOUND_MARKER.length);
+      continue;
+    }
+    out[key] = value;
+  }
+  return { params: out, boundsTreatedInclusive: boundsTreatedInclusive.sort() };
 }
 
 function zodSchemaForParameter(parameter: ParameterSpec): z.ZodTypeAny {
-  if (parameter.name === "cursor") {
-    return z
-      .string()
-      .optional()
-      .describe(
-        "Resume a truncated read: pass read.next_cursor from a prior incomplete response. Not needed on a complete read — one search call returns the complete scoped set."
-      );
-  }
   if (parameter.name === "per_page") {
-    return z
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .describe("Result cap: return at most this many rows of the complete scoped set (upstream reading is unaffected). Pair with offset to page.");
+    return z.number().int().positive().optional().describe(describeParameter(parameter));
   }
-  if (parameter.type === "boolean") {
-    return z.boolean().optional();
-  }
-  if (parameter.enumValues && parameter.enumValues.length > 0) {
-    return z.enum(parameter.enumValues as [string, ...string[]]).optional();
-  }
-  if (parameter.type === "integer" || parameter.type === "number") {
-    return z.number().int().positive().optional();
-  }
-  // v3's date filters (created_at/updated_at/resolved_at/sent_on/...) accept bracket ranges
-  // upstream; the tool boundary takes an exact ISO value, a {gte,lte,gt,lt} object, or the
-  // "START..END" shorthand — the read layer translates the last two to bracket params.
+  // v3's date filters (created_at/updated_at/resolved_at/sent_on/...) accept bracket ranges upstream.
+  //
+  // The tool boundary ADVERTISES one string: an exact ISO value, or the "START..END" shorthand,
+  // either side of which may be empty ("2026-04-01.." is a floor, "..2026-06-30" a ceiling). The
+  // advertised form is a string because the object form cost 357 bytes per date parameter across 117
+  // of them — 41,780 B, a quarter of the whole catalog — paid by every recruiter at every initialize.
+  //
+  // It ACCEPTS more than it advertises, and that is the fold (Codex reproduced `-32602 Expected
+  // string, received object` through a real McpServer): the truncation notes and the model's own
+  // habit both produce `{"gte": ..., "lte": ...}`, which the schema rejected before the handler ever
+  // ran — a hard boundary error on the exact shape the tool's own guidance suggested. The preprocess
+  // below normalises the object (and a bare ISO value) into the advertised string, so the cheap
+  // schema and the forgiving boundary are no longer in conflict.
   if (/(_at|_on)$/.test(parameter.name)) {
     return z
-      .union([
-        z.string(),
+      .preprocess(
+        normalizeDateRangeParamInput,
         z
-          .object({ gte: z.string().optional(), lte: z.string().optional(), gt: z.string().optional(), lt: z.string().optional() })
-          .strict(),
-      ])
-      .optional()
-      .describe(
-        'ISO date-time; or a RANGE as {"gte": "...", "lte": "..."} (any of gte/lte/gt/lt) or the string shorthand "2026-04-01..2026-06-30".'
-      );
+          .string()
+          .describe("ISO date-time, or a range 2026-04-01..2026-06-30 (either side may be empty).")
+          .superRefine((value, ctx) => {
+            // A malformed date object arrives here carrying its own problem statement (see
+            // normalizeDateRangeParamInput): raise it as the schema issue so the -32602 the model
+            // reads names the key it got wrong, instead of "Expected string, received object".
+            if (!value.startsWith(INVALID_DATE_RANGE_MARKER)) return;
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: value.slice(INVALID_DATE_RANGE_MARKER.length),
+            });
+          })
+      )
+      .optional();
   }
-  return z.string().optional();
+  if (parameter.type === "boolean") {
+    return z.boolean().optional().describe(describeParameter(parameter));
+  }
+  if (parameter.enumValues && parameter.enumValues.length > 0) {
+    // The legal values live in the schema's own enum, where a client renders them. Repeating them in
+    // the description would bill for the list twice.
+    return z.enum(parameter.enumValues as [string, ...string[]]).optional().describe(describeParameter(parameter));
+  }
+  if (parameter.type === "integer" || parameter.type === "number") {
+    return z.number().int().positive().optional().describe(describeParameter(parameter));
+  }
+  return z.string().optional().describe(describeParameter(parameter));
 }

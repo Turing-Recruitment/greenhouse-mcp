@@ -1,6 +1,7 @@
 import { ACTION_DEFINITIONS } from "../../../../action-mcp/dist/index.js";
 import { newCorrelationId } from "../../audit.js";
 import { isActionToolGranted, isToolEnabled, readPositiveInt } from "../../limits.js";
+import { RECRUITER_READ_TOOL_ORDER, recruiterReadToolKind } from "../catalog-order.js";
 import {
   createToolDeadline,
   deny,
@@ -433,9 +434,26 @@ export async function runGetRecruitingCapabilities(
   return audited ?? result;
 }
 
+/**
+ * The READ tools this session's catalog actually mounts.
+ *
+ * Derived from the registrar's own order list rather than from an env allowlist: R2a deleted
+ * `GREENHOUSE_RECRUITER_ALLOWED_TOOLS`, so the catalog IS every registered reader minus whatever the
+ * operator denylist removes. Reading the env variable here would have quietly turned
+ * `model_visible_tools` and `browsing_tools` into an empty promise the moment the variable went away —
+ * the model would have been told nothing about what it holds. The kill switches are not consulted for
+ * the same reason they were not before: `getRecruitingCapabilities` is itself gated on `analysis`
+ * being enabled, so a session that reaches this line has the analysis surface on.
+ */
 function activeAllowlistedTools(runtime: RecruiterToolRuntime): Set<string> | undefined {
-  if (!runtime.toolConfig.allowedTools) return undefined;
-  return new Set([...runtime.toolConfig.allowedTools].filter((name) => !runtime.toolConfig.disabledTools.has(name)));
+  // The registrar's OWN predicate, not a subset of it. Filtering on `disabledTools` alone announced
+  // every evidence reader as available on a runtime where the evidence kill switch had removed all
+  // of them (GREENHOUSE_RECRUITER_DISABLE_EVIDENCE), and did the same for a disabled surface.
+  return new Set(
+    RECRUITER_READ_TOOL_ORDER.filter((name) =>
+      isToolEnabled(runtime.toolConfig, runtime.session.surface, name, recruiterReadToolKind(name))
+    )
+  );
 }
 
 /**

@@ -119,7 +119,6 @@ describe("read_my_resume", () => {
       { name: "absent", rows: [] },
       { name: "ambiguous", rows: [attachment(), attachment({ filename: "second.txt" })] },
       { name: "wrong id", rows: [attachment({ id: 99 })] },
-      { name: "wrong type", rows: [attachment({ type: "cover_letter" })] },
     ];
     for (const item of cases) {
       await context.test(item.name, async () => {
@@ -135,7 +134,7 @@ describe("read_my_resume", () => {
         assert.equal(result.ok, false);
         if (result.ok) return;
         assert.equal(result.denial.code, "INVALID_REQUEST");
-        assert.equal(result.denial.message, "Resume attachment was not found or is not permitted.");
+        assert.equal(result.denial.message, "Attachment was not found or is not permitted.");
         assert.equal(fetches, 0);
       });
     }
@@ -180,7 +179,7 @@ describe("read_my_resume", () => {
     assert.equal(result.ok, false);
     if (result.ok) return;
     assert.equal(result.denial.code, "INVALID_REQUEST");
-    assert.equal(result.denial.message, "Resume attachment was not found or is not permitted.");
+    assert.equal(result.denial.message, "Attachment was not found or is not permitted.");
     assert.equal(downloads, 0);
     // "View Private Candidates" is resolved for the whole page in one batched read BEFORE the
     // per-row parent joins, so a full page costs one privacy round trip rather than one per row.

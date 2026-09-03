@@ -73,6 +73,10 @@ export const RECRUITER_MCP_READINESS_CHECK_NAMES = [
 ] as const;
 
 const HOSTED_ENV_FORBIDDEN_VARS = [
+  // R2a deleted the tool allowlist. A hosted service still carrying the variable is a service whose
+  // operator believes it controls the catalog — it does not, and readiness says so out loud rather
+  // than letting a stale control sit in the environment looking load-bearing.
+  "GREENHOUSE_RECRUITER_ALLOWED_TOOLS",
   "GREENHOUSE_RECRUITER_SESSION_TOKEN",
   "GREENHOUSE_RECRUITER_REMOTE_AUTH_TOKEN",
   "GREENHOUSE_RECRUITER_REMOTE_READY_TOKEN",
@@ -583,10 +587,26 @@ function runtimeLimitCheck(env: NodeJS.ProcessEnv): ReadinessCheck {
   }
 }
 
+/**
+ * The catalog a given config is SUPPOSED to mount: every registered reader, minus the ones an
+ * operator denylisted by name.
+ *
+ * Shared by readiness, the rollout gate and the container self-check so all three agree on what
+ * "correct" means. The denylist is the one supported way to remove a reader — `catalog-order.ts` and
+ * production.env.example both say so — but every gate compared the mount against the FULL list, so
+ * using the documented escape hatch 503'd the service. A denylisted reader is now a supported state
+ * that WARNS and names the tool; the kill switches (server, surface, evidence/analysis category)
+ * still fail, because those are not a per-tool decision anyone recorded a reason for.
+ */
+export function expectedMountedCatalog(disabledTools: ReadonlySet<string>): string[] {
+  return PILOT_TOOL_NAMES.filter((name) => !disabledTools.has(name));
+}
+
 function toolCatalogCheck(env: NodeJS.ProcessEnv): ReadinessCheck {
   try {
-    const config = createRecruiterToolConfig(env, RECRUITER_TOOL_DEFINITIONS.map((tool) => tool.name));
-    const expected: readonly string[] = PILOT_TOOL_NAMES;
+    const config = createRecruiterToolConfig(env);
+    const expected: readonly string[] = expectedMountedCatalog(config.disabledTools);
+    const disabled = PILOT_TOOL_NAMES.filter((name) => config.disabledTools.has(name));
     const activeBySurface = (["claude_desktop", "chatgpt_desktop"] as const).map((surface) => ({
       surface,
       names: RECRUITER_TOOL_DEFINITIONS
@@ -601,13 +621,20 @@ function toolCatalogCheck(env: NodeJS.ProcessEnv): ReadinessCheck {
       return {
         name: "tool_catalog",
         status: "fail",
-        summary: `Hosted recruiter MCP must expose the exact ordered ${expected.length}-tool production allowlist on every desktop surface.`,
+        summary: `Hosted recruiter MCP must expose the exact ordered ${expected.length}-tool production catalog on every desktop surface.`,
+      };
+    }
+    if (disabled.length > 0) {
+      return {
+        name: "tool_catalog",
+        status: "warn",
+        summary: `Recruiter MCP mounts the ordered ${expected.length}-tool catalog on every desktop surface; ${disabled.length} reader(s) removed by GREENHOUSE_RECRUITER_DISABLE_TOOLS: ${disabled.join(", ")}.`,
       };
     }
     return {
       name: "tool_catalog",
       status: "pass",
-      summary: `Recruiter MCP tool controls resolve to the exact ordered ${expected.length}-tool production allowlist on every desktop surface.`,
+      summary: `Recruiter MCP tool controls resolve to the exact ordered ${expected.length}-tool production catalog on every desktop surface.`,
     };
   } catch (error) {
     return {

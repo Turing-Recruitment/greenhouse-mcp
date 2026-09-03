@@ -94,7 +94,7 @@ export interface RecruiterToolSuccess<T = unknown> {
 export interface EvidenceReadEnvelope {
   // True only when every cursor page was fetched (no deadline/rate-limit/page-cap truncation).
   complete: boolean;
-  status: "complete" | "incomplete_scope_resolution" | "incomplete_timeout" | "incomplete_rate_limited" | "incomplete_page_cap";
+  status: "complete" | "incomplete_scope_resolution" | "incomplete_timeout" | "incomplete_rate_limited" | "incomplete_page_cap" | "incomplete_upstream";
   /** Rows admitted by scope filtering across all upstream reads; bridge hops are included. */
   rows_returned: number;
   raw_rows_read: number;
@@ -106,15 +106,33 @@ export interface EvidenceReadEnvelope {
    * short answer as a complete one.
    */
   privacy_withheld?: number;
+  /**
+   * Date fields the caller bounded EXCLUSIVELY (`{gt}` / `{lt}`) and this read applied inclusively.
+   *
+   * The tool advertises one cheap string per date filter, so the exclusive form has nowhere to go;
+   * the bound is widened by one instant rather than rejected, and named here so an answer built on
+   * it is not quietly one row wider than the question. Absent when nothing was widened.
+   */
+  bounds_treated_inclusive?: string[];
   unresolved_scope_rows: number;
-  pages_read: number;
-  per_page: number;
-  pagination_truncated: boolean;
+  /**
+   * What the upstream read COST — pages walked, page size, whether it stopped short, where it would
+   * resume, retries, cache hits.
+   *
+   * Optional because one envelope reports no upstream read at all: the canonical role-gate denial
+   * (`evidence-projection.ts`), which describes the refusal rather than the read behind it. Every
+   * one of these varies with whether the filtered row existed and how many pages it spanned, so a
+   * denied envelope that carried them would answer — in mechanics — the question the gate refuses to
+   * answer in rows. They are present on every real read.
+   */
+  pages_read?: number;
+  per_page?: number;
+  pagination_truncated?: boolean;
   // Resumable cursor when the read was truncated; null when complete. The complete read needs no
   // manual pagination — this is an honest escape hatch for the incomplete case, not the normal path.
-  next_cursor: string | null;
-  rate_limit_retries: number;
-  cache_hits: number;
+  next_cursor?: string | null;
+  rate_limit_retries?: number;
+  cache_hits?: number;
   warnings: string[];
   message?: string;
 }
@@ -144,11 +162,11 @@ export interface EvidenceBridgeEnvelope {
   // id-derivation read(s). Emitted by the R2 scorecard/interview/candidate bridges. The original
   // application_ids bridge keeps its own field names below, so its envelope is byte-for-byte unchanged.
   scoped_id_count?: number;
-  derive_read_status?: "complete" | "incomplete_scope_resolution" | "incomplete_timeout" | "incomplete_rate_limited" | "incomplete_page_cap";
+  derive_read_status?: "complete" | "incomplete_scope_resolution" | "incomplete_timeout" | "incomplete_rate_limited" | "incomplete_page_cap" | "incomplete_upstream";
   derive_read_complete?: boolean;
   // L1 application_ids-bridge disclosure (present only when via === "application_ids").
   scoped_application_count?: number;
-  application_read_status?: "complete" | "incomplete_scope_resolution" | "incomplete_timeout" | "incomplete_rate_limited" | "incomplete_page_cap";
+  application_read_status?: "complete" | "incomplete_scope_resolution" | "incomplete_timeout" | "incomplete_rate_limited" | "incomplete_page_cap" | "incomplete_upstream";
   application_read_complete?: boolean;
 }
 
@@ -192,6 +210,20 @@ export interface RecruiterProjectionMetadata {
   omittedFields: RecruiterProjectionOmittedField[];
   requiredFieldOmissions: RecruiterProjectionRequiredFieldOmission[];
   incompleteProjection: boolean;
+  /**
+   * The read is gated on the caller's ROLE, not on their requisitions, and this caller does not hold
+   * it — so no row of this endpoint is returned to them and every count in the envelope is zero.
+   *
+   * Stated on EVERY call to a role-gated tool by a caller outside the role, never only when rows
+   * existed: a disclosure that appeared exactly when there was something to withhold would itself
+   * answer the question the gate exists to refuse ("does a record for this colleague exist").
+   */
+  roleGatedRowsWithheld?: RecruiterProjectionRoleGate;
+}
+
+export interface RecruiterProjectionRoleGate {
+  reason: "privacy";
+  note: string;
 }
 
 export interface RecruiterToolDefinition {

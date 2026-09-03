@@ -6,7 +6,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSignedSessionToken } from "../src/auth.js";
 import { shutdownHttpRecruiterMcp, startHttpRecruiterMcp } from "../src/http-server.js";
-import { PILOT_TOOL_NAMES } from "../src/tools/register.js";
 import { setGcsStorageFactoryForTests } from "../src/audit-gcs.js";
 import { _resetReadCache } from "../src/read-cache.js";
 import { createFakeGcsStorage } from "./fake-gcs-storage.js";
@@ -230,7 +229,6 @@ describe("hosted recruiter MCP HTTP server", () => {
       GREENHOUSE_RECRUITER_AUDIT_JSONL_PATH: "/secure/greenhouse-recruiter-audit.jsonl",
       GREENHOUSE_RECRUITER_AUDIT_DURABLE_MOUNT_PATH: "/secure",
       GREENHOUSE_RECRUITER_CORS_ORIGIN: "https://chatgpt.com,https://claude.ai",
-      GREENHOUSE_RECRUITER_ALLOWED_TOOLS: PILOT_TOOL_NAMES.join(","),
       GREENHOUSE_RECRUITER_READYZ_TOKEN: READYZ_TOKEN,
     } as NodeJS.ProcessEnv);
     try {

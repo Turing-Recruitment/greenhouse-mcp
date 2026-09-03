@@ -100,6 +100,23 @@ export type PermissionScope =
        * external constraint behind it.
        */
       privateCapableJobIds?: ReadonlySet<number>;
+      /**
+       * PROOF that this org-wide scope came from a Greenhouse site-admin role, rather than from an
+       * all-jobs grant an ordinary job admin can hold.
+       *
+       * `kind: "all"` answers two different questions with one word. The site-admin wrapper
+       * (`recruiter-mcp/src/site-admin-permission.ts`) returns it after reading `/v3/users.site_admin`
+       * — a proven role. The base provider returns the SAME shape for a NON-site-admin who holds an
+       * all-jobs marker on `/v3/user_job_permissions` (`rowGrantsAllJobAccess` below) — a job-access
+       * grant that says nothing about administering the staff directory. Anything downstream that
+       * keys a ROLE decision off `kind` therefore hands the second actor the first actor's view.
+       *
+       * So the role signal is carried explicitly and stamped in exactly one place. Only `=== true`
+       * counts; absent means "not established", which is the fail-closed direction — an actor whose
+       * site-admin status nobody proved reads every row their jobs give them and none of the rows
+       * Greenhouse restricts to site admins.
+       */
+      siteAdmin?: boolean;
     }
   | {
       kind: "jobs";
@@ -114,14 +131,25 @@ export type PermissionScope =
        * those jobs are visible, which is the distinction Greenhouse itself draws.
        */
       privateCapableJobIds?: ReadonlySet<number>;
+      /**
+       * The same proof as on the `all` branch, on a scope that is NOT org-wide.
+       *
+       * A site admin whose role `/v3/users.site_admin` established can still end up job-scoped: the
+       * site-admin wrapper narrows to the admin's explicit grants when it cannot read which jobs
+       * Greenhouse restricts (`recruiter-mcp/src/site-admin-permission.ts`). The JOB narrowing is a
+       * correct fail-closed; the ROLE was never in question, and dropping it demoted a proven admin
+       * to the line-recruiter projection because of an unrelated `/jobs` outage. Job scope and role
+       * are two answers, so they are carried as two fields.
+       */
+      siteAdmin?: boolean;
     };
 
 export type PermissionLookupResult = ReadonlySet<number> | PermissionScope;
 
 export type AppliedPermissionScope =
   | { kind: "operator"; permittedJobCount: null; privateCandidatesWithheld?: true }
-  | { kind: "all"; permittedJobCount: null; privateCandidatesWithheld?: true }
-  | { kind: "jobs"; permittedJobCount: number };
+  | { kind: "all"; permittedJobCount: null; privateCandidatesWithheld?: true; siteAdmin?: true }
+  | { kind: "jobs"; permittedJobCount: number; siteAdmin?: true };
 
 /**
  * `privateCandidatesWithheld` is the org-wide branch's disclosure, and it appears ONLY there.
@@ -803,7 +831,7 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
         return deny(toolName, "TOOL_NOT_AVAILABLE", actorId, actAsUserId);
       }
 
-      const safeParams = sanitizeReadParams(params);
+      const safeParams = sanitizeReadParams(params, registration.endpoint);
 
       if (isOperator && actAsUserId === undefined) {
         options.onPermissionScopeResolved?.({ kind: "operator" });
@@ -905,7 +933,11 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
           actorId,
           effectiveActorId,
           scoped: false,
-          permissionScope: { kind: "all", permittedJobCount: null },
+          permissionScope: {
+            kind: "all",
+            permittedJobCount: null,
+            ...(permissionScope.siteAdmin === true ? { siteAdmin: true as const } : {}),
+          },
           rowCounts,
           data: response.data,
           nextCursor: response.nextCursor,
@@ -955,7 +987,12 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
           effectiveActorId,
           response,
           scoped: true,
-          appliedScope: { kind: "all", permittedJobCount: null, privateCandidatesWithheld: true },
+          appliedScope: {
+            kind: "all",
+            permittedJobCount: null,
+            privateCandidatesWithheld: true,
+            ...(permissionScope.siteAdmin === true ? { siteAdmin: true as const } : {}),
+          },
           context: privacyOnlyContext(
             config,
             applicationTerminal,
@@ -1062,8 +1099,15 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
               kind: "all",
               permittedJobCount: null,
               ...(allAccessAttested ? {} : { privateCandidatesWithheld: true as const }),
+              ...(permissionScope.siteAdmin === true ? { siteAdmin: true as const } : {}),
             }
-          : { kind: "jobs", permittedJobCount: permissionScope.jobIds.size },
+          : {
+              kind: "jobs",
+              permittedJobCount: permissionScope.jobIds.size,
+              // A proven site admin narrowed to explicit job grants stays a proven site admin on the
+              // envelope: the projection layer keys the admin view off this flag, never off `kind`.
+              ...(permissionScope.siteAdmin === true ? { siteAdmin: true as const } : {}),
+            },
         rowCounts,
         data: scopedResponse.data,
         nextCursor: scopedResponse.nextCursor,
@@ -1502,6 +1546,11 @@ export const CANDIDATE_SUBSTANCE_TOOLS: ReadonlySet<string> = new Set([
   "list_attachments",
   "list_candidate_educations",
   "list_candidate_employments",
+  // R2b: an applied-tag row names a candidate by id, so an unattested actor must not learn a private
+  // candidate exists by seeing their tag row.
+  "list_applied_candidate_tags",
+  // R2d: `note` on a scorecard-attribute row is an interviewer's free text about one candidate.
+  "list_scorecard_candidate_attributes",
   "list_scorecard_question_answers",
   "list_scorecard_question_answer_options",
 ]);
@@ -2461,6 +2510,9 @@ export const DEFAULT_FILTER_REGISTRY: ReadonlyMap<string, ToolRegistration> =
     ["get_candidate", getTool("/candidates", filterCandidateRow)],
     ["list_candidate_educations", listTool("/candidate_educations", filterCandidateBackedRow)],
     ["list_candidate_employments", listTool("/candidate_employments", filterCandidateBackedRow)],
+    // R2b. The pool behind a tag name: search_my_candidate_tags gives the dictionary, this gives who
+    // carries which tag. Candidate-backed, so the private-candidate gate runs on every row.
+    ["list_applied_candidate_tags", listTool("/applied_candidate_tags", filterCandidateBackedRow)],
     ["list_scorecards", listTool("/scorecards", filterApplicationBackedRow)],
     ["list_notes", listTool("/notes", filterNoteOrActivityRow)],
     ["list_attachments", listTool("/attachments", filterAttachmentRow)],
@@ -2489,6 +2541,14 @@ export const DEFAULT_FILTER_REGISTRY: ReadonlyMap<string, ToolRegistration> =
     ["list_close_reasons", globalReferenceListTool("/close_reasons")],
     ["list_custom_field_options", globalReferenceListTool("/custom_field_options")],
     ["list_custom_fields", globalReferenceListTool("/custom_fields")],
+    // R2b. The permission-role dictionary: role names plus the two-value role_type taxonomy that
+    // decode the role_id on /user_job_permissions and /future_job_permissions. No PII, no per-user
+    // rows — it is the same class of id->name dictionary as /departments.
+    ["list_user_roles", globalReferenceListTool("/user_roles")],
+    // R2b. Org email copy: the template a rejection or an availability request sends, and the
+    // template_id a future write needs. `recipients` is projected back to site admins and operators
+    // only (Sam's teammate-email ruling); everything else is company copy every recruiter sends.
+    ["list_email_templates", globalReferenceListTool("/email_templates")],
     ["list_pay_inputs", globalReferenceListTool("/pay_inputs")],
     // Tier-3.4 domain exposure (audit C-DOMAINS). Scope filters are contract-grounded per row shape:
     // approval_flows + interview_kits carry job_id (direct job scoping); prospect_details carries
@@ -2506,6 +2566,39 @@ export const DEFAULT_FILTER_REGISTRY: ReadonlyMap<string, ToolRegistration> =
     ["list_scorecard_question_answer_options", policyListTool("/scorecard_question_answer_options")],
     ["list_default_interviewers", policyListTool("/default_interviewers")],
     ["list_job_post_locations", policyListTool("/job_post_locations")],
+    // R2b. The finer post-level location (city, region, lat/long) behind the coarse country tags the
+    // server instructions apologise for. The row carries job_post_id and NO job_id, so it is bound
+    // through the same job_post_id -> /job_posts -> job_id chain as /job_post_locations, never as a
+    // direct job-scoped row (which would have resolved every row unresolved and withheld the page).
+    ["list_job_post_searchable_locations", policyListTool("/job_post_searchable_locations")],
+    // R2d. The candidate-attribute (structured rubric) family. Each is bound to the field its row
+    // ACTUALLY carries: job_candidate_attributes and candidate_attribute_types carry job_id;
+    // scorecard_candidate_attributes carries scorecard_id; focus_candidate_attributes and
+    // scorecard_question_candidate_attributes carry neither and reach a job through the kit/question
+    // chain, so they are policy-driven like the rest of the rubric structure.
+    ["list_job_candidate_attributes", listTool("/job_candidate_attributes", filterDirectJobScopedRow)],
+    ["list_candidate_attribute_types", listTool("/candidate_attribute_types", filterDirectJobScopedRow)],
+    ["list_scorecard_candidate_attributes", listTool("/scorecard_candidate_attributes", filterScorecardBackedRow)],
+    ["list_focus_candidate_attributes", policyListTool("/focus_candidate_attributes")],
+    ["list_scorecard_question_candidate_attributes", policyListTool("/scorecard_question_candidate_attributes")],
+    // R2d. "Who else can see this req" — bounded to the reader's OWN reqs by the same direct job
+    // filter every job-scoped read uses, so it is never an org-wide view of who has access to what.
+    ["list_user_job_permissions", listTool("/user_job_permissions", filterDirectJobScopedRow)],
+    // R2d. Staff configuration and operational diagnostics, none of which can carry a candidate row.
+    // future_job_permissions and user_emails additionally return rows only to a site admin or
+    // operator (evidence-projection.ts operatorOnlyProjector) — Greenhouse restricts its own
+    // permission and staff-directory settings to site admins, and this surface does not open a side
+    // door around that.
+    ["list_future_job_permissions", globalReferenceListTool("/future_job_permissions")],
+    ["list_user_emails", globalReferenceListTool("/user_emails")],
+    ["list_bulk_requests", globalReferenceListTool("/bulk_requests")],
+    // R2e. The single bulk request, fetched by its uuid. Same rows as the list read filtered by
+    // bulk_action_uuid, plus the signed result files' URLs — which the projection drops, exactly as
+    // it drops a signed attachment URL. Bound because "did the bulk update I ran an hour ago
+    // finish, and what failed" is a question with a uuid in hand and no list filter needed.
+    ["get_bulk_request", pathParamGetTool("/bulk_requests", "bulk_action_uuid")],
+    ["list_blocked_spam_sources", globalReferenceListTool("/blocked_spam_sources")],
+    ["list_job_board_custom_locations", globalReferenceListTool("/job_board_custom_locations")],
     ["list_pay_input_ranges", policyListTool("/pay_input_ranges")],
     ["list_interviewer_tags", globalReferenceListTool("/interviewer_tags")],
     ["list_candidate_tags", globalReferenceListTool("/candidate_tags")],
@@ -2554,10 +2647,34 @@ function permissionLookupFailureMessage(error: unknown): string {
   return "Scoped Greenhouse read denied: permissions could not be resolved for this actor.";
 }
 
-function sanitizeReadParams(params: Record<string, unknown>): Record<string, unknown> {
+/**
+ * Endpoint query filters that COLLIDE with an actor-identity parameter name.
+ *
+ * The identity guard below drops `email` (and the other actor-naming keys) unconditionally, because
+ * on every other endpoint such a param is an attempt to say WHO the read runs as — and the actor is
+ * resolved from the session, never from params. On these two endpoints `email` is not that: it is
+ * the endpoint's own documented filter over its own rows (`/v3/user_emails` filters the staff
+ * directory it returns; `/v3/candidates` filters candidates by their address, which is how
+ * "where is jane@example.com in process" is answered). Dropping it there silently returned the whole
+ * directory to an admin who asked for one colleague, and silently ignored the filter the
+ * `search_my_candidates` description tells the model to use.
+ *
+ * Exact endpoint+param pairs only, so a new endpoint cannot inherit the exemption, and the actor
+ * cannot be re-named through it: nothing here decides WHOSE permissions the read runs under.
+ */
+const ENDPOINT_QUERY_FILTER_PARAMS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["/user_emails", new Set(["email"])],
+  ["/candidates", new Set(["email"])],
+]);
+
+function isEndpointQueryFilterParam(endpoint: string | undefined, key: string): boolean {
+  return endpoint !== undefined && (ENDPOINT_QUERY_FILTER_PARAMS.get(endpoint)?.has(key) ?? false);
+}
+
+function sanitizeReadParams(params: Record<string, unknown>, endpoint?: string): Record<string, unknown> {
   const safe: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(params)) {
-    if (isIdentityParamName(key)) continue;
+    if (isIdentityParamName(key) && !isEndpointQueryFilterParam(endpoint, key)) continue;
     // Drop a model/caller-supplied `fields` selector at the reader boundary. Several row filters scope
     // through a structural FK on the row (an attachment's application_id, a note's visibility, an
     // application's job_id); a `fields` projection that omitted that FK would blind the filter and could
@@ -2877,6 +2994,46 @@ function globalReferenceListTool(path: string): ToolRegistration {
       };
     },
     endpoint: path,
+  };
+}
+
+/**
+ * A single-record read whose id lives in the PATH rather than in an `ids` filter.
+ *
+ * `/v3/bulk_requests/{bulk_action_uuid}` is the only such endpoint bound today. The id is validated
+ * against a strict character class before it is interpolated — a path segment assembled from caller
+ * input is exactly where a `..%2f` would reach another resource — and the read carries no query
+ * params at all, so nothing else can ride along.
+ */
+function pathParamGetTool(basePath: string, paramName: string): ToolRegistration {
+  const endpoint = `${basePath}/{${paramName}}`;
+  return {
+    async execute(rawReader, params, signal) {
+      const raw = params[paramName];
+      const id = typeof raw === "string" ? raw.trim() : "";
+      if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(id)) {
+        throw new Error(`Scoped Greenhouse read requires a valid ${paramName} for ${endpoint}.`);
+      }
+      const response = await rawReader.read<unknown>(`${basePath}/${id}`, {}, undefined, signal);
+      return {
+        ...response,
+        data: isRecord(response.data) ? response.data : null,
+        nextCursor: null,
+      };
+    },
+    async filter(response) {
+      const data = isRecord(response.data) ? response.data : null;
+      return {
+        response: { ...response, data },
+        outcomes: {
+          permitted: data ? 1 : 0,
+          notPermitted: 0,
+          missingParent: 0,
+          parentReadFailed: 0,
+        },
+      };
+    },
+    endpoint,
   };
 }
 
@@ -3365,6 +3522,9 @@ function clonePermissionScope(scope: PermissionScope): PermissionScope {
     return {
       kind: "all",
       ...(scope.excludedJobIds ? { excludedJobIds: new Set(scope.excludedJobIds) } : {}),
+      // The proven-site-admin signal is a field the reader never sees unless it is named here.
+      // Dropping it would silently demote every site admin to the non-admin projection.
+      ...(scope.siteAdmin === true ? { siteAdmin: true } : {}),
       ...(scope.privateCandidatesAttested === undefined
         ? {}
         : { privateCandidatesAttested: scope.privateCandidatesAttested }),
@@ -3373,21 +3533,25 @@ function clonePermissionScope(scope: PermissionScope): PermissionScope {
         : {}),
     };
   }
-  return scope.privateCapableJobIds
-    ? {
-        kind: "jobs",
-        jobIds: new Set(scope.jobIds),
-        privateCapableJobIds: new Set(scope.privateCapableJobIds),
-      }
-    : { kind: "jobs", jobIds: new Set(scope.jobIds) };
+  // Same field-by-field rule as the all-branch: a proven site-admin role narrowed to explicit job
+  // grants is still a proven role, and a clone that dropped it would demote the admin on every
+  // permission refresh.
+  return {
+    kind: "jobs",
+    jobIds: new Set(scope.jobIds),
+    ...(scope.privateCapableJobIds ? { privateCapableJobIds: new Set(scope.privateCapableJobIds) } : {}),
+    ...(scope.siteAdmin === true ? { siteAdmin: true } : {}),
+  };
 }
 
-// A bare Set is still the accepted shape from a custom provider, but it cannot carry the
-// private-capable subset — so a scope that HAS one is returned as the object form. Returning the
-// Set here would silently drop private capability every time the answer came from the cache.
+// A bare Set is still the accepted shape from a custom provider, but it can carry neither the
+// private-capable subset nor the proven site-admin role — so a scope that HAS either is returned as
+// the object form. Returning the Set here would silently drop them every time the answer came from
+// the cache: private candidates withheld from an actor Greenhouse grants them to, or a proven admin
+// demoted to the line-recruiter projection.
 function clonePermissionLookupResult(scope: PermissionScope): PermissionLookupResult {
   if (scope.kind === "all") return clonePermissionScope(scope);
-  return scope.privateCapableJobIds ? clonePermissionScope(scope) : new Set(scope.jobIds);
+  return scope.privateCapableJobIds || scope.siteAdmin === true ? clonePermissionScope(scope) : new Set(scope.jobIds);
 }
 
 function isPermissionScope(value: unknown): value is PermissionScope {
@@ -3401,9 +3565,16 @@ function isPermissionScope(value: unknown): value is PermissionScope {
     if (value.privateCandidatesAttested !== undefined && typeof value.privateCandidatesAttested !== "boolean") {
       return false;
     }
+    // Same rule for the site-admin proof: a provider answering `siteAdmin: "true"` out of a JSON
+    // config must not be read as a site admin.
+    if (value.siteAdmin !== undefined && typeof value.siteAdmin !== "boolean") {
+      return false;
+    }
     return value.privateCapableJobIds === undefined || isSetLike(value.privateCapableJobIds);
   }
-  return value.kind === "jobs" && isSetLike(value.jobIds);
+  if (value.kind !== "jobs" || !isSetLike(value.jobIds)) return false;
+  // Same rule as the all-branch: a stringy `siteAdmin` out of a JSON config is not a proven role.
+  return value.siteAdmin === undefined || typeof value.siteAdmin === "boolean";
 }
 
 function isSetLike(value: unknown): value is ReadonlySet<number> {

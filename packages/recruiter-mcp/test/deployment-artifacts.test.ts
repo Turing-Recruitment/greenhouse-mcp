@@ -15,6 +15,7 @@ const distributionExamples = [
   "distribution-claude-desktop.example.json",
   "distribution-claude-code.example.json",
 ].map((name) => JSON.parse(readFileSync(`examples/rollout-evidence/${name}`, "utf8")));
+const productionEnvCheckExample = JSON.parse(readFileSync("examples/rollout-evidence/production-env-check.example.json", "utf8"));
 
 describe("hosted deployment artifacts", () => {
   it("keeps static boundary guards in the package verify path", () => {
@@ -101,8 +102,8 @@ describe("hosted deployment artifacts", () => {
     assert.match(dockerSmokeScript, /runDockerJson\(\[/);
     assert.match(dockerSmokeScript, /greenhouse-recruiter-container-self-check\.mjs/);
     assert.match(dockerSmokeScript, /authenticatedMcpHttpValidated: false/);
-    assert.match(dockerSmokeScript, /catalogToolCount !== 44/);
-    assert.match(dockerSmokeScript, /hiddenToolCount !== 22/);
+    assert.match(dockerSmokeScript, /Number\.isInteger\(parsed\?\.catalogToolCount\)/);
+    assert.match(dockerSmokeScript, /hiddenToolCount !== 0/);
     assert.match(dockerSmokeScript, /real issued recruiter session/);
     assert.match(dockerSmokeScript, /GREENHOUSE_RECRUITER_DOCKER_SMOKE_RUN/);
     assert.match(dockerSmokeScript, /runDocker\(\[\s*"run"/);
@@ -149,7 +150,7 @@ describe("hosted deployment artifacts", () => {
       "GREENHOUSE_RECRUITER_RATE_LIMIT_DISABLED",
       "GREENHOUSE_RECRUITER_MAX_TOOL_DURATION_MS",
       "GREENHOUSE_RECRUITER_MAX_ANALYSIS_DURATION_MS",
-      "GREENHOUSE_RECRUITER_ALLOWED_TOOLS",
+      "GREENHOUSE_RECRUITER_DISABLE_TOOLS",
       "GREENHOUSE_RECRUITER_MAX_HTTP_BODY_BYTES",
       "GREENHOUSE_RECRUITER_HTTP_HEADERS_TIMEOUT_MS",
       "GREENHOUSE_RECRUITER_HTTP_REQUEST_TIMEOUT_MS",
@@ -221,14 +222,28 @@ describe("hosted deployment artifacts", () => {
     assert.match(productionEnvExample, /fails closed/i);
   });
 
-  it("locks production env, Docker smoke, and ChatGPT config to the exact ordered 44-tool catalog", () => {
+  it("locks production env, Docker smoke, and ChatGPT config to the exact ordered mounted catalog", () => {
     const expected = [...PILOT_TOOL_NAMES];
-    const productionTools = lineValue(productionEnvExample, "GREENHOUSE_RECRUITER_ALLOWED_TOOLS").split(",");
-    const dockerTools = dockerSmokeScript.match(/GREENHOUSE_RECRUITER_ALLOWED_TOOLS: "([^"]+)"/)?.[1]?.split(",");
 
-    assert.equal(expected.length, 44);
-    assert.deepEqual(productionTools, expected);
-    assert.deepEqual(dockerTools, expected);
+    // R2a deleted the allowlist. The env template and the Docker smoke env must not resurrect it, and
+    // the template has to say the deploy step out loud so the live Cloud Run service is cleaned up.
+    assert.equal(/^GREENHOUSE_RECRUITER_ALLOWED_TOOLS=/m.test(productionEnvExample), false);
+    assert.equal(/GREENHOUSE_RECRUITER_ALLOWED_TOOLS:/.test(dockerSmokeScript), false);
+    assert.match(productionEnvExample, /DEPLOY STEP: delete GREENHOUSE_RECRUITER_ALLOWED_TOOLS from the Cloud Run service/);
+    assert.match(productionEnvExample, /^GREENHOUSE_RECRUITER_DISABLE_TOOLS=$/m);
+
+    // The smoke script no longer carries a catalog-size literal at all: the container's self-check
+    // asserts the exact ordered catalog inside the image, which is stronger than a count and cannot
+    // be forgotten in a second file. What the script must still check is that the self-check ran and
+    // hid nothing.
+    assert.equal(
+      /EXPECTED_CATALOG_TOOL_COUNT/.test(dockerSmokeScript),
+      false,
+      "the catalog-size literal is retired; the container self-check owns exactness"
+    );
+    assert.match(dockerSmokeScript, /parsed\?\.hiddenToolCount !== 0/, "nothing is hidden any more");
+    assert.match(dockerSmokeScript, /Number\.isInteger\(parsed\?\.catalogToolCount\)/, "the self-check's answer is still shape-checked");
+
     assert.deepEqual(chatGptExample.allowed_tools, expected);
     for (const example of distributionExamples) {
       assert.deepEqual(example.toolNames, expected);
@@ -244,6 +259,36 @@ describe("hosted deployment artifacts", () => {
       assert.equal(example.expectedChecks.find((check: { name?: string }) => check.name === "exact_tool_catalog")?.status, "pass");
       assert.equal(example.expectedChecks.find((check: { name?: string }) => check.name === "read_only_tool_annotations")?.status, "pass");
     }
+  });
+});
+
+describe("committed example evidence counts", () => {
+  /**
+   * Fold 2: three examples said "catalog exactly matched 81 unique approved tools" while their own
+   * toolNames arrays carried 82 — the count-bearing SUMMARY was never compared to anything, so it
+   * went stale the moment a reader was bound. Every number a committed example states about the
+   * catalog is now derived from the artifact next to it.
+   */
+  it("states a catalog count equal to the catalog the example actually lists", () => {
+    for (const example of distributionExamples) {
+      const summary = String(
+        example.expectedChecks.find((check: { name?: string }) => check.name === "exact_tool_catalog")?.summary ?? ""
+      );
+      const stated = Number(summary.match(/\b(\d+)\b/)?.[1]);
+      assert.equal(
+        stated,
+        example.toolNames.length,
+        `example summary says ${stated} tools, its own catalog lists ${example.toolNames.length}`
+      );
+      assert.equal(stated, PILOT_TOOL_NAMES.length, "and the catalog it lists is the one this build mounts");
+    }
+  });
+
+  it("states the shipping catalog size in the production env-check example", () => {
+    const summary = String(
+      productionEnvCheckExample.expectedChecks.find((check: { name?: string }) => check.name === "tool_catalog")?.summary ?? ""
+    );
+    assert.equal(Number(summary.match(/(\d+)-tool/)?.[1]), PILOT_TOOL_NAMES.length);
   });
 });
 

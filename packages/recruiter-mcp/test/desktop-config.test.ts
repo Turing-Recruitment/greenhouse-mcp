@@ -11,7 +11,7 @@ import {
   mergeDesktopConfigManifests,
   writeDesktopConfigBatchFiles,
 } from "../src/desktop-config.js";
-import { PILOT_TOOL_NAMES } from "../src/tools/register.js";
+import { PILOT_TOOL_NAMES, RECRUITER_TOOL_DEFINITIONS } from "../src/tools/register.js";
 
 describe("desktop distribution config generator", () => {
   it("refuses the unsupported Claude Desktop remote url/headers shape", () => {
@@ -59,53 +59,10 @@ describe("desktop distribution config generator", () => {
     });
 
     assert.equal(report.surface, "chatgpt_desktop");
-    const expectedPilotTools = [
-      "answer_my_recruiting_question",
-      "analyze_scorecard_accountability",
-      "analyze_interview_feedback_drag",
-      "analyze_stage_latency",
-      "analyze_pipeline_quality",
-      "analyze_source_quality",
-      "analyze_rejection_reason_drift",
-      "resolve_job_scope",
-      "confirm_job_scope",
-      "get_job_scope",
-      "get_recruiting_capabilities",
-      "read_my_resume",
-      "search_my_jobs",
-      "get_my_job",
-      "search_my_applications",
-      "get_my_application",
-      "search_my_interviews",
-      "search_my_offers",
-      "search_my_openings",
-      "search_my_users",
-      "search_my_job_owners",
-      "search_my_job_interview_stages",
-      "search_my_application_stages",
-      "search_my_job_hiring_managers",
-      "search_my_job_posts",
-      "search_my_candidates",
-      "get_my_candidate",
-      "search_my_scorecards",
-      "search_my_rejection_details",
-      "search_my_rejection_reasons",
-      "search_my_notes",
-      "search_my_attachments",
-      "search_my_interviewers",
-      "search_my_scorecard_question_answers",
-      "search_my_candidate_educations",
-      "search_my_candidate_employments",
-      "get_my_user",
-      "search_my_sources",
-      "search_my_referrers",
-      "search_my_custom_field_options",
-      "search_my_custom_fields",
-      "search_my_departments",
-      "search_my_offices",
-      "search_my_close_reasons",
-    ];
-    assert.deepEqual([...PILOT_TOOL_NAMES], expectedPilotTools);
+    // R2a: the ChatGPT `allowed_tools` payload names the tools the SERVER mounts — it is the client's
+    // own picker filter, not a server-side gate, so it follows the mounted catalog rather than a
+    // separately curated list. `test/catalog-registrar.test.ts` locks that catalog to the registrar.
+    const expectedPilotTools = [...PILOT_TOOL_NAMES];
     assert.deepEqual(report.config, {
       type: "mcp",
       server_label: "greenhouse-recruiter",
@@ -115,7 +72,7 @@ describe("desktop distribution config generator", () => {
       require_approval: "always",
       allowed_tools: expectedPilotTools,
     });
-    assert.equal(expectedPilotTools.length, 44);
+    assert.equal(expectedPilotTools.length, RECRUITER_TOOL_DEFINITIONS.length, "the client picker lists every mounted read tool");
   });
 
   it("loads generation options from env and supports intentionally restricted pilot payloads", () => {

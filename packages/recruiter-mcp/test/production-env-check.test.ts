@@ -4,7 +4,6 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parseProductionEnvFile, runProductionEnvCheck } from "../src/production-env-check.js";
-import { PILOT_TOOL_NAMES } from "../src/tools/register.js";
 
 const STRONG_SESSION_SECRET = "session-secret-value-with-at-least-32-chars";
 const STRONG_SCOPE_SIGNING_SECRET = "scope-signing-secret-value-at-least-32-chars";
@@ -112,7 +111,6 @@ function completeEnv(): NodeJS.ProcessEnv {
     GREENHOUSE_RECRUITER_AUDIT_JSONL_PATH: "/secure/greenhouse-recruiter-audit.jsonl",
     GREENHOUSE_RECRUITER_AUDIT_DURABLE_MOUNT_PATH: "/secure",
     GREENHOUSE_RECRUITER_CORS_ORIGIN: "https://chatgpt.com,https://claude.ai",
-    GREENHOUSE_RECRUITER_ALLOWED_TOOLS: PILOT_TOOL_NAMES.join(","),
     GREENHOUSE_RECRUITER_FORCE_PERMISSION_TTL_ZERO: "true",
     GREENHOUSE_RECRUITER_RATE_LIMIT_DISABLED: "false",
   } as NodeJS.ProcessEnv;

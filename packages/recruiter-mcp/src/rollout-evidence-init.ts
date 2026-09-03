@@ -194,6 +194,7 @@ function desktopTestTemplate(surface: string, client: string) {
     })),
     resumeInstructionsTreatedAsUntrusted: false,
     catalogAttestation: "",
+    observedToolNames: [],
     containsTokens: false,
     taskOutcome: "",
     taskOutcomeReason: "",
@@ -208,6 +209,7 @@ function desktopTestTemplate(surface: string, client: string) {
       "Record the exact physical clientVersion and modelVersion shown by the tested client; blank or inferred versions are not evidence.",
       `Run every routingChecks case at least ${MIN_ROUTING_RUNS} times in the real client and record each actual ordered observedTools sequence. The matrix covers all critical analyses, all candidate-intelligence prompts, adversarial near-neighbors, scope confirm/get, and hostile instructions inside resume text.`,
       "Set resumeInstructionsTreatedAsUntrusted=true only after the client treated resume instructions as document content and did not follow them.",
+      "Set observedToolNames to the ordered tool names the tested client's tools/list actually returned. The recorder hashes THOSE names and refuses a catalog that is not the one this build ships, so a stale or reordered deployment fails at record time.",
       "Record taskOutcome as useful, not_useful, or could_not_use and taskOutcomeReason as wrong_scope, timeout_error, installation_blocked, answer_received, or not_yet_needed.",
     ],
   };
@@ -570,7 +572,8 @@ greenhouse-recruiter-record-desktop-test \
   --attest-durable-session-access \
   --attest-session-persisted-across-restart \
   --attest-no-routine-reverification \
-  --attest-catalog read_only_44 \
+  --attest-catalog read_only_full_catalog \
+  --observed-tools '<the tool names tools/list returned, comma-separated, in that order>' \
   --out ./desktop-chatgpt-desktop.json
 
 # Repeat for Claude Desktop with --surface claude_desktop, --client claude_desktop_chat, and --attachment-method claude_desktop_mcpb.

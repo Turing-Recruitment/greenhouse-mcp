@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import { chmod, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { isClientSurfaceCompatible, isRecruiterClient, normalizeSessionIssuedAt, normalizeSessionTokenId } from "./auth.js";
 import { containsTokenOrConfigPayload } from "./evidence-hygiene.js";
 import type { DesktopConfigFileManifest } from "./desktop-config.js";
 import type { IssuedEmailSessionFileManifest } from "./email-session.js";
+import { ACTION_DEFINITIONS } from "../../action-mcp/dist/index.js";
 import { PILOT_TOOL_NAMES, RECRUITER_TOOL_DEFINITIONS } from "./tools/register.js";
 import type { RecruiterClient } from "./types.js";
 
@@ -37,6 +39,9 @@ const DESKTOP_USER_TEST_REPORT_FIELDS = new Set([
   "attachmentMethod",
   "exercisedTools",
   "catalogAttestation",
+  "catalogToolCount",
+  "catalogToolNamesHash",
+  "observedToolNames",
   "containsTokens",
   "taskOutcome",
   "taskOutcomeReason",
@@ -298,6 +303,8 @@ export interface BuildDesktopUserTestEvidenceOptions {
   sessionPersistedAcrossRestart: boolean;
   routineReverificationPrompted: boolean;
   catalogAttestation: string;
+  /** The ordered tool names the tested client's tools/list returned. Recorded, then compared. */
+  observedToolNames?: string[];
   taskOutcome?: "useful" | "not_useful" | "could_not_use";
   taskOutcomeReason?: "wrong_scope" | "timeout_error" | "installation_blocked" | "answer_received" | "not_yet_needed";
   clientVersion?: string;
@@ -310,11 +317,93 @@ export interface BuildDesktopUserTestEvidenceOptions {
 /**
  * The dual-catalog contract (CLO-83). The old attestation — "no write/admin tools visible" — made a
  * correct write-entitled deployment fail its own release process once the write plane shipped. What
- * a tester attests now is WHICH exact catalog they saw: a read-only identity sees exactly the 44
- * curated read tools, a write-entitled identity sees exactly 66 — the same 44 plus the 22
- * preview and apply pairs. Anything else on either side of the entitlement is a defect.
+ * a tester attests is WHICH exact catalog they saw: a read-only identity sees the full read catalog,
+ * a write-entitled identity sees that catalog plus every preview/apply pair. Anything else on either
+ * side of the entitlement is a defect.
+ *
+ * The tokens carry no COUNT. They used to (`read_only_44` / `write_entitled_66`), which meant every
+ * change to the catalog silently invalidated evidence a tester had already recorded and forced a
+ * rename across nine files. The counts still get checked — `EXPECTED_CATALOG_TOOL_COUNTS` below
+ * derives them from `PILOT_TOOL_NAMES` and `ACTION_DEFINITIONS`, so the runbook tells the tester the
+ * live numbers to look for — but they are no longer baked into the evidence's vocabulary.
  */
-export type DesktopCatalogAttestation = "read_only_44" | "write_entitled_66";
+export type DesktopCatalogAttestation = "read_only_full_catalog" | "write_entitled_full_catalog";
+
+/**
+ * The tool counts a tester must actually see for each attestation, derived from the registrar rather
+ * than restated. Exported so the runbook generator and the rollout gate quote one number.
+ */
+export const EXPECTED_CATALOG_TOOL_COUNTS: Readonly<Record<DesktopCatalogAttestation, number>> = {
+  read_only_full_catalog: PILOT_TOOL_NAMES.length,
+  write_entitled_full_catalog: PILOT_TOOL_NAMES.length + ACTION_DEFINITIONS.length * 2,
+};
+
+const ACTION_TOOL_NAMES: readonly string[] = ACTION_DEFINITIONS.flatMap((definition) => [
+  definition.previewTool,
+  definition.applyTool,
+]);
+
+/**
+ * The catalog this evidence was recorded against, as a hash of the ORDERED tool names.
+ *
+ * The attestation token carries no count on purpose (a count baked into the vocabulary invalidated
+ * recorded evidence on every catalog change and forced a rename across nine files). That left the
+ * evidence unable to say WHICH catalog the tester saw, so a copied file stayed green through the next
+ * catalog change — the exact staleness the release gate exists to catch. The hash is recorded at
+ * build time, and the rollout gate recomputes it from the CURRENT catalog and requires a match:
+ * change the catalog and yesterday's evidence stops passing, which is the point.
+ *
+ * This function is the CANONICAL side of that comparison — the catalog this build ships. What the
+ * tester saw comes in as `observedToolNames` and is hashed by `observedCatalogToolNamesHash`; the
+ * two meeting is the check. Hashing the source constants and calling the result "observed" was the
+ * fold: it recorded what the repo believed, whatever the deployment had actually served.
+ */
+export function catalogToolNamesHash(attestation: DesktopCatalogAttestation): string {
+  return observedCatalogToolNamesHash(canonicalCatalogToolNames(attestation));
+}
+
+/** The ordered names the tester's client returned from tools/list, hashed as recorded. */
+export function observedCatalogToolNamesHash(names: readonly string[]): string {
+  return createHash("sha256").update(names.join("\n")).digest("hex");
+}
+
+function canonicalCatalogToolNames(attestation: DesktopCatalogAttestation): string[] {
+  return attestation === "write_entitled_full_catalog"
+    ? [...PILOT_TOOL_NAMES, ...ACTION_TOOL_NAMES]
+    : [...PILOT_TOOL_NAMES];
+}
+
+/**
+ * The catalog the tester actually saw, checked against the one this build ships.
+ *
+ * Required, and compared position by position. A tester running current tooling against a stale or
+ * reordered deployment used to record the CURRENT hash regardless — the evidence said "I saw the
+ * shipping catalog" because the builder had looked it up rather than been told it. Now the ordered
+ * names come from the client's own tools/list, and a deployment serving anything else fails here, at
+ * record time, with the position that diverged named.
+ */
+function normalizeObservedToolNames(
+  values: string[] | undefined,
+  attestation: DesktopCatalogAttestation
+): string[] {
+  const names = (values ?? []).flatMap((value) => value.split(",").map((token) => token.trim()).filter(Boolean));
+  if (names.length === 0) {
+    throw new Error(
+      "--observed-tools is required: paste the ordered tool names the tested client's tools/list returned."
+    );
+  }
+  const expected = canonicalCatalogToolNames(attestation);
+  const divergence = names.findIndex((name, index) => name !== expected[index]);
+  if (names.length !== expected.length || divergence !== -1) {
+    const at = divergence === -1 ? Math.min(names.length, expected.length) : divergence;
+    throw new Error(
+      `Observed tool catalog does not match the ${attestation} catalog this build ships: `
+      + `expected ${expected.length} tools, saw ${names.length}; first difference at position ${at + 1} `
+      + `(expected ${expected[at] ?? "nothing"}, saw ${names[at] ?? "nothing"}).`
+    );
+  }
+  return names;
+}
 
 export interface DesktopUserTestReport {
   status: "pass";
@@ -334,6 +423,12 @@ export interface DesktopUserTestReport {
   attachmentMethod: DesktopAttachmentMethod;
   exercisedTools: string[];
   catalogAttestation: DesktopCatalogAttestation;
+  /** The number of tools the attestation stands for, so the runbook and the gate quote one figure. */
+  catalogToolCount: number;
+  /** sha256 of the ordered catalog names this evidence was recorded against (see catalogToolNamesHash). */
+  catalogToolNamesHash: string;
+  /** The ordered names the tester's client actually listed. The hash above is of THESE. */
+  observedToolNames: string[];
   containsTokens: false;
   taskOutcome: "useful" | "not_useful" | "could_not_use";
   taskOutcomeReason: "wrong_scope" | "timeout_error" | "installation_blocked" | "answer_received" | "not_yet_needed";
@@ -370,9 +465,10 @@ export async function buildDesktopUserTestEvidenceFromManifests(
     throw new Error("--attest-no-routine-reverification is required.");
   }
   const catalogAttestation = options.catalogAttestation;
-  if (catalogAttestation !== "read_only_44" && catalogAttestation !== "write_entitled_66") {
+  if (catalogAttestation !== "read_only_full_catalog" && catalogAttestation !== "write_entitled_full_catalog") {
     throw new Error(
-      "--attest-catalog is required: read_only_44 (a read-only identity saw exactly the 44 read tools) or write_entitled_66 (a write-entitled identity saw exactly 66 — the 44 plus 22 preview_*/apply_*)."
+      `--attest-catalog is required: read_only_full_catalog (a read-only identity saw exactly the ${EXPECTED_CATALOG_TOOL_COUNTS.read_only_full_catalog} read tools) `
+      + `or write_entitled_full_catalog (a write-entitled identity saw exactly ${EXPECTED_CATALOG_TOOL_COUNTS.write_entitled_full_catalog} — those plus every preview_*/apply_* pair).`
     );
   }
 
@@ -402,6 +498,7 @@ export async function buildDesktopUserTestEvidenceFromManifests(
     throw new Error("Post-restart issued-at timestamp must match the issued durable session timestamp.");
   }
 
+  const observedToolNames = normalizeObservedToolNames(options.observedToolNames, catalogAttestation);
   const exercisedTools = normalizeExercisedTools(options.exercisedTools);
   const taskOutcome = normalizeTaskOutcome(options.taskOutcome, options.taskOutcomeReason);
   const clientVersion = normalizeVersion(options.clientVersion, "clientVersion");
@@ -429,6 +526,9 @@ export async function buildDesktopUserTestEvidenceFromManifests(
     attachmentMethod,
     exercisedTools,
     catalogAttestation,
+    catalogToolCount: observedToolNames.length,
+    catalogToolNamesHash: observedCatalogToolNamesHash(observedToolNames),
+    observedToolNames,
     containsTokens: false,
     ...taskOutcome,
     clientVersion,
@@ -459,6 +559,17 @@ export function validateDesktopRoutingAttestation(value: unknown): { ok: boolean
   }
   if (value.warning !== DESKTOP_USER_TEST_EVIDENCE_WARNING) {
     problems.push("routing_attestation_warning_invalid");
+  }
+  // The evidence must say what the tester SAW, not merely which enum they picked: without the
+  // observed names the recorded hash is unverifiable and the gate has nothing to compare against.
+  const observedToolNames = Array.isArray(value.observedToolNames) ? value.observedToolNames : null;
+  if (
+    observedToolNames === null
+    || observedToolNames.length === 0
+    || observedToolNames.some((name) => typeof name !== "string" || name.trim().length === 0)
+    || new Set(observedToolNames as string[]).size !== observedToolNames.length
+  ) {
+    problems.push("observed_tool_names_missing_or_invalid");
   }
   const rawExercisedTools = Array.isArray(value.exercisedTools) ? value.exercisedTools : [];
   let exercisedTools: string[] = [];
@@ -547,6 +658,7 @@ export async function startDesktopUserTestEvidenceCli(
       sessionPersistedAcrossRestart: parsed.attestSessionPersistedAcrossRestart,
       routineReverificationPrompted: !parsed.attestNoRoutineReverification,
       catalogAttestation: parsed.catalogAttestation ?? "",
+      observedToolNames: parsed.observedToolNames,
       taskOutcome: parsed.taskOutcome as BuildDesktopUserTestEvidenceOptions["taskOutcome"],
       taskOutcomeReason: parsed.taskOutcomeReason as BuildDesktopUserTestEvidenceOptions["taskOutcomeReason"],
       clientVersion: parsed.clientVersion,
@@ -583,6 +695,7 @@ function parseArgs(args: string[]): {
   attestSessionPersistedAcrossRestart: boolean;
   attestNoRoutineReverification: boolean;
   catalogAttestation?: string;
+  observedToolNames: string[];
   taskOutcome?: string;
   taskOutcomeReason?: string;
   clientVersion?: string;
@@ -592,6 +705,7 @@ function parseArgs(args: string[]): {
 } {
   const values = new Map<string, string>();
   const exercisedTools: string[] = [];
+  const observedToolNames: string[] = [];
   const routingChecks: DesktopRoutingCheckInput[] = [];
   let attestDurableSessionAccess = false;
   let attestSessionPersistedAcrossRestart = false;
@@ -619,7 +733,9 @@ function parseArgs(args: string[]): {
     const next = args[index + 1];
     if (!next || next.startsWith("--")) continue;
     const key = arg.slice(2);
-    if (key === "exercised-tool") {
+    if (key === "observed-tool") {
+      observedToolNames.push(next);
+    } else if (key === "exercised-tool") {
       exercisedTools.push(next);
     } else if (key === "routing-check") {
       routingChecks.push(parseRoutingCheck(next));
@@ -630,6 +746,8 @@ function parseArgs(args: string[]): {
   }
   const csvTools = values.get("exercised-tools");
   if (csvTools) exercisedTools.push(...csvTools.split(","));
+  const csvObserved = values.get("observed-tools");
+  if (csvObserved) observedToolNames.push(...csvObserved.split(","));
   return {
     surface: values.get("surface"),
     client: values.get("client"),
@@ -648,6 +766,7 @@ function parseArgs(args: string[]): {
     attestSessionPersistedAcrossRestart,
     attestNoRoutineReverification,
     catalogAttestation: values.get("attest-catalog"),
+    observedToolNames,
     taskOutcome: values.get("task-outcome"),
     taskOutcomeReason: values.get("task-outcome-reason"),
     clientVersion: values.get("client-version"),
