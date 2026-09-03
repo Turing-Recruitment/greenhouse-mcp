@@ -130,10 +130,17 @@ export const EVIDENCE_GET_READ_PARAM_NAMES = readParamNames(
   "id"
 );
 
+// interviewed_at / submitted_at are the basis the scorecard recipes actually analyse on, and
+// /v3/scorecards accepts both as server-side range filters (harvest-v3-registry.generated.ts,
+// /v3/scorecards). A bracket key (interviewed_at[gte]) is admitted by sanitizeReadParams against its
+// base name below. created_at stays admitted so a caller can still filter on it explicitly; the
+// recipes no longer send it as a window floor.
 export const SCORECARD_ANALYSIS_READ_PARAM_NAMES = readParamNames(
   ...COMMON_PAGINATION_PARAM_NAMES,
   "job_ids",
-  "created_at"
+  "created_at",
+  "interviewed_at",
+  "submitted_at"
 );
 
 export const REJECTION_REASON_DRIFT_READ_PARAM_NAMES = readParamNames(

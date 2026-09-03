@@ -101,7 +101,8 @@ export async function runStageLatency(
     }
     params = scope.params;
     const window = resolveAnalysisWindow(params, runtime.now, Math.min(90, runtime.limits.maxLookbackDays));
-    // An EXPLICIT window runs free of maxLookbackDays (in-memory cap, guards no API cost).
+    // A caller-stated window (explicit params, or a time phrase in the question forwarded by the
+    // planner) runs free of maxLookbackDays (in-memory cap, guards no API cost).
     if (!hasExplicitAnalysisWindow(params)) assertWindowWithinLimit(window.windowStart, window.windowEnd, runtime.limits);
     // Rank 7: let an explicit max_rankings run free (clamped only to row count by the slice);
     // the default (env-overridable) applies only when the caller did not ask for more.

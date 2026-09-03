@@ -9,8 +9,10 @@ import { resolveAnalysisContext } from "../resolution/analysis-context.js";
 import { attachAnalysisScope, buildAnalysisCompleteness } from "../resolution/analysis-result.js";
 import { detectDataProvenance } from "../resolution/provenance.js";
 import { buildTemporalView } from "../resolution/temporal.js";
+import { PIPELINE_QUALITY_CLOCK } from "./analysis-window-copy.js";
 import { classifyUpstreamError, readAllScopedRows, readStatusMessage } from "../read-all.js";
 import { buildApplicationLifecycleFacts } from "../facts.js";
+import { weekKey } from "../metrics.js";
 import { buildAnalysisFactMetricLayer } from "./analysis-fact-metrics.js";
 import type { RecruiterToolDefinition, RecruiterToolResult } from "../types.js";
 
@@ -18,7 +20,8 @@ export const PIPELINE_QUALITY_TOOL: RecruiterToolDefinition = {
   name: "analyze_pipeline_quality",
   kind: "analysis",
   description:
-    "Analyze scoped pipeline quality using application status mix, stale active applications, stage concentration, job breakdown, data-quality gaps, and evidence ids.",
+    "Analyze scoped pipeline quality using application status mix, stale active applications, stage concentration, job breakdown, data-quality gaps, and evidence ids. " +
+    PIPELINE_QUALITY_CLOCK,
 };
 
 interface ApplicationRow extends Record<string, unknown> {
@@ -94,8 +97,14 @@ export async function runPipelineQuality(
     }
     params = scope.params;
     const window = resolveAnalysisWindow(params, runtime.now, Math.min(90, runtime.limits.maxLookbackDays));
-    // An EXPLICIT window runs free of maxLookbackDays (in-memory cap, guards no API cost).
+    // A caller-stated window (explicit params, or a time phrase in the question forwarded by the
+    // planner) runs free of maxLookbackDays (in-memory cap, guards no API cost).
     if (!hasExplicitAnalysisWindow(params)) assertWindowWithinLimit(window.windowStart, window.windowEnd, runtime.limits);
+    // The snapshot half of this recipe is as of NOW, not as of window_end. /v3/applications returns
+    // CURRENT rows: status, current stage and last_activity_at are whatever they are at read time, and
+    // no window_end can rewind them. Computing (and labelling) staleness against a historical
+    // window_end presented today's rows as a point-in-time snapshot they are not.
+    const snapshotAsOf = new Date(runtime.now()).toISOString();
     const maxRankings = Math.min(readPositiveInt(params.max_rankings) ?? runtime.limits.maxRankings, runtime.limits.maxRankings);
     const maxEvidenceIds = runtime.limits.maxEvidenceIds;
     const staleDays = readNonNegativeFiniteNumber(params.stale_days) ?? 14;
@@ -123,7 +132,7 @@ export async function runPipelineQuality(
     // silently inflating pipeline volume/status mix (ledger #32).
     const nonProspectRows = applications.rows.filter((row) => (row as { prospect?: unknown }).prospect !== true);
     const prospectsExcluded = applications.rows.length - nonProspectRows.length;
-    const observations = buildObservations(nonProspectRows, window.windowEnd, staleDays);
+    const observations = buildObservations(nonProspectRows, snapshotAsOf, staleDays);
     const active = observations.filter((row) => row.active).length;
     const terminal = observations.filter((row) => row.terminal).length;
     const staleActive = observations.filter((row) => row.staleActive).length;
@@ -140,21 +149,41 @@ export async function runPipelineQuality(
       { name: "stage_rankings", rows: stageRankings },
       { name: "job_breakdown", rows: jobRankings },
     ], runtime.limits.maxEvidenceIds);
+    // Temporal-now mode: weekly inflow, a genuine two-window WoW diff, status-mix trend, and velocity
+    // from real application created_at. Stage-flow-over-time is disclosed unavailable (L3), never faked.
+    // The window is threaded in so the series is anchored at window_end and bounded at window_start —
+    // anchored to now, a historical window produced an empty series.
+    const temporal = buildTemporalView(
+      observations.map((row) => ({ timestamp: row.applicationTimestamp, status: row.status })),
+      {
+        nowMs: runtime.now(),
+        basis: "application created_at (inflow anchor; falls back to applied_at, last_activity_at)",
+        windowStart: window.windowStart,
+        windowEnd: window.windowEnd,
+      }
+    );
+    // Every metric in this layer buckets by created_at over a recent-weeks window, so it is fed the
+    // same INFLOW cohort the weekly series above displays — not the whole snapshot cohort, which would
+    // have made weekly_application_volume disagree with temporal.weekly_inflow beside it.
+    const inflowWeeks = new Set(temporal.weekly_inflow.map((bucket) => bucket.week));
+    const inflowObservations = observations.filter((row) => inflowWeeks.has(weekKey(row.applicationTimestamp) ?? ""));
     const factMetricLayer = buildAnalysisFactMetricLayer({
-      facts: { application_lifecycle_fact: buildApplicationLifecycleFacts(applicationFactRows(observations)) },
+      facts: { application_lifecycle_fact: buildApplicationLifecycleFacts(applicationFactRows(inflowObservations)) },
       metricIds: [
         "weekly_application_volume",
         "weekly_qualified_pipeline_movement",
         "source_quality_by_outcome",
       ],
-      nowMs: Date.parse(window.windowEnd),
+      nowMs: Date.parse(snapshotAsOf),
       readStatus: applications.status,
     });
 
     const summary = {
       question: "pipeline quality",
-      snapshot_as_of: window.windowEnd,
-      freshness_window_start: window.windowStart,
+      snapshot_as_of: snapshotAsOf,
+      snapshot_basis:
+        "Status mix, stale-active and stage concentration are computed as of now: /v3/applications returns current rows, so a historical window_end cannot rewind them. Only the weekly inflow below is windowed.",
+      inflow_window: temporal.inflow_window,
       rows_read: applications.rawRowsRead,
       pages_read: applications.pagesRead,
       per_page: applications.perPage,
@@ -219,12 +248,6 @@ export async function runPipelineQuality(
     const provenance = detectDataProvenance(
       observations.map((row) => ({ timestamp: row.applicationTimestamp, isTerminal: fullStatusRead ? row.terminal : undefined, jobId: row.jobId })),
       { nowMs: runtime.now(), jobAnchors: scope.jobAnchors, recordKind: "application" }
-    );
-    // Temporal-now mode: weekly inflow, a genuine two-window WoW diff, status-mix trend, and velocity
-    // from real application created_at. Stage-flow-over-time is disclosed unavailable (L3), never faked.
-    const temporal = buildTemporalView(
-      observations.map((row) => ({ timestamp: row.applicationTimestamp, status: row.status })),
-      { nowMs: runtime.now(), basis: "application created_at (inflow anchor; falls back to applied_at, last_activity_at)" }
     );
     const envelope = attachAnalysisScope({
       data: {

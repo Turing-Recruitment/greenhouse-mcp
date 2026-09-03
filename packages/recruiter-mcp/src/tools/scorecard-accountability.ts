@@ -1,14 +1,23 @@
 import { SCORECARD_ANALYSIS_READ_PARAM_NAMES, assertWindowWithinLimit, hasExplicitAnalysisWindow, isToolEnabled, readPositiveInt, resolveAnalysisWindow, sanitizeReadParams } from "../limits.js";
+import { SCORECARD_WINDOW_CLOCK } from "./analysis-window-copy.js";
+import {
+  SCORECARD_MISSING_BASIS_DISCLOSURE,
+  SCORECARD_WINDOW_BASIS_LABEL,
+  countScorecardWindowPartitions,
+  partitionScorecardByWindow,
+  readScorecardsForWindow,
+  scorecardWindowBasis,
+} from "./scorecard-window.js";
 import { createToolDeadline, deny, emitRequiredToolAudit, enforceUsageBudget, isToolCancelledError, isToolTimeoutError, type RecruiterToolRuntime, type ToolDeadline } from "../runtime.js";
 import { newCorrelationId } from "../audit.js";
 import { IdentityResolutionError } from "../identity.js";
 import { buildEvidencePack, stripEvidencePackParams } from "./evidence-pack.js";
-import { loadApplicationJobIdsFromScopedList, readScorecardRowsForJobScope } from "./application-job-lookup.js";
+import { loadApplicationJobIdsFromScopedList } from "./application-job-lookup.js";
 import { readScorecardPersonId } from "./application-shapes.js";
 import { resolveAnalysisContext } from "../resolution/analysis-context.js";
 import { attachAnalysisScope, buildAnalysisCompleteness } from "../resolution/analysis-result.js";
 import { detectDataProvenance } from "../resolution/provenance.js";
-import { classifyUpstreamError, readAllScopedRows, readStatusMessage } from "../read-all.js";
+import { classifyUpstreamError, readStatusMessage } from "../read-all.js";
 import { buildScorecardFacts } from "../facts.js";
 import { buildAnalysisFactMetricLayer } from "./analysis-fact-metrics.js";
 import type { RecruiterToolDefinition, RecruiterToolResult } from "../types.js";
@@ -17,7 +26,8 @@ export const SCORECARD_ACCOUNTABILITY_TOOL: RecruiterToolDefinition = {
   name: "analyze_scorecard_accountability",
   kind: "analysis",
   description:
-    "Rank scorecard accountability across the authenticated recruiter's permitted jobs, including unsubmitted rate, severity, affected jobs, and evidence ids.",
+    "Rank scorecard accountability across the authenticated recruiter's permitted jobs, including unsubmitted rate, severity, affected jobs, and evidence ids. " +
+    SCORECARD_WINDOW_CLOCK,
 };
 
 interface ScorecardRow extends Record<string, unknown> {
@@ -75,15 +85,17 @@ export async function runScorecardAccountability(
     // means "all permitted jobs" and reads the full permitted set, unchanged.
     const requestedJobIds = parseRequestedJobIds(params.job_ids);
     const window = resolveAnalysisWindow(params, runtime.now, 30);
-    // An EXPLICIT window runs free of maxLookbackDays (in-memory cap, guards no API cost).
+    // A caller-stated window (explicit params, or a time phrase in the question forwarded by the
+    // planner) runs free of maxLookbackDays (in-memory cap, guards no API cost).
     if (!hasExplicitAnalysisWindow(params)) assertWindowWithinLimit(window.windowStart, window.windowEnd, runtime.limits);
     const maxRankings = Math.min(readPositiveInt(params.max_rankings) ?? runtime.limits.maxRankings, runtime.limits.maxRankings);
     const maxEvidenceIds = runtime.limits.maxEvidenceIds;
+    // No created_at floor: the recipe reports an INTERVIEW-date window, so it selects on one
+    // (readScorecardsForWindow adds the interviewed_at / submitted_at range bounds per read).
     const scorecardParams = sanitizeReadParams(
       {
         ...params,
         per_page: params.per_page,
-        created_at: `gte|${window.windowStart}`,
       },
       runtime.limits,
       { allowedParamNames: SCORECARD_ANALYSIS_READ_PARAM_NAMES }
@@ -96,16 +108,20 @@ export async function runScorecardAccountability(
     // Never send job_ids to /v3/scorecards (422s on it); the narrowed read bridges to application_ids.
     delete scorecardParams.job_ids;
 
-    const scorecards = requestedJobIds
-      ? await readScorecardRowsForJobScope<ScorecardRow>(runtime, toolName, [...requestedJobIds], scorecardParams, deadline)
-      : await readAllScopedRows<ScorecardRow>(runtime, toolName, "list_scorecards", scorecardParams, deadline);
+    const scorecards = await readScorecardsForWindow<ScorecardRow>(runtime, toolName, requestedJobIds, scorecardParams, window, deadline);
     if (scorecards.kind === "denial") {
       const auditDenied = await emitAnalysisAudit(runtime, startedAt, correlationId, scorecards.result, null, null, actAsUser);
       return auditDenied ?? scorecards.result;
     }
 
-    const windowed = scorecards.rows.filter((row: ScorecardRow) => scorecardInWindow(row, window.windowStart, window.windowEnd));
-    const outsideWindowCount = scorecards.rows.length - windowed.length;
+    // Every row read lands in exactly ONE partition, so the completeness identity holds:
+    // total_records_in_scope === records_analyzed + records_excluded.
+    const windowPartitions = countScorecardWindowPartitions(scorecards.rows, window.windowStart, window.windowEnd);
+    const windowed = scorecards.rows.filter(
+      (row: ScorecardRow) => partitionScorecardByWindow(row, window.windowStart, window.windowEnd) === "in_window"
+    );
+    const outsideWindowCount = windowPartitions.outside_window;
+    const missingBasisCount = windowPartitions.missing_basis;
     const applicationJobIds = await loadApplicationJobIds(runtime, windowed, deadline);
     if (applicationJobIds.denial) {
       const result = deny(toolName, applicationJobIds.denial.code, applicationJobIds.denial.message);
@@ -165,6 +181,13 @@ export async function runScorecardAccountability(
       rows_dropped_outside_requested_scope: outOfScopeCount,
       scoped_job_count: countScopedJobs(applicationJobIds, requestedJobIds),
       read_warnings: scorecards.warnings,
+      data_quality: {
+        window_basis: SCORECARD_WINDOW_BASIS_LABEL,
+        in_window: windowPartitions.in_window,
+        outside_window: windowPartitions.outside_window,
+        missing_basis: windowPartitions.missing_basis,
+        missing_basis_note: SCORECARD_MISSING_BASIS_DISCLOSURE,
+      },
     };
     const metrics = {
       unsubmitted_scorecards: unsubmittedScorecards,
@@ -203,6 +226,9 @@ export async function runScorecardAccountability(
         exclusionReasons: [
           ...(outsideWindowCount > 0
             ? [{ reason: "outside_analysis_window", count: outsideWindowCount }]
+            : []),
+          ...(missingBasisCount > 0
+            ? [{ reason: "missing_window_basis", count: missingBasisCount }]
             : []),
           ...(unresolvedAssociationCount > 0
             ? [{ reason: "unresolved_application_job_association", count: unresolvedAssociationCount }]
@@ -276,7 +302,7 @@ function buildRankings(
     if (row.id !== null) accumulator.evidenceIds.add(`scorecard:${row.id}`);
     if (isUnsubmittedScorecard(row)) {
       accumulator.unsubmitted += 1;
-      accumulator.ageDaysTotal += ageDays(row.interviewed_at ?? row.submitted_at, windowEnd);
+      accumulator.ageDaysTotal += ageDays(scorecardWindowBasis(row), windowEnd);
     }
     byPerson.set(personKey, accumulator);
   }
@@ -298,13 +324,6 @@ function severityScore(entry: RankingAccumulator): number {
   const volumeComponent = entry.unsubmitted * 8;
   const ageComponent = entry.unsubmitted > 0 ? Math.min(60, entry.ageDaysTotal / entry.unsubmitted * 2) : 0;
   return Math.round(rateComponent + volumeComponent + ageComponent);
-}
-
-function scorecardInWindow(row: ScorecardRow, startIso: string, endIso: string): boolean {
-  const basis = row.interviewed_at ?? row.submitted_at;
-  if (!basis) return true;
-  const at = Date.parse(basis);
-  return Number.isFinite(at) && at >= Date.parse(startIso) && at <= Date.parse(endIso);
 }
 
 function isUnsubmittedScorecard(row: ScorecardRow): boolean {

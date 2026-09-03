@@ -4,6 +4,8 @@
  * contract. It never advertises write/admin tools or raw unscoped data paths.
  */
 
+import { PIPELINE_QUALITY_CLOCK, SCORECARD_WINDOW_CLOCK } from "../../tools/analysis-window-copy.js";
+
 export interface RecruitingCapabilityRecipe {
   id: string;
   recipe: string;
@@ -77,7 +79,7 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
       "Broad operators must use a confirmed scope_handle or exact job_ids before analysis.",
     ],
     availability: "available",
-    description: "Rank scorecard accountability (unsubmitted rate, severity, affected jobs) across scoped jobs.",
+    description: `Rank scorecard accountability (unsubmitted rate, severity, affected jobs) across scoped jobs. ${SCORECARD_WINDOW_CLOCK}`,
     summary: "Ranks unsubmitted scorecard debt and affected jobs using scoped scorecard/application metadata.",
     example_question: "Who is sitting on unsubmitted scorecards across my reqs?",
     example_questions: ["Who is sitting on unsubmitted scorecards across my reqs?"],
@@ -106,7 +108,7 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
       "Broad operators must use a confirmed scope_handle or exact job_ids before analysis.",
     ],
     availability: "available",
-    description: "Surface late/overdue interview feedback against an SLA across scoped jobs.",
+    description: `Surface late/overdue interview feedback against an SLA across scoped jobs. ${SCORECARD_WINDOW_CLOCK}`,
     summary: "Ranks delayed or missing feedback by interviewer/submitter over scoped scorecard metadata.",
     example_question: "Where is interview feedback dragging past two days?",
     example_questions: ["Where is interview feedback dragging past two days?"],
@@ -165,7 +167,7 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
       "Broad operators must use a confirmed scope_handle or exact job_ids before analysis.",
     ],
     availability: "available",
-    description: "Summarize pipeline health, status mix, conversion, and stale active pipeline across scoped jobs.",
+    description: `Summarize pipeline health, status mix, conversion, and stale active pipeline across scoped jobs. ${PIPELINE_QUALITY_CLOCK}`,
     summary: "Summarizes scoped pipeline health, status mix, stale active rows, and job/stage concentration.",
     example_question: "How healthy is the pipeline for these jobs?",
     example_questions: ["How healthy is the pipeline for these jobs?"],

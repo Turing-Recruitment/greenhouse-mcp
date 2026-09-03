@@ -94,7 +94,8 @@ export async function runSourceQuality(
     }
     params = scope.params;
     const window = resolveAnalysisWindow(params, runtime.now, Math.min(90, runtime.limits.maxLookbackDays));
-    // An EXPLICIT window runs free of maxLookbackDays (in-memory cap, guards no API cost).
+    // A caller-stated window (explicit params, or a time phrase in the question forwarded by the
+    // planner) runs free of maxLookbackDays (in-memory cap, guards no API cost).
     if (!hasExplicitAnalysisWindow(params)) assertWindowWithinLimit(window.windowStart, window.windowEnd, runtime.limits);
     const maxRankings = Math.min(readPositiveInt(params.max_rankings) ?? runtime.limits.maxRankings, runtime.limits.maxRankings);
     const maxEvidenceIds = runtime.limits.maxEvidenceIds;

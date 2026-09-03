@@ -19,6 +19,12 @@ import {
   runGetRecruitingCapabilities,
   runResolveJobScope,
 } from "./job-scope/tools.js";
+import {
+  PIPELINE_WINDOW_END_PARAM,
+  PIPELINE_WINDOW_START_PARAM,
+  SCORECARD_WINDOW_END_PARAM,
+  SCORECARD_WINDOW_START_PARAM,
+} from "./analysis-window-copy.js";
 import { isActionToolGranted, isToolEnabled, validateRecruiterToolConfig } from "../limits.js";
 import { mcpTextResult, runActionTool, type RecruiterToolRuntime } from "../runtime.js";
 import { ACTION_DEFINITIONS } from "../../../action-mcp/dist/index.js";
@@ -286,8 +292,8 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
       SCORECARD_ACCOUNTABILITY_TOOL.name,
       SCORECARD_ACCOUNTABILITY_TOOL.description,
       {
-        window_start: z.string().optional().describe("Inclusive ISO timestamp/date for the analysis window start. Defaults to 30 days before window_end."),
-        window_end: z.string().optional().describe("Inclusive ISO timestamp/date for the analysis window end. Defaults to now."),
+        window_start: z.string().optional().describe(SCORECARD_WINDOW_START_PARAM),
+        window_end: z.string().optional().describe(SCORECARD_WINDOW_END_PARAM),
         job_ids: z.string().optional().describe("Optional comma-separated job ids; still scoped by Greenhouse permissions."),
         max_rankings: z.number().int().positive().optional().describe("Maximum ranked people to return, capped by runtime limits."),
         per_page: z.number().int().positive().optional().describe("Scorecard page size, capped by runtime limits."),
@@ -303,8 +309,8 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
       INTERVIEW_FEEDBACK_DRAG_TOOL.name,
       INTERVIEW_FEEDBACK_DRAG_TOOL.description,
       {
-        window_start: z.string().optional().describe("Inclusive ISO timestamp/date for the analysis window start. Defaults to 30 days before window_end."),
-        window_end: z.string().optional().describe("Inclusive ISO timestamp/date for the analysis window end. Defaults to now."),
+        window_start: z.string().optional().describe(SCORECARD_WINDOW_START_PARAM),
+        window_end: z.string().optional().describe(SCORECARD_WINDOW_END_PARAM),
         job_ids: z.string().optional().describe("Optional comma-separated job ids; still scoped by Greenhouse permissions."),
         due_days: z.number().nonnegative().optional().describe("Feedback SLA in days. Defaults to 2."),
         max_rankings: z.number().int().positive().optional().describe("Maximum ranked people to return, capped by runtime limits."),
@@ -341,8 +347,8 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
       PIPELINE_QUALITY_TOOL.name,
       PIPELINE_QUALITY_TOOL.description,
       {
-        window_start: z.string().optional().describe("Inclusive ISO timestamp/date for freshness lookback. Defaults to 90 days before window_end, capped by runtime limits."),
-        window_end: z.string().optional().describe("Snapshot as-of timestamp/date. Defaults to now."),
+        window_start: z.string().optional().describe(PIPELINE_WINDOW_START_PARAM),
+        window_end: z.string().optional().describe(PIPELINE_WINDOW_END_PARAM),
         job_ids: z.string().optional().describe("Optional comma-separated job ids; still scoped by Greenhouse permissions."),
         status: z.string().optional().describe("Optional application status filter."),
         stale_days: z.number().nonnegative().optional().describe("Last-activity age counted as stale for active applications. Defaults to 14 days."),
