@@ -106,16 +106,20 @@ export interface MetricDefinition {
    */
   windowField?: string;
   /**
-   * The endpoint(s) this metric's `requiredFields` are actually read FROM.
+   * The endpoint(s) this metric's `requiredFields` are actually read FROM. MANDATORY.
    *
-   * Undeclared means "any endpoint", which is what the projection layer assumed for every metric:
-   * dropping `status` from /v3/prospect_pools announced that the hire count was blocked, on a read
-   * that had nothing to do with offers. Declaring it here is what lets evidence-projection key the
-   * blocks_answer omission by (endpoint, field) instead of by field alone. Left undeclared where
-   * the endpoint has not been established — a MISSING blocker is worse than a noisy one, so the
-   * mapping is added with evidence, never guessed.
+   * Optional was the defect, not the caution. "Undeclared means any endpoint" is exactly the
+   * behaviour that made a /v3/prospect_pools projection dropping `status` announce that the hire
+   * count, the scorecard submission rate, the opening fill status, the source-quality breakdown
+   * and the weekly pipeline movement were all blocked — five metrics, four of which never touch
+   * that endpoint. Leaving the field optional kept that fallback alive for sixteen metrics whose
+   * endpoint was never in doubt: each one's single fact builder declares its own
+   * `requiredEndpoints` to buildFacts (facts.ts), and that IS the endpoint its rows come from.
+   *
+   * Required here means the compiler asks the question for every metric added from now on, rather
+   * than a new metric silently inheriting the noisiest possible answer.
    */
-  requiredFieldEndpoints?: string[];
+  requiredFieldEndpoints: string[];
   defaultTimeWindow?: string;
   scopeBehavior: "job" | "job_set" | "permitted_scope" | "org_reference";
   exclusions: string[];
@@ -129,6 +133,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Scorecard submission rate",
     requiredFacts: ["scorecard_fact"],
     requiredFields: ["scorecard_id", "status", "submitted_at"],
+    // /v3/scorecards: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/scorecards"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -141,6 +147,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Scorecard overdue rate",
     requiredFacts: ["scorecard_fact"],
     requiredFields: ["scorecard_id", "interviewed_at", "submitted_at"],
+    // /v3/scorecards: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/scorecards"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -153,6 +161,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Interview feedback SLA breach rate",
     requiredFacts: ["scorecard_fact"],
     requiredFields: ["interviewed_at", "submitted_at"],
+    // /v3/scorecards: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/scorecards"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -165,6 +175,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Time from availability received to scheduled interview",
     requiredFacts: ["interview_event_fact"],
     requiredFields: ["availability_received_at", "scheduled_at"],
+    // /v3/interviews: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/interviews"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -177,6 +189,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Time from interview to feedback completion",
     requiredFacts: ["scorecard_fact"],
     requiredFields: ["interviewed_at", "submitted_at"],
+    // /v3/scorecards: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/scorecards"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -189,6 +203,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Stage conversion rate",
     requiredFacts: ["application_stage_transition_fact"],
     requiredFields: ["application_stage_id", "exited_at"],
+    // /v3/application_stages: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/application_stages"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -207,6 +223,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Stage dwell",
     requiredFacts: ["application_stage_transition_fact"],
     requiredFields: ["days_in_stage"],
+    // /v3/application_stages: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/application_stages"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -219,6 +237,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Weekly application volume",
     requiredFacts: ["application_lifecycle_fact"],
     requiredFields: ["created_at"],
+    // /v3/applications: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/applications"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_12_weeks",
     scopeBehavior: "job_set",
@@ -231,6 +251,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Weekly not-rejected pipeline movement",
     requiredFacts: ["application_lifecycle_fact"],
     requiredFields: ["created_at", "status"],
+    // /v3/applications: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/applications"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_12_weeks",
     scopeBehavior: "job_set",
@@ -252,6 +274,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Source quality by outcome",
     requiredFacts: ["application_lifecycle_fact"],
     requiredFields: ["source_id", "status"],
+    // /v3/applications: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/applications"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_90_days",
     scopeBehavior: "job_set",
@@ -264,6 +288,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Job-post tracking-link count by post (exposure proxy)",
     requiredFacts: ["job_post_exposure_fact"],
     requiredFields: ["tracking_link_id", "related_post_id"],
+    // /v3/tracking_links: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/tracking_links"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_90_days",
     scopeBehavior: "job_set",
@@ -279,6 +305,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Approval bottleneck (pending age)",
     requiredFacts: ["approval_flow_fact"],
     requiredFields: ["created_at", "approval_status"],
+    // /v3/approval_flows: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/approval_flows"],
     requiredRoleProfile: "recruiting_manager",
     defaultTimeWindow: "last_90_days",
     scopeBehavior: "job_set",
@@ -293,6 +321,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Prospect pool distribution",
     requiredFacts: ["prospect_state_fact"],
     requiredFields: ["pool_id", "pool_stage_id"],
+    // /v3/prospect_details: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/prospect_details"],
     requiredRoleProfile: "recruiting_manager",
     defaultTimeWindow: "last_90_days",
     scopeBehavior: "job_set",
@@ -308,6 +338,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Note activity volume",
     requiredFacts: ["note_activity_fact"],
     requiredFields: ["type", "created_at"],
+    // /v3/notes: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/notes"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "permitted_scope",
@@ -320,6 +352,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Opening fill status",
     requiredFacts: ["opening_headcount_fact"],
     requiredFields: ["status", "open"],
+    // /v3/openings: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/openings"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "current",
     scopeBehavior: "job_set",
@@ -391,6 +425,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Rubric answer coverage",
     requiredFacts: ["scorecard_question_answer_fact"],
     requiredFields: ["scorecard_id"],
+    // /v3/scorecard_question_answers: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/scorecard_question_answers"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_90_days",
     scopeBehavior: "job_set",
