@@ -4,6 +4,7 @@ import type { AssignmentBinding } from "../types.js";
 import {
   assertActiveUser,
   authorizedApplication,
+  classifyJobAccess,
   classifyState,
   getApplication,
   prepared,
@@ -52,32 +53,33 @@ type Approval = z.infer<typeof approvalSchema>;
 async function prepare(input: Preview, context: ActionContext) {
   const application = await authorizedApplication(input.application_id, context);
   const proposed = await assertActiveUser(input.proposed_user_id, context);
-  if (proposed.agency_id !== null && proposed.agency_id !== undefined) {
-    // Internal invariant: Harvest v3 users schema 0169 identifies agency-linked users with
-    // `agency_id`; application recruiter/coordinator ownership here is reserved for tenant staff.
-    // Greenhouse does not document this as an endpoint permission requirement.
-    throw new ActionDeniedError(
-      "USER_JOB_PERMISSION_DENIED",
-      `Selected user is an external agency account (agency ${String(proposed.agency_id)}) and cannot hold this assignment.`,
-    );
-  }
-  const permissions = await context.greenhouse.list("/user_job_permissions", {
-    user_ids: String(input.proposed_user_id),
-    job_ids: String(application.jobId),
-    fields: "id,user_id,job_id,role_id,automated",
-  }, context.actorUserId);
-  const explicit = permissions.some((row) => row.user_id === input.proposed_user_id && row.job_id === application.jobId);
-  const assigneeAccess = explicit ? "explicit_permission"
-    : proposed.site_admin === true && application.jobConfidential === false ? "site_admin_non_confidential"
-    : "none";
+  const assigneeAccess = await classifyJobAccess(
+    proposed,
+    { id: application.jobId, confidential: application.jobConfidential },
+    context,
+  );
   const proposedName = typeof proposed.name === "string" && proposed.name.length > 0 ? proposed.name : "Selected user";
-  // Internal invariant: disclose whether the assignee can open the job so the approver can repair
-  // access without turning an undocumented Greenhouse permission rule into a denial.
+  // DISCLOSED, NOT DENIED — and the copy is load-bearing.
+  //
+  // No vendored Harvest page says Greenhouse refuses an assignment to a user without job access
+  // (`0016-patch_v3-applications-id.md:486-491` documents no permission semantics), so a denial here
+  // would be an invented rule. What the approver gets instead is the fact, plus the repair that
+  // actually works: Job Admin access on the req. NOT "add them as a job owner" —
+  // `0116-post_v3-job-owners.md:7` requires the user to ALREADY have permission to edit the job, so
+  // that instruction sends the operator to a call that fails for exactly the user it is meant to fix.
+  // "may not" rather than "cannot", because `0166:7` notes `/v3/future_job_permissions` grants
+  // access too, and this classification does not read that endpoint.
   const accessEffect = assigneeAccess === "explicit_permission"
     ? `${proposedName} can open this job (explicit permission)`
     : assigneeAccess === "site_admin_non_confidential"
       ? `${proposedName} can open this job (site admin, non-confidential job)`
-      : `${proposedName} has no permission row on req ${application.jobId} and may not be able to open this application in Greenhouse; grant access in Greenhouse or add them as a job owner first.`;
+      : `${proposedName} has no permission row on req ${application.jobId} and may not be able to open this application in Greenhouse; grant them Job Admin access on this req in Greenhouse first.`;
+  // Agency accounts are disclosed on the same terms. `0169-get_v3-users.md:785` marks a user as an
+  // external agency recruiter rather than an employee; that is worth saying out loud before someone
+  // hands them a req, and it is not a rule Greenhouse enforces on this endpoint.
+  const agencyEffect = proposed.agency_id === null || proposed.agency_id === undefined
+    ? null
+    : `${proposedName} is an external agency account (agency ${String(proposed.agency_id)})`;
   const currentId = input.assignment_role === "recruiter" ? application.recruiterId : application.coordinatorId;
   const current = currentId === null ? null : uniqueById(await context.greenhouse.list("/users", {
     ids: String(currentId), fields: "id,name,deactivated,site_admin", show_service_accounts: "true",
@@ -93,12 +95,16 @@ async function prepare(input: Preview, context: ActionContext) {
     current_user_id: currentId,
     proposed_user_id: input.proposed_user_id,
   };
+  // `assignee_access` deliberately does NOT ride in the binding. The binding is fingerprinted and
+  // re-derived at apply, so carrying a disclosure in it turns the operator DOING WHAT THE PREVIEW
+  // ASKED — granting the assignee access — into `STATE_CHANGED`, breaking the one path the warning
+  // exists to produce. `mutation()` never reads it either. It lives in the preview's effects, which
+  // is where the human reads it.
   const binding: AssignmentBinding = {
     application_id: application.id,
     assignment_role: input.assignment_role,
     previous_user_id: currentId,
     proposed_user_id: input.proposed_user_id,
-    assignee_access: assigneeAccess,
   };
   return prepared({
     kind: "application_assignment_change",
@@ -115,6 +121,7 @@ async function prepare(input: Preview, context: ActionContext) {
       effects: [
         "Changes only the selected assignment field; the sibling recruiter/coordinator field is not patched.",
         accessEffect,
+        ...(agencyEffect ? [agencyEffect] : []),
       ],
     },
     changeRequired: currentId !== input.proposed_user_id,

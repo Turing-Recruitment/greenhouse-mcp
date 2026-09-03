@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { actionDefinition } from "./actions/index.js";
 import type { ActionContext, ActionDefinition } from "./actions/index.js";
+import { resolveActorName } from "./actions/shared.js";
 import {
   fingerprintSession,
   fingerprintSubject,
@@ -56,6 +57,16 @@ export class GreenhouseActionService {
     };
     if (config.production && config.session.client === "test") {
       throw new ActionDeniedError("TEST_CLIENT_FORBIDDEN", "Test action sessions are forbidden in production.");
+    }
+    // Every preview states, in words, whose name the write will carry. A gateway that does not
+    // declare its mode cannot be described truthfully, and the failure is silent: the disclosure
+    // would say "service account" while the writes went out under the human's own token, or the
+    // reverse. So it fails at construction, where a force-cast fake has to state a mode too.
+    if (config.greenhouse.attributionMode !== "service_user" && config.greenhouse.attributionMode !== "per_human") {
+      throw new ActionDeniedError(
+        "ATTRIBUTION_MODE_UNDECLARED",
+        "Greenhouse gateway did not declare a supported attribution mode.",
+      );
     }
   }
 
@@ -264,16 +275,9 @@ export class GreenhouseActionService {
   }
 
   private async attribution(actorUserId: number, changeRequired: boolean): Promise<Record<string, unknown>> {
-    let actorName: string | null = null;
-    try {
-      const rows = await this.config.greenhouse.list("/users", {
-        ids: String(actorUserId), fields: "id,name", show_service_accounts: "true", per_page: "1",
-      }, actorUserId);
-      const actor = rows.find((row) => row.id === actorUserId);
-      actorName = actor && typeof actor.name === "string" && actor.name.length > 0 ? actor.name : null;
-    } catch {
-      // Attribution labels are disclosure only; authorization already ran in action preparation.
-    }
+    // Fail-soft, and read through the shared helper so the fence inventory covers it: attribution
+    // labels are disclosure only, and authorization already ran in action preparation.
+    const actorName = await resolveActorName(this.context(actorUserId));
     const mode = this.config.greenhouse.attributionMode;
     return {
       mode,

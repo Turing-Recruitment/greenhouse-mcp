@@ -4,6 +4,7 @@ import { describe, test } from "node:test";
 import {
   DEFAULT_SESSION_TTL_MS,
   issueActionIntent,
+  parseActionBinding,
   issueActionSession,
   validateActionSession,
   verifyActionIntent,
@@ -125,5 +126,19 @@ describe("action signing domains", () => {
     assert.ok(issued.token.length > 65_536);
     assert.ok(issued.token.length < 131_072);
     assert.equal(verifyActionIntent(issued.token, TEST_SECRET).ok, true);
+  });
+
+  test("the assignment binding is EXACTLY its four mutation keys, so rows already in the store still load", () => {
+    // `parseActionBinding` is exact by design, and the store throws on a binding it cannot parse
+    // (`store.ts:261`). Adding a fifth key would therefore strand every assignment row written by a
+    // previous deploy — `listRecoverableActions()` aborts on the first one. The disclosure that was
+    // briefly proposed for this binding lives in the preview's effects instead.
+    const persisted = { application_id: 100, assignment_role: "recruiter", previous_user_id: 20, proposed_user_id: 40 };
+    assert.deepEqual(parseActionBinding("application_assignment_change", persisted), persisted);
+    assert.equal(
+      parseActionBinding("application_assignment_change", { ...persisted, assignee_access: "explicit_permission" }),
+      null,
+      "a disclosure has no business in the signed binding, and the parser is what keeps it out",
+    );
   });
 });

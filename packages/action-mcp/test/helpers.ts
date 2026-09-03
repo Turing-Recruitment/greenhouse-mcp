@@ -275,7 +275,7 @@ export class RouteGreenhouse implements GreenhouseGateway {
     const result = await handler(params, actorUserId);
     this.afterList?.();
     this.afterList = null;
-    return clone(result);
+    return projectToFields(clone(result), params.fields);
   }
 
   async mutate(input: {
@@ -289,6 +289,18 @@ export class RouteGreenhouse implements GreenhouseGateway {
     if (!handler) throw new Error(`Unexpected Greenhouse mutation route: ${input.method} ${input.path}`);
     return clone(await handler(input));
   }
+}
+
+/**
+ * Harvest v3 returns exactly the `fields` a read asks for. Fakes that echo whole fixture rows do
+ * not: a projection dropped from a src read would then keep reading the field here while production
+ * saw `undefined`. Projecting the fake's rows down to the requested `fields` makes a missing
+ * projection reproduce production instead of hiding behind a generous fixture.
+ */
+function projectToFields(rows: GreenhouseRow[], fields: string | undefined): GreenhouseRow[] {
+  if (fields === undefined) return rows;
+  const wanted = new Set(fields.split(","));
+  return rows.map((row) => Object.fromEntries(Object.entries(row).filter(([key]) => wanted.has(key))));
 }
 
 export type MutationBehavior = "success" | "definite_failure" | "ambiguous_desired" | "ambiguous_original";
@@ -329,9 +341,16 @@ export function assignmentGreenhouse(attributionMode: AttributionMode = "service
     }))
     .onList("/jobs", (params) => params.ids === "200" ? [state.job] : [])
     .onList("/candidates", (params) => params.ids === "300" ? [state.candidate] : [])
-    .onList("/user_job_permissions", (params) => state.permitted && state.permittedUserIds.has(Number(params.user_ids))
-      ? [{ id: 900, user_id: Number(params.user_ids), job_id: Number(params.job_ids), role_id: 1, automated: false }]
-      : [])
+    // `state.permitted` is the ACTOR's switch and only the actor's: a test that revokes the actor's
+    // access must not silently revoke the proposed assignee's too, or the assignment tests stop
+    // distinguishing the two gates. Every other user answers to `permittedUserIds`.
+    .onList("/user_job_permissions", (params) => {
+      const userId = Number(params.user_ids);
+      const granted = userId === 10 ? state.permitted : state.permittedUserIds.has(userId);
+      return granted
+        ? [{ id: 900, user_id: userId, job_id: Number(params.job_ids), role_id: 1, automated: false }]
+        : [];
+    })
     .onList("/application_stages", () => [state.currentStage])
     .onList("/job_interview_stages", (params) => [{
       id: Number(params.ids), job_id: 200, name: "Onsite", active: true, sort_order: 2,

@@ -108,11 +108,39 @@ export async function assertActiveUser(userId: number, context: ActionContext): 
     ids: String(userId), fields: "id,name,deactivated,site_admin,agency_id", show_service_accounts: "true",
   }, context.actorUserId);
   const user = uniqueById(rows, userId, "Greenhouse user");
+  // Active is the only gate here. `site_admin` and `agency_id` ride along for the callers that
+  // CLASSIFY on them; a missing or odd value is their problem to interpret (both read it as "no"),
+  // not a reason to refuse an unrelated write — this helper also validates the linked users on a
+  // candidate record update, which has nothing to do with site-admin state.
   if (user.deactivated !== false) throw new ActionDeniedError("USER_INACTIVE", "Selected Greenhouse user is not active.");
-  if (typeof user.site_admin !== "boolean") {
-    throw new ActionDeniedError("UPSTREAM_STATE_INVALID", "Greenhouse omitted the selected user's site-admin state.");
-  }
   return user;
+}
+
+export type JobAccess = "explicit_permission" | "site_admin_non_confidential" | "none";
+
+/**
+ * How a given user reaches a given job — one classifier, two policies on top of it.
+ *
+ * `0166-get_v3-user-job-permissions.md:7`: site admins are ABSENT from this endpoint because they
+ * hold implicit access to every NON-confidential job, so a confidential job still needs an explicit
+ * row. A non-boolean `site_admin` reads as "not a site admin" rather than an error: the field is an
+ * input to a classification, and the classification's `none` outcome is already handled by both
+ * callers.
+ *
+ * Deliberately NOT a gate. `application-assignment.ts` discloses `none` and proceeds (no vendor rule
+ * requires an assignee to hold the job); `assertUserMayOwnJob` denies it, citing `0116`.
+ */
+export async function classifyJobAccess(
+  user: GreenhouseRow,
+  job: { id: number; confidential: boolean },
+  context: ActionContext,
+): Promise<JobAccess> {
+  const userId = Number(user.id);
+  const permissions = await context.greenhouse.list("/user_job_permissions", {
+    user_ids: String(userId), job_ids: String(job.id), fields: "id,user_id,job_id,role_id,automated",
+  }, context.actorUserId);
+  if (permissions.some((row) => row.user_id === userId && row.job_id === job.id)) return "explicit_permission";
+  return user.site_admin === true && job.confidential === false ? "site_admin_non_confidential" : "none";
 }
 
 export async function assertUserMayOwnJob(
@@ -122,16 +150,32 @@ export async function assertUserMayOwnJob(
   context: ActionContext,
 ): Promise<GreenhouseRow> {
   const user = await assertActiveUser(userId, context);
-  const permissions = await context.greenhouse.list("/user_job_permissions", {
-    user_ids: String(userId), job_ids: String(jobId), fields: "id,user_id,job_id,role_id,automated",
-  }, context.actorUserId);
-  const explicit = permissions.some((row) => row.user_id === userId && row.job_id === jobId);
-  // Greenhouse Harvest v3 users schema 0169:798 limits implicit site-admin access to
-  // non-confidential jobs; a confidential job therefore still needs an explicit permission row.
-  if (!(user.site_admin === true && job.confidential === false) && !explicit) {
+  const access = await classifyJobAccess(user, { id: jobId, confidential: job.confidential === true }, context);
+  if (access === "none") {
+    // The one denial with a vendor citation behind it: `0116-post_v3-job-owners.md:7` — "The user
+    // must already exist in your organization and have permission to edit the job." Greenhouse
+    // rejects the POST itself, so allowing it through would only trade a legible denial for a 4xx.
     throw new ActionDeniedError("USER_JOB_PERMISSION_DENIED", "Selected user does not have access to this job.");
   }
   return user;
+}
+
+/**
+ * The acting human's own display name, for the attribution disclosure. Fail-soft on purpose and for
+ * the same reason as the label helpers below: a name that will not resolve must never fail a
+ * preview whose authorization already passed.
+ *
+ * It lives here rather than in `service.ts` so the fence inventory (`fence-structure.test.ts`)
+ * covers it like every other read a write path makes.
+ */
+export async function resolveActorName(context: ActionContext): Promise<string | null> {
+  return labelFor(
+    "/users",
+    context.actorUserId,
+    (row) => (typeof row.name === "string" && row.name.length > 0 ? row.name : null),
+    context,
+    { fields: "id,name", show_service_accounts: "true" },
+  );
 }
 
 /**
@@ -157,10 +201,11 @@ async function labelFor(
   path: string,
   id: number,
   render: (row: GreenhouseRow) => string | null,
-  context: ActionContext
+  context: ActionContext,
+  extraParams: Record<string, string> = {},
 ): Promise<string | null> {
   try {
-    const rows = await context.greenhouse.list(path, { ids: String(id), per_page: "1" }, context.actorUserId);
+    const rows = await context.greenhouse.list(path, { ids: String(id), per_page: "1", ...extraParams }, context.actorUserId);
     const row = rows.find((candidate) => Number(candidate.id) === id);
     return row ? render(row) : null;
   } catch {

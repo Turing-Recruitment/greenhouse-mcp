@@ -150,13 +150,11 @@ export function parseActionBinding(kind: ActionKind, value: unknown): ActionBind
   if (!isRecord(value)) return null;
   switch (kind) {
     case "application_assignment_change":
-      return exact(value, ["application_id", "assignment_role", "previous_user_id", "proposed_user_id", "assignee_access"])
+      return exact(value, ["application_id", "assignment_role", "previous_user_id", "proposed_user_id"])
         && positive(value.application_id)
         && (value.assignment_role === "recruiter" || value.assignment_role === "coordinator")
         && nullablePositive(value.previous_user_id)
         && positive(value.proposed_user_id)
-        && (value.assignee_access === "explicit_permission"
-          || value.assignee_access === "site_admin_non_confidential" || value.assignee_access === "none")
         ? value as unknown as ActionBinding : null;
     case "job_owner_change":
       return exact(value, ["job_id", "user_id", "owner_type", "verb", "owner_row_id"])

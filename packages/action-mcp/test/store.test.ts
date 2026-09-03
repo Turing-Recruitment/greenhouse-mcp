@@ -8,10 +8,7 @@ const row = {
   action_kind: "application_assignment_change",
   lock_key: "application:100",
   scope_job_id: 200,
-  binding: {
-    application_id: 100, assignment_role: "recruiter", previous_user_id: 20,
-    proposed_user_id: 40, assignee_access: "explicit_permission",
-  },
+  binding: { application_id: 100, assignment_role: "recruiter", previous_user_id: 20, proposed_user_id: 40 },
   identity_id: "11111111-1111-4111-8111-111111111111",
   actor_user_id: 10,
   subject_fingerprint: "A".repeat(43),

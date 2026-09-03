@@ -31,7 +31,7 @@ function listPaths(file: string): string[] {
  * someone must classify the new path as fenced or exempt, in writing, before the suite goes green.
  */
 const EXPECTED_READS: Readonly<Record<string, readonly string[]>> = {
-  "application-assignment.ts": ["/user_job_permissions", "/users"],
+  "application-assignment.ts": ["/users"],
   "application-attribution.ts": ["/referrers", "/sources"],
   "application-rejection.ts": ["/notes", "/rejection_details", "/rejection_reasons"],
   "application-stage-move.ts": ["/job_interview_stages"],
@@ -46,6 +46,17 @@ const EXPECTED_READS: Readonly<Record<string, readonly string[]>> = {
   "offer-update.ts": [],
   "shared.ts": ["/application_stages", "/applications", "/jobs", "/user_job_permissions", "/users"],
   "types.ts": [],
+};
+
+/**
+ * The same inventory for the two src files outside `actions/` that a write path reads through.
+ * `service.ts` reads NOTHING: the attribution disclosure's actor-name lookup lives in
+ * `actions/shared.ts` with every other read, so this entry is an empty list on purpose — a read
+ * added to the service fails here until someone moves it or classifies it.
+ */
+const EXPECTED_SRC_READS: Readonly<Record<string, readonly string[]>> = {
+  "custom-fields.ts": ["/custom_field_options", "/custom_fields"],
+  "service.ts": [],
 };
 
 /**
@@ -90,15 +101,16 @@ describe("fence structure (Phase 2c Slice 5)", () => {
       }
     }
 
-    // custom-fields.ts sits outside actions/ but is read by four prepares; same rule.
-    for (const path of listPaths(join(ACTION_SRC, "custom-fields.ts"))) {
-      assert.ok(PATH_DISPOSITION[path], `custom-fields.ts reads ${path} with no disposition`);
-    }
-
-    // service.ts reads the actor's display name for the attribution disclosure (P4); a read added
-    // there must be classified like any prepare's read.
-    for (const path of listPaths(join(ACTION_SRC, "service.ts"))) {
-      assert.ok(PATH_DISPOSITION[path], `service.ts reads ${path} with no disposition`);
+    // custom-fields.ts and service.ts sit outside actions/ but are on the write path; same rule,
+    // and the same EXACT inventory rather than a disposition-only check that a new read would pass.
+    for (const [file, expected] of Object.entries(EXPECTED_SRC_READS)) {
+      const discovered = listPaths(join(ACTION_SRC, file));
+      assert.deepEqual(discovered, [...expected].sort(),
+        `${file} reads a different set of Greenhouse resources than recorded — classify the change ` +
+        `in PATH_DISPOSITION before going green`);
+      for (const path of discovered) {
+        assert.ok(PATH_DISPOSITION[path], `${file} reads ${path} with no disposition`);
+      }
     }
   });
 

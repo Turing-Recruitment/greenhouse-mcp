@@ -48,7 +48,6 @@ export interface AssignmentBinding {
   assignment_role: AssignmentRole;
   previous_user_id: number | null;
   proposed_user_id: number;
-  assignee_access: "explicit_permission" | "site_admin_non_confidential" | "none";
 }
 
 export interface JobOwnerBinding {

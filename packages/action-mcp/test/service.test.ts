@@ -50,6 +50,34 @@ async function previewApplyInput(service: GreenhouseActionService): Promise<Reco
 }
 
 describe("GreenhouseActionService", () => {
+  test("a gateway that does not declare an attribution mode cannot build a service", () => {
+    // Every preview states whose name the write will carry. A force-cast fake with no mode used to
+    // preview happily and emit `recorded_as: "service_account"` with `mode: undefined` — a sentence
+    // about attribution that nothing had decided. The mode is now stated at construction or not at all.
+    const clock = new TestClock();
+    const build = (attributionMode: unknown) => () => new GreenhouseActionService({
+      session: testSession(),
+      store: new MemoryActionStore(clock),
+      greenhouse: {
+        ...(attributionMode === undefined ? {} : { attributionMode }),
+        async probe() {},
+        async list() { return []; },
+        async mutate() { throw new Error("no test here may reach a mutation"); },
+      } as unknown as GreenhouseGateway,
+      signingSecret: TEST_SECRET,
+      visibility: allowAllVisibility(),
+      writesEnabled: true,
+      production: false,
+      clock,
+    });
+    const undeclared = (error: unknown) => error instanceof ActionDeniedError
+      && error.code === "ATTRIBUTION_MODE_UNDECLARED";
+    assert.throws(build(undefined), undeclared, "a fake with no mode must fail loudly");
+    assert.throws(build("per_humans"), undeclared, "and so must a mode nothing supports");
+    assert.doesNotThrow(build("service_user"));
+    assert.doesNotThrow(build("per_human"));
+  });
+
   test("an intent cannot cross attribution modes", async () => {
     const clock = new TestClock();
     const store = new MemoryActionStore(clock);
