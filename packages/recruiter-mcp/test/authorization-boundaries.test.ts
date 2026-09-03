@@ -41,7 +41,9 @@ function fixtureReader(testCase: BoundaryCase): RawReadClient & { calls: RawCall
       assert.ok(rows, `${testCase.name}: unexpected parent read ${path}`);
       assert.equal(cursor, undefined);
       assert.equal(typeof params?.ids, "string", `${testCase.name}: parent reads must be ID-bounded`);
-      assert.equal(params?.per_page, 500);
+      // The privacy gate's candidate read is id-bounded like every other parent read but pages at
+      // 100 with an explicit `fields` projection; the scope joins page at 500.
+      assert.equal(params?.per_page, path === "/candidates" ? 100 : 500);
       return response(rows as T);
     },
   };
@@ -152,13 +154,17 @@ const BOUNDARY_CASES: BoundaryCase[] = [
         { id: 100, application_id: 1_000 },
         { id: 200, application_id: 2_000 },
       ],
+      // candidate_id is on the v3 application row's default field set, and the privacy gate now
+      // walks this whole chain to reach it — so the fixture carries it, and the boundary case
+      // asserts the privacy read that follows as part of the chain.
       "/applications": [
-        { id: 1_000, jobs: [{ id: 1 }] },
-        { id: 2_000, jobs: [{ id: 2 }] },
+        { id: 1_000, jobs: [{ id: 1 }], candidate_id: 501 },
+        { id: 2_000, jobs: [{ id: 2 }], candidate_id: 502 },
       ],
+      "/candidates": [{ id: 501, private: false }],
     },
     expectedRows: [{ id: 1, scorecard_question_answer_id: 10, text: "Permitted" }],
-    expectedParentPaths: ["/scorecard_question_answers", "/scorecards", "/applications"],
+    expectedParentPaths: ["/scorecard_question_answers", "/scorecards", "/applications", "/candidates"],
   },
   {
     name: "default interviewers",

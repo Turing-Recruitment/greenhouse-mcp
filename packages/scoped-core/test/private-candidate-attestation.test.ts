@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  createHarvestPermissionProvider,
   createScopedGreenhouseReader,
   type ActorResolver,
   type ApiResponse,
@@ -150,9 +151,10 @@ describe("B1: unattested all-access, list_candidates", () => {
       permittedJobCount: null,
       privateCandidatesWithheld: true,
     });
-    // 1 page read + at most one batched privacy read per 50 ids. A candidate row carries `private`
-    // in its own field set, so in practice this costs nothing beyond the page itself.
-    assert.ok(raw.calls.length <= 1 + Math.ceil(CANDIDATES.length / 50), `saw ${raw.calls.length} upstream calls`);
+    // Exactly one call: a `/v3/candidates` row carries `private` in its default field set, so the
+    // gate reads the flag off the page it already has. An inequality here would pass just as
+    // happily against a gate that fell back to one privacy read per row.
+    assert.deepStrictEqual(raw.calls.map((call) => call.path), ["/candidates"]);
   });
 });
 
@@ -346,7 +348,9 @@ describe("B5: the operator path is gated by the same attestation", () => {
     assert.equal(result.ok, true);
     if (!result.ok) return;
     assert.deepStrictEqual(rowIds(result.data), [501, 502, 503]);
-    assert.equal(result.scoped, true);
+    // scoped stays FALSE for an operator: three release-gate predicates require it. The
+    // withholding is disclosed on permissionScope instead. See B16.
+    assert.equal(result.scoped, false);
     assert.deepStrictEqual(result.permissionScope, {
       kind: "operator",
       permittedJobCount: null,
@@ -422,5 +426,269 @@ describe("B14: unattested all-access keeps the private access Greenhouse's per-j
     const result = await scoped.scopedRead(100, "list_candidates", {});
     assert.deepStrictEqual(rowIds(result.ok ? result.data : []), [501, 502, 503, 504, 505]);
     assert.deepStrictEqual(result.ok && result.permissionScope, { kind: "all", permittedJobCount: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B15 — unattested all-access WITH confidential exclusions never enters the engine
+// ---------------------------------------------------------------------------
+
+describe("B15: unattested all-access with exclusions keeps its own branch", () => {
+  it("excludes the confidential job's rows, withholds private rows, and keeps a candidate with no applications", async () => {
+    // The unfiltered page includes the applicationless candidate, which is the shape the job-scope
+    // engine drops as `missingParent`.
+    const raw = rawReader((path, params) =>
+      path === "/candidates" && params?.ids === undefined
+        ? [...CANDIDATES, UNAPPLIED_CANDIDATE]
+        : tenantHandler(path, params)
+    );
+    const { scoped } = readerFor({ scope: { kind: "all", excludedJobIds: new Set([9]) }, raw });
+    const result = await scoped.scopedRead(100, "list_candidates", {});
+
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepStrictEqual(rowIds(result.data), [501, 502, 506],
+      "503 sits on the confidential job 9; 504/505 are private; 506 has no application at all and " +
+        "the job-scope engine's missingParent drop is exactly what this branch must not inherit");
+    // Only 504 is withheld BY PRIVACY: 505 is private too, but it sits on the confidential job the
+    // exclusion step already removed, and a row can only be withheld once.
+    assert.equal(result.rowCounts.privacyWithheld, 1);
+    assert.equal(result.rowCounts.permissionExcluded, 3, "503 and 505 on the confidential job, plus 504 for privacy");
+    assert.equal(result.rowCounts.unresolved, 0);
+    assert.equal(result.rowCounts.status, "complete");
+    assert.deepStrictEqual(result.permissionScope, {
+      kind: "all",
+      permittedJobCount: null,
+      privateCandidatesWithheld: true,
+    });
+  });
+
+  it("never denies the whole page when one row's parent read fails", async () => {
+    const raw = rawReader((path, params) => {
+      if (path === "/applications" && params?.candidate_ids !== undefined) {
+        if (idsOf(params, "candidate_ids").includes(503)) throw new Error("upstream 500");
+      }
+      return tenantHandler(path, params);
+    });
+    const { scoped } = readerFor({ scope: { kind: "all", excludedJobIds: new Set([9]) }, raw });
+    const result = await scoped.scopedRead(100, "list_candidates", {});
+
+    assert.equal(result.ok, true, "a failed join on one row must not become PERMISSION_JOIN_FAILED for the page");
+    if (!result.ok) return;
+    assert.ok(rowIds(result.data).includes(501));
+    assert.ok(!rowIds(result.data).includes(503), "the row whose job could not be established is dropped, not kept");
+    assert.equal(result.rowCounts.status, "incomplete_scope_resolution");
+    assert.ok((result.rowCounts.unresolved ?? 0) > 0);
+  });
+
+  it("still honours the actor's own private-capable job inside the exclusion branch", async () => {
+    const { scoped } = readerFor({
+      scope: { kind: "all", excludedJobIds: new Set([9]), privateCapableJobIds: new Set([7]) },
+    });
+    const result = await scoped.scopedRead(100, "list_applications", {});
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepStrictEqual(rowIds(result.data), [1001, 1002, 1004],
+      "job 9 is confidential; 1004's private candidate sits on job 7, where the actor holds the Private role");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B16 — the operator branch keeps scoped:false (three release-gate predicates require it)
+// ---------------------------------------------------------------------------
+
+describe("B16: an unattested operator read still reports scoped:false", () => {
+  it("carries the disclosure on permissionScope, not by flipping the scoped flag", async () => {
+    const { scoped } = readerFor({
+      scope: { kind: "all" },
+      operatorActorIds: new Set([900]),
+      attestation: async () => false,
+    });
+    const result = await scoped.scopedRead(900, "list_candidates", {});
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.scoped, false,
+      "leakage-sample.ts:160, rollout-gate.ts:775 and rollout-gate.ts:3203 all require scoped===false " +
+        "for an operator; the withholding is disclosed on permissionScope instead");
+    assert.deepStrictEqual(result.permissionScope, {
+      kind: "operator",
+      permittedJobCount: null,
+      privateCandidatesWithheld: true,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B17 — the unattested operator gets their OWN private-capable jobs, not an empty set
+// ---------------------------------------------------------------------------
+
+describe("B17: an unattested operator keeps the private access their Greenhouse roles grant", () => {
+  it("resolves the operator's private-capable jobs through the permission provider", async () => {
+    const { scoped } = readerFor({
+      scope: { kind: "jobs", jobIds: new Set([7]), privateCapableJobIds: new Set([7]) },
+      operatorActorIds: new Set([900]),
+      attestation: async () => false,
+    });
+    const result = await scoped.scopedRead(900, "list_candidates", {});
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepStrictEqual(rowIds(result.data), [501, 502, 503, 504],
+      "504 sits on job 7, where the operator holds Greenhouse's Private Job Admin role; 505 does not");
+    assert.equal(result.rowCounts.privacyWithheld, 1);
+  });
+
+  it("fails soft to an empty private-capable set when the provider cannot answer", async () => {
+    const scoped = createScopedGreenhouseReader<number>({
+      actorResolver: actorResolver(),
+      permissionProvider: {
+        async getPermittedJobIds(): Promise<PermissionLookupResult> {
+          throw new Error("permission provider is down");
+        },
+      },
+      rawReader: rawReader(),
+      operatorActorIds: new Set([900]),
+      privateCandidateAttestation: async () => false,
+    } as Parameters<typeof createScopedGreenhouseReader>[0]);
+    const result = await scoped.scopedRead(900, "list_candidates", {});
+    assert.equal(result.ok, true, "a permission-provider failure must not deny the operator's read");
+    if (!result.ok) return;
+    assert.deepStrictEqual(rowIds(result.data), [501, 502, 503]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B18 — a rejecting attestation lookup is unattested, never a denial
+// ---------------------------------------------------------------------------
+
+describe("B18: a rejecting attestation lookup yields the unattested envelope", () => {
+  it("does not throw out of the operator path", async () => {
+    const { scoped } = readerFor({
+      scope: { kind: "all" },
+      operatorActorIds: new Set([900]),
+      attestation: async () => {
+        throw new Error("directory unreachable");
+      },
+    });
+    const result = await scoped.scopedRead(900, "list_candidates", {});
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepStrictEqual(rowIds(result.data), [501, 502, 503]);
+    assert.deepStrictEqual(result.permissionScope, {
+      kind: "operator",
+      permittedJobCount: null,
+      privateCandidatesWithheld: true,
+    });
+  });
+
+  it("propagates an abort rather than swallowing it", async () => {
+    const controller = new AbortController();
+    const { scoped } = readerFor({
+      scope: { kind: "all" },
+      operatorActorIds: new Set([900]),
+      attestation: async () => {
+        controller.abort(new Error("caller gave up"));
+        throw new Error("aborted");
+      },
+    });
+    await assert.rejects(
+      () => scoped.scopedRead(900, "list_candidates", {}, { signal: controller.signal }),
+      /caller gave up/
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B19 — the base provider's all-jobs marker no longer discards the explicit Private roles
+// ---------------------------------------------------------------------------
+
+describe("B19: an all-jobs marker keeps the actor's explicit private-capable grants", () => {
+  function permissionRawReader(rows: unknown[], roles: unknown[]): RawReadClient & { calls: RawCall[] } {
+    return rawReader((path) => {
+      if (path === "/user_job_permissions") return rows;
+      if (path === "/user_roles") return roles;
+      return [];
+    });
+  }
+
+  it("returns kind:all AND the private-capable jobs from the same sweep", async () => {
+    const raw = permissionRawReader(
+      [
+        { user_id: 100, role: { name: "All Jobs" } },
+        { user_id: 100, job_id: 7, role_id: 55 },
+        { user_id: 100, job_id: 9, role_id: 56 },
+      ],
+      [
+        { id: 55, role_type: "job_admin", name: "Private" },
+        { id: 56, role_type: "job_admin", name: "Standard" },
+      ]
+    );
+    const provider = createHarvestPermissionProvider({ rawReader: raw });
+    const scope = await provider.getPermittedJobIds(100);
+
+    assert.equal((scope as { kind?: string }).kind, "all");
+    const privateCapable = (scope as { privateCapableJobIds?: ReadonlySet<number> }).privateCapableJobIds;
+    assert.deepStrictEqual([...(privateCapable ?? [])], [7],
+      "returning at the marker discarded the explicit Private Job Admin grant on job 7");
+  });
+
+  it("still answers a bare kind:all when the actor holds no private-capable role", async () => {
+    const raw = permissionRawReader([{ user_id: 100, role: { name: "All Jobs" } }], []);
+    const provider = createHarvestPermissionProvider({ rawReader: raw });
+    assert.deepStrictEqual(await provider.getPermittedJobIds(100), { kind: "all" });
+  });
+
+  it("keeps the private-capable set across the TTL cache clone", async () => {
+    const raw = permissionRawReader(
+      [
+        { user_id: 100, role: { name: "All Jobs" } },
+        { user_id: 100, job_id: 7, role_id: 55 },
+      ],
+      [{ id: 55, role_type: "job_admin", name: "Private" }]
+    );
+    const provider = createHarvestPermissionProvider({ rawReader: raw, ttlMs: 60_000 });
+    await provider.getPermittedJobIds(100);
+    const second = await provider.getPermittedJobIds(100);
+    assert.deepStrictEqual(
+      [...((second as { privateCapableJobIds?: ReadonlySet<number> }).privateCapableJobIds ?? [])],
+      [7]
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B20 — the per-job private-access check is batched, not one read per private row
+// ---------------------------------------------------------------------------
+
+describe("B20: the per-job private-access exception does not go N+1", () => {
+  it("resolves every private candidate's applications in one batched read", async () => {
+    const page = Array.from({ length: 30 }, (_, index) => ({
+      id: 4000 + index,
+      first_name: `P${index}`,
+      private: true,
+    }));
+    const raw = rawReader((path, params) => {
+      if (path === "/candidates") return page;
+      if (path === "/applications" && params?.candidate_ids !== undefined) {
+        return idsOf(params, "candidate_ids").map((candidateId) => ({
+          id: 90000 + candidateId,
+          job_id: 7,
+          candidate_id: candidateId,
+        }));
+      }
+      return [];
+    });
+    const { scoped } = readerFor({
+      scope: { kind: "all", privateCapableJobIds: new Set([7]) },
+      raw,
+    });
+    const result = await scoped.scopedRead(100, "list_candidates", {});
+
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.rowCounts.returned, 30, "every one sits on the actor's private-capable job");
+    assert.ok(
+      raw.calls.length <= 2,
+      `1 page + 1 batched /applications?candidate_ids=… — saw ${raw.calls.length}: ${raw.calls.map((call) => call.path).join(", ")}`
+    );
   });
 });

@@ -1208,7 +1208,32 @@ describe("scoped Greenhouse read wrapper", () => {
     });
   });
 
-  it("leaves non-public notes untouched for unscoped operators", async () => {
+  it("leaves non-public notes untouched for an ATTESTED unscoped operator", async () => {
+    const raw = rawReader(() => [
+      { id: 801, application_id: 10, visibility: "privately_visible" },
+      { id: 802, application_id: 10 },
+    ]);
+    const scoped = createScopedGreenhouseReader({
+      actorResolver: actorResolver(),
+      permissionProvider: permissionProvider(new Map([[100, [1]]])),
+      rawReader: raw,
+      operatorActorIds: new Set([900]),
+      privateCandidateAttestation: async () => true,
+    });
+
+    const result = await scoped.scopedRead(900, "list_notes", {});
+
+    assert.equal(result.ok, true);
+    assert.deepStrictEqual(result.ok && result.data, [
+      { id: 801, application_id: 10, visibility: "privately_visible" },
+      { id: 802, application_id: 10 },
+    ]);
+  });
+
+  it("withholds notes whose candidate cannot be established from an UNATTESTED operator", async () => {
+    // The fake tenant answers every path with the note rows, so the application these notes hang
+    // off cannot be read — which makes their candidate's privacy unknown. A note is candidate
+    // substance, and unknown privacy has never been "not private" anywhere in this reader.
     const raw = rawReader(() => [
       { id: 801, application_id: 10, visibility: "privately_visible" },
       { id: 802, application_id: 10 },
@@ -1223,10 +1248,9 @@ describe("scoped Greenhouse read wrapper", () => {
     const result = await scoped.scopedRead(900, "list_notes", {});
 
     assert.equal(result.ok, true);
-    assert.deepStrictEqual(result.ok && result.data, [
-      { id: 801, application_id: 10, visibility: "privately_visible" },
-      { id: 802, application_id: 10 },
-    ]);
+    assert.deepStrictEqual(result.ok && result.data, []);
+    assert.equal(result.ok && result.rowCounts.privacyWithheld, 2);
+    assert.equal(result.ok && result.scoped, false, "an operator envelope stays scoped:false for the release gates");
   });
 
   it("returns write tools as not available through the default-deny registry", async () => {

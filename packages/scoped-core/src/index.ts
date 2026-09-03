@@ -235,6 +235,17 @@ interface ScopeContext {
   // role. A private candidate is visible on those jobs and nowhere else — always a subset, so this
   // can only decide privacy, never widen job scope.
   privateCapableJobIds: ReadonlySet<number>;
+  /**
+   * Resolves `privateCapableJobIds` on FIRST NEED, for the direct-operator branch.
+   *
+   * The operator path returns raw data before the permission provider runs, so recovering the
+   * operator's own private-capable reqs means resolving their permission scope — a `/users` probe
+   * plus a `/user_job_permissions` sweep plus the `/user_roles` dictionary, on a TTL production
+   * forces to zero. Paying that on every operator read, for pages that usually hold no private row
+   * at all, would be a real cost for a rarely-used answer. So it is deferred until the gate finds a
+   * private row it actually has to decide, and then resolved once for the read.
+   */
+  resolvePrivateCapableJobIds?: () => Promise<ReadonlySet<number>>;
   applicationTerminal: ScopeTerminal;
   applicationCache: Map<number, Promise<Record<string, unknown> | null>>;
   candidateApplicationsCache: Map<number, Promise<Record<string, unknown>[]>>;
@@ -242,6 +253,11 @@ interface ScopeContext {
   // scorecard-question-answer scoping. Keyed by record id, deduped per scopedRead like the others.
   interviewCache: Map<number, Promise<Record<string, unknown> | null>>;
   scorecardCache: Map<number, Promise<Record<string, unknown> | null>>;
+  // Parent-record caches for the hops the privacy resolver takes that no row filter has a
+  // dedicated cache for (today: /scorecard_question_answers, the middle hop of the answer-options
+  // chain). Keyed by endpoint path so a new hop needs no new ScopeContext field, and deduped per
+  // scopedRead like the named caches above.
+  extraParentCaches: Map<string, Map<number, Promise<Record<string, unknown> | null>>>;
   policyParentCache: Map<string, Promise<PolicyParentRead>>;
   // Greenhouse restricts a candidate flagged `private` to holders of the "View Private Candidates"
   // permission. Job permission alone does NOT grant it, and these reads run under an org-wide
@@ -350,6 +366,17 @@ interface ToolRegistration {
   ): Promise<ApiResponse>;
   filter(response: ApiResponse, context: ScopeContext): Promise<FilterResult>;
   requiresScopePolicy?: boolean;
+  /**
+   * The per-row filter this registration was built from, carried so the registry can be WALKED
+   * rather than transcribed.
+   *
+   * `CANDIDATE_ROW_TOOLS` and `CANDIDATE_SUBSTANCE_TOOLS` are hand-maintained lists of tool names,
+   * and a hand-maintained list of what must be gated is exactly the kind of thing a new
+   * registration silently falls out of — the drift that leaks. Exposing the filter lets a test
+   * assert the membership from the registry itself, so adding a candidate-bearing tool without
+   * classifying it fails the suite instead of shipping.
+   */
+  rowFilter?: RowFilter;
 }
 
 export interface ScopedGreenhouseConfig<SessionIdentity = unknown> {
@@ -498,6 +525,12 @@ export function createHarvestPermissionProvider(
     // job id -> the role ids the actor holds on it, so private capability can be decided after the
     // role dictionary is read rather than requiring a second sweep of the grants.
     const roleIdsByJob = new Map<number, Set<number>>();
+    // An all-jobs role marker is COLLECTED, not returned on. Returning at the first marker threw
+    // away every explicit per-job grant that followed it — including the built-in "Private" Job
+    // Admin role — so an all-jobs actor whose private-candidate permission nobody has attested lost
+    // the private candidates Greenhouse had already granted them on their own reqs. The sweep is
+    // already paginating; finishing it costs the same reads and answers both questions.
+    let grantsAllJobAccess = false;
     let cursor: string | null = null;
 
     do {
@@ -521,7 +554,8 @@ export function createHarvestPermissionProvider(
           continue;
         }
         if (rowGrantsAllJobAccess(row)) {
-          return { kind: "all" };
+          grantsAllJobAccess = true;
+          continue;
         }
         const jobIds = extractJobIds(row);
         const roleId = readPositiveInteger(row.role_id);
@@ -537,6 +571,14 @@ export function createHarvestPermissionProvider(
     } while (cursor);
 
     const privateCapableJobIds = await resolvePrivateCapableJobIds(roleIdsByJob, signal);
+    if (grantsAllJobAccess) {
+      // Job scope is `all`; the private-capable set rides along so the attestation gate downstream
+      // can admit this actor's own private reqs while the org-wide grant stays unattested. An
+      // attested actor ignores it — they hold the org-wide permission and see everything.
+      return privateCapableJobIds.size > 0
+        ? { kind: "all", privateCapableJobIds }
+        : { kind: "all" };
+    }
     return privateCapableJobIds.size > 0
       ? { kind: "jobs", jobIds: permitted, privateCapableJobIds }
       : { kind: "jobs", jobIds: permitted };
@@ -720,15 +762,41 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
         // The operator path returns raw data before the permission provider runs, so the flag the
         // provider stamps onto a scope never reaches it. It asks directly instead — and an absent
         // lookup is unattested, not a grant.
-        const operatorAttested = (await config.privateCandidateAttestation?.(actorId, signal)) === true;
+        //
+        // A lookup that REJECTS is unattested too, not a denial: the directory being unreachable is
+        // this layer failing to establish a permission, which is exactly what "unattested" means.
+        // Letting it throw turned a Supabase blip into a hard read failure for every operator.
+        let operatorAttested = false;
+        try {
+          operatorAttested = (await config.privateCandidateAttestation?.(actorId, signal)) === true;
+        } catch (error) {
+          if (signal?.aborted) throw signal.reason;
+          operatorAttested = false;
+        }
         if (!operatorAttested) {
           return withholdUnattestedPrivateCandidates({
             toolName,
             actorId,
             effectiveActorId: actorId,
             response,
+            // scoped STAYS false. Three release-gate predicates read an operator envelope and
+            // require it — `leakage-sample.ts:160`, `rollout-gate.ts:775` (scoped_flag_mismatch)
+            // and `rollout-gate.ts:3203` — so flipping it to advertise the withholding would fail
+            // the gate on every operator probe. The withholding is disclosed on `permissionScope`
+            // instead, which is where the rest of this branch already says it.
+            scoped: false,
             appliedScope: { kind: "operator", permittedJobCount: null, privateCandidatesWithheld: true },
-            context: privacyOnlyContext(config, applicationTerminal, signal, new Set<number>()),
+            context: privacyOnlyContext(
+              config,
+              applicationTerminal,
+              signal,
+              // The operator's OWN private-capable reqs, resolved through the permission provider.
+              // Hard-coding an empty set here withheld private candidates on reqs Greenhouse's own
+              // "Private" Job Admin role already grants them — a narrowing with nothing behind it.
+              // Passed as a thunk: an operator page with no private row on it never pays for the
+              // permission sweep. Fails soft to empty: a provider that cannot answer never widens.
+              () => operatorPrivateCapableJobIds(config, actorId, signal)
+            ),
           });
         }
         const rowCounts = unscopedRowCounts(response.data);
@@ -779,49 +847,60 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
       // path, and the correct answer for a tenant with no legacy confidential jobs. With
       // exclusions, the same row filtering everyone else gets runs, over a "permitted" set that is
       // everything BUT them.
-      if (permissionScope.kind === "all" && !(permissionScope.excludedJobIds?.size)) {
-        if (allAccessAttested) {
-          const rowCounts = unscopedRowCounts(response.data);
-          return {
-            ok: true,
-            toolName,
-            actorId,
-            effectiveActorId,
-            scoped: false,
-            permissionScope: { kind: "all", permittedJobCount: null },
-            rowCounts,
-            data: response.data,
-            nextCursor: response.nextCursor,
-            meta: response.meta,
-          };
-        }
-        // UNATTESTED org-wide: a dedicated branch, deliberately NOT the job-scope filter path.
-        //
-        // Routing it through the filter would change far more than privacy: that path drops a
-        // candidate with no applications as `missingParent`, resolves each row's job through a
-        // per-row parent read, and can deny the WHOLE read with PERMISSION_JOIN_FAILED — which
-        // `recruiter-mcp/src/action-visibility.ts:147` turns into a write denial. None of that is
-        // what "this actor's private-candidate permission is unattested" means. So the raw page is
-        // taken as-is and only the private rows are withheld.
-        //
-        // The cost is the batched candidate loads the gate below performs on the UNCACHED
-        // authorization reader: one `/candidates?ids=…&fields=id,private` per 50 rows on an
-        // endpoint that does not already carry the flag, plus one `/applications` read per private
-        // row IF the actor holds a private-capable role somewhere (nothing at all when they do
-        // not). The window is bounded: from migration 0008 until the operator runs
-        // greenhouse-recruiter-attest-private-candidates for each org-wide user.
+      if (permissionScope.kind === "all" && allAccessAttested && !(permissionScope.excludedJobIds?.size)) {
+        const rowCounts = unscopedRowCounts(response.data);
+        return {
+          ok: true,
+          toolName,
+          actorId,
+          effectiveActorId,
+          scoped: false,
+          permissionScope: { kind: "all", permittedJobCount: null },
+          rowCounts,
+          data: response.data,
+          nextCursor: response.nextCursor,
+          meta: response.meta,
+        };
+      }
+
+      // UNATTESTED org-wide: a dedicated branch, deliberately NOT the job-scope filter path — and
+      // it is taken WITH OR WITHOUT confidential exclusions. The exclusion test used to come first,
+      // which meant an unattested admin in a tenant that has even one legacy confidential job fell
+      // straight back into the engine and inherited everything this branch exists to avoid.
+      //
+      // Routing it through the filter would change far more than privacy: that path drops a
+      // candidate with no applications as `missingParent`, resolves each row's job through a
+      // per-row parent read, and can deny the WHOLE read with PERMISSION_JOIN_FAILED — which
+      // `recruiter-mcp/src/action-visibility.ts:147` turns into a write denial. None of that is
+      // what "this actor's private-candidate permission is unattested" means. So the raw page is
+      // taken as-is, the confidential exclusion is applied to it directly (Greenhouse restricts a
+      // legacy confidential job to users explicitly on its hiring team — an external constraint
+      // this branch honours exactly as the engine does), and then the private rows are withheld.
+      //
+      // The cost is the batched candidate loads the gate below performs on the UNCACHED
+      // authorization reader: one `/candidates?ids=…&fields=id,private` per 50 rows on an
+      // endpoint that does not already carry the flag, plus one batched `/applications` read per
+      // 50 private candidates IF the actor holds a private-capable role somewhere (nothing at all
+      // when they do not). With exclusions there is one further batched job-resolution pass over
+      // the page. The window is bounded: from migration 0008 until the operator runs
+      // greenhouse-recruiter-attest-private-candidates for each org-wide user.
+      if (permissionScope.kind === "all" && !allAccessAttested) {
+        const excludedJobIds = permissionScope.excludedJobIds ?? new Set<number>();
         return withholdUnattestedPrivateCandidates({
           toolName,
           actorId,
           effectiveActorId,
           response,
+          scoped: true,
           appliedScope: { kind: "all", permittedJobCount: null, privateCandidatesWithheld: true },
           context: privacyOnlyContext(
             config,
             applicationTerminal,
             signal,
-            permissionScope.privateCapableJobIds ?? new Set<number>()
+            permissionScope.privateCapableJobIds ?? new Set<number>(),
+            excludedJobIds
           ),
+          applyExclusions: excludedJobIds.size > 0,
         });
       }
 
@@ -846,6 +925,7 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
         candidateApplicationsCache: new Map(),
         interviewCache: new Map(),
         scorecardCache: new Map(),
+        extraParentCaches: new Map(),
         policyParentCache: new Map(),
         candidatePrivacyCache: new Map(),
       };
@@ -944,19 +1024,26 @@ function privacyOnlyContext(
   config: { rawReader: RawReadClient; authorizationReader?: RawReadClient },
   applicationTerminal: ScopeTerminal,
   signal: AbortSignal | undefined,
-  privateCapableJobIds: ReadonlySet<number>
+  privateCapableJobIds: ReadonlySet<number> | (() => Promise<ReadonlySet<number>>),
+  // The legacy confidential jobs Greenhouse restricts from this org-wide actor. Empty for the
+  // operator path and for a tenant with none, which is the untouched raw case.
+  excludedJobIds: ReadonlySet<number> = new Set<number>()
 ): ScopeContext {
   return {
     rawReader: config.rawReader,
     authorizationReader: config.authorizationReader ?? config.rawReader,
     ...(signal ? { signal } : {}),
-    permittedJobIds: everyJobExcept(new Set<number>()),
-    privateCapableJobIds,
+    permittedJobIds: everyJobExcept(excludedJobIds),
+    privateCapableJobIds: typeof privateCapableJobIds === "function" ? new Set<number>() : privateCapableJobIds,
+    ...(typeof privateCapableJobIds === "function"
+      ? { resolvePrivateCapableJobIds: privateCapableJobIds }
+      : {}),
     applicationTerminal,
     applicationCache: new Map(),
     candidateApplicationsCache: new Map(),
     interviewCache: new Map(),
     scorecardCache: new Map(),
+    extraParentCaches: new Map(),
     policyParentCache: new Map(),
     candidatePrivacyCache: new Map(),
   };
@@ -977,46 +1064,208 @@ async function withholdUnattestedPrivateCandidates(input: {
   actorId: number;
   effectiveActorId: number;
   response: ApiResponse;
+  /**
+   * What the envelope reports for `scoped`. TRUE on the org-wide branch, where rows really were
+   * filtered out of an otherwise org-wide read. FALSE on the operator branch, where three release
+   * gates (`leakage-sample.ts:160`, `rollout-gate.ts:775`, `rollout-gate.ts:3203`) read an operator
+   * envelope and require `scoped === false`; the withholding is disclosed on `permissionScope`
+   * there, which is a field those predicates do not constrain.
+   */
+  scoped: boolean;
   appliedScope: AppliedPermissionScope;
   context: ScopeContext;
+  /** Run the confidential-job exclusion before the privacy gate. Only ever true for an org-wide scope. */
+  applyExclusions?: boolean;
 }): Promise<ScopedReadSuccess> {
   const { toolName, response, context } = input;
-  const filtered = await applyCandidatePrivacyGate(
-    toolName,
-    {
-      response,
-      outcomes: { ...emptyScopeOutcomeCounts(), permitted: countReturnedRows(response.data) },
-    },
-    context
-  );
+  const seeded: FilterResult = input.applyExclusions
+    ? await excludeConfidentialJobRows(toolName, response, context)
+    : {
+        response,
+        outcomes: { ...emptyScopeOutcomeCounts(), permitted: countReturnedRows(response.data) },
+      };
+  const filtered = await applyCandidatePrivacyGate(toolName, seeded, context);
   const privacyWithheld = filtered.outcomes.privacyWithheld ?? 0;
+  const unresolved = filtered.outcomes.missingParent + filtered.outcomes.parentReadFailed;
   // The same existence-suppression rule the filter path applies, for the same reason: a single-row
   // read the privacy gate emptied must report exactly what a nonexistent id reports, or the counts
-  // become a per-person oracle for the restricted flag. There is no missingParent/parentReadFailed
-  // term here because this branch never resolves job scope — a row it could not read is withheld,
-  // not "unresolved".
-  const suppressExistence = isRecord(response.data) && privacyWithheld > 0;
+  // become a per-person oracle for the restricted flag. An unresolved or unreadable parent stays
+  // loud, exactly as it does on the filter path — that is a reliability signal, not an existence one.
+  const suppressExistence = isRecord(response.data) && privacyWithheld > 0 && unresolved === 0;
   return {
     ok: true,
     toolName,
     actorId: input.actorId,
     effectiveActorId: input.effectiveActorId,
-    // Rows were withheld, so this read was scoped — reporting it as unscoped would tell the model
-    // it holds a complete page when it does not.
-    scoped: true,
+    scoped: input.scoped,
     permissionScope: input.appliedScope,
     rowCounts: {
       raw: suppressExistence ? 0 : countRows(response.data),
       returned: countReturnedRows(filtered.response.data),
-      permissionExcluded: suppressExistence ? 0 : privacyWithheld,
-      unresolved: 0,
-      status: "complete",
+      permissionExcluded: suppressExistence ? 0 : filtered.outcomes.notPermitted,
+      unresolved,
+      status: unresolved > 0 || filtered.outcomes.incomplete
+        ? "incomplete_scope_resolution" as const
+        : "complete" as const,
       ...(suppressExistence || privacyWithheld === 0 ? {} : { privacyWithheld }),
     },
     data: filtered.response.data,
     nextCursor: filtered.response.nextCursor,
     meta: filtered.response.meta,
   };
+}
+
+/**
+ * Withhold the rows that sit on a job Greenhouse restricts from this org-wide actor.
+ *
+ * The one narrowing on this branch that cites an EXTERNAL constraint: `/v3/jobs` documents a legacy
+ * confidential job as "restricted to users explicitly granted access on the Hiring Team", site
+ * admin or not, and `site-admin-permission.ts` has already computed which of them this actor is not
+ * on. Skipped entirely when that set is empty, which is the whole tenant in the ordinary case.
+ *
+ * Three outcomes, and the middle one is what the job-scope engine gets wrong here. A row whose job
+ * RESOLVES is kept or excluded on the answer. A row that belongs to NO job — a candidate with no
+ * applications, a dictionary row — is KEPT, because "no job" cannot be "a confidential job"; the
+ * engine calls that `missingParent` and drops it. A row whose job could not be READ is dropped as
+ * `parentReadFailed` and makes the page honestly incomplete — but it never denies the page, which
+ * the engine's PermissionJoinError does, and which `action-visibility.ts:147` turns into a write
+ * denial.
+ */
+async function excludeConfidentialJobRows(
+  toolName: string,
+  response: ApiResponse,
+  context: ScopeContext
+): Promise<FilterResult> {
+  const sourceWasArray = Array.isArray(response.data);
+  const rows: Record<string, unknown>[] = sourceWasArray
+    ? (response.data as unknown[]).filter(isRecord)
+    : isRecord(response.data)
+      ? [response.data]
+      : [];
+  const outcomes = emptyScopeOutcomeCounts();
+  if (sourceWasArray) {
+    outcomes.missingParent = (response.data as unknown[]).length - rows.length;
+  }
+  if (rows.length === 0) {
+    return { response: { ...response, data: sourceWasArray ? [] : null }, outcomes };
+  }
+
+  // The same batched primers the privacy gate uses, so the job hop and the candidate hop share one
+  // set of reads rather than each paying for its own.
+  await primeCandidateParents(rows, context);
+
+  const kept: Record<string, unknown>[] = [];
+  for (const row of rows) {
+    let decision: RowScopeDecision;
+    try {
+      const jobs = await resolveRowJobIds(row, context, JOB_ROW_TOOLS.has(toolName), CANDIDATE_ROW_TOOLS.has(toolName));
+      if (jobs.state === "unresolved") decision = parentReadFailed();
+      else if (jobs.state === "none") decision = permitted(row);
+      else decision = intersects(jobs.jobIds, context.permittedJobIds) ? permitted(row) : notPermitted();
+    } catch (error) {
+      if (context.signal?.aborted) throw context.signal.reason;
+      decision = parentReadFailed();
+    }
+    addDecision(outcomes, decision);
+    if (decision.row) kept.push(decision.row);
+  }
+  return {
+    response: { ...response, data: sourceWasArray ? kept : (kept[0] ?? null) },
+    outcomes,
+  };
+}
+
+/** Tools whose rows ARE jobs, so the row's own `id` is the job the exclusion set is checked against. */
+const JOB_ROW_TOOLS: ReadonlySet<string> = new Set(["list_jobs", "get_job"]);
+
+type RowJobs =
+  | { state: "resolved"; jobIds: ReadonlySet<number> }
+  | { state: "none" }
+  | { state: "unresolved" };
+
+/**
+ * The jobs a row belongs to, resolved through the same routes the row filters use.
+ *
+ * Ordered so the cheapest, most direct answer wins: the row IS a job; the row names its job
+ * (`rowOwnJob`, which honours the applications compatibility shape and fails closed on ambiguity);
+ * the row carries a job-ish field a nested shape put there; the row names an application; the row
+ * embeds its applications; the row reaches a candidate (directly, or through the parent chain) and
+ * that candidate's applications name the jobs.
+ */
+async function resolveRowJobIds(
+  row: Record<string, unknown>,
+  context: ScopeContext,
+  jobRowTool: boolean,
+  candidateRowTool: boolean
+): Promise<RowJobs> {
+  if (jobRowTool) {
+    const id = readPositiveInteger(row.id);
+    return id === null ? { state: "unresolved" } : { state: "resolved", jobIds: new Set([id]) };
+  }
+
+  const own = rowOwnJob(row, context.applicationTerminal);
+  if (own.state === "resolved") return { state: "resolved", jobIds: new Set([own.jobId]) };
+  if (own.state === "unresolved") return { state: "unresolved" };
+
+  const declared = extractJobIds(row);
+  if (declared.size > 0) return { state: "resolved", jobIds: declared };
+
+  const applicationId = readPositiveInteger(row.application_id);
+  if (applicationId !== null) {
+    const application = await loadApplication(context, applicationId);
+    if (!application) return { state: "unresolved" };
+    const jobId = applicationJobId(application, context.applicationTerminal);
+    return jobId === null ? { state: "unresolved" } : { state: "resolved", jobIds: new Set([jobId]) };
+  }
+
+  const embedded = readRecordArray(row.applications);
+  if (embedded) {
+    const jobIds = new Set<number>();
+    for (const application of embedded) {
+      const jobId = applicationJobId(application, context.applicationTerminal);
+      if (jobId !== null) jobIds.add(jobId);
+    }
+    return jobIds.size === 0 ? { state: "none" } : { state: "resolved", jobIds };
+  }
+
+  let candidateId: number | null = candidateRowTool ? extractCandidateId(row) : null;
+  if (candidateId === null) {
+    const candidate = await resolveRowCandidate(row, context);
+    if (candidate.state === "unresolved") return { state: "unresolved" };
+    if (candidate.state === "none") return { state: "none" };
+    candidateId = candidate.candidateId;
+  }
+  const applications = await loadCandidateApplications(context, candidateId);
+  const jobIds = new Set<number>();
+  for (const application of applications) {
+    const jobId = applicationJobId(application, context.applicationTerminal);
+    if (jobId !== null) jobIds.add(jobId);
+  }
+  return jobIds.size === 0 ? { state: "none" } : { state: "resolved", jobIds };
+}
+
+/**
+ * The private-capable reqs a DIRECT OPERATOR holds through Greenhouse's own per-job roles.
+ *
+ * The operator path returns raw data before the permission provider runs, so nothing had resolved
+ * this actor's grants at all — the branch used to hand the gate an empty set and withhold private
+ * candidates on reqs the organization had already granted them. Fails SOFT: a provider that throws,
+ * or answers a shape with no private-capable subset, yields an empty set, which withholds rather
+ * than widens. An abort still propagates.
+ */
+async function operatorPrivateCapableJobIds<SessionIdentity>(
+  config: ScopedGreenhouseConfig<SessionIdentity>,
+  actorId: number,
+  signal: AbortSignal | undefined
+): Promise<ReadonlySet<number>> {
+  try {
+    const answer = await config.permissionProvider.getPermittedJobIds(actorId, signal);
+    if (!isPermissionScope(answer)) return new Set<number>();
+    return answer.privateCapableJobIds ? new Set(answer.privateCapableJobIds) : new Set<number>();
+  } catch (error) {
+    if (signal?.aborted) throw signal.reason;
+    return new Set<number>();
+  }
 }
 
 function unscopedRowCounts(data: unknown): ScopedReadRowCounts {
@@ -1129,6 +1378,25 @@ export const CANDIDATE_ROW_TOOLS: ReadonlySet<string> = new Set([
   "get_candidate",
 ]);
 
+/**
+ * Tools whose EVERY row is candidate substance, so a row that resolves to NO candidate is a shape
+ * violation and is withheld rather than waved through.
+ *
+ * The membership rule is "could this endpoint ever legitimately return a row belonging to nobody".
+ * Notes, attachments, educations and employments cannot: each hangs off a candidate or an
+ * application, and a row of one that names neither is malformed, not candidate-free — it used to
+ * fail OPEN. The scorecard-answer chain cannot either: a scorecard belongs to an application, and
+ * an answer (and an answer option) belongs to a scorecard, so the whole chain is one person's
+ * interview record.
+ *
+ * `list_interviews` and `list_interviewers` are deliberately ABSENT, and that is not an oversight.
+ * `/v3/interviews` is job-scoped in the endpoint registry and its rows carry `job_id` when they
+ * belong to no application, so a job-level interview — and the panel membership hanging off it —
+ * genuinely belongs to no candidate. Failing those closed would withhold rows no one's privacy is
+ * at stake in, a narrowing with no external constraint behind it. The leak they DID have is closed
+ * a different way: `resolveRowCandidate` walks their parent chain, and an unreadable hop is
+ * `unresolved`, which is withheld for every tool regardless of this set.
+ */
 export const CANDIDATE_SUBSTANCE_TOOLS: ReadonlySet<string> = new Set([
   "list_applications",
   "get_application",
@@ -1137,7 +1405,107 @@ export const CANDIDATE_SUBSTANCE_TOOLS: ReadonlySet<string> = new Set([
   "list_rejection_details",
   "list_prospect_details",
   "list_offers",
+  "list_notes",
+  "list_attachments",
+  "list_candidate_educations",
+  "list_candidate_employments",
+  "list_scorecard_question_answers",
+  "list_scorecard_question_answer_options",
 ]);
+
+/**
+ * The parent chain the privacy resolver walks to reach the candidate behind a row.
+ *
+ * The scope engines reach a candidate through the ROW FILTERS, each of which hard-codes its own
+ * hop: an interviewer's `interview_id`, a scorecard answer's `scorecard_id`. The unattested
+ * org-wide branch and the direct-operator branch run NO row filter — that is the whole point of
+ * them, since job scope is not what is in question — so the hops have to live here too, or a row
+ * two joins away from its candidate walks past the gate. They did: `list_interviewers`,
+ * `list_scorecard_question_answers` and `list_scorecard_question_answer_options` returned
+ * private-candidate rows to an unattested actor because the resolver stopped after one hop.
+ *
+ * Ordered cheapest-first: a row carrying `application_id` is one read from its candidate, and the
+ * later hops each land on a record that carries one. Every hop goes through a per-read cache (the
+ * same ones the row filters use, so the two engines share the work) and is batch-primed by
+ * `primeCandidateParents` before any row is decided.
+ */
+interface CandidateParentHop {
+  idField: string;
+  endpoint: string;
+}
+
+const CANDIDATE_PARENT_HOPS: readonly CandidateParentHop[] = [
+  { idField: "application_id", endpoint: "/applications" },
+  { idField: "interview_id", endpoint: "/interviews" },
+  { idField: "scorecard_id", endpoint: "/scorecards" },
+  { idField: "scorecard_question_answer_id", endpoint: "/scorecard_question_answers" },
+];
+
+function candidateParentHopFor(
+  row: Record<string, unknown>
+): { hop: CandidateParentHop; id: number } | null {
+  for (const hop of CANDIDATE_PARENT_HOPS) {
+    const id = readPositiveInteger(row[hop.idField]);
+    if (id !== null) return { hop, id };
+  }
+  return null;
+}
+
+function parentCacheFor(
+  context: ScopeContext,
+  endpoint: string
+): Map<number, Promise<Record<string, unknown> | null>> {
+  if (endpoint === "/applications") return context.applicationCache;
+  if (endpoint === "/interviews") return context.interviewCache;
+  if (endpoint === "/scorecards") return context.scorecardCache;
+  let cache = context.extraParentCaches.get(endpoint);
+  if (!cache) {
+    cache = new Map<number, Promise<Record<string, unknown> | null>>();
+    context.extraParentCaches.set(endpoint, cache);
+  }
+  return cache;
+}
+
+async function loadParentRecord(
+  context: ScopeContext,
+  endpoint: string,
+  id: number
+): Promise<Record<string, unknown> | null> {
+  if (endpoint === "/applications") return loadApplication(context, id);
+  return loadRecordById(parentCacheFor(context, endpoint), context.rawReader, endpoint, id, context.signal);
+}
+
+/**
+ * Three states, and the middle one is the reason this is not a `number | null`.
+ *
+ * `none` means the row belongs to no candidate — a job-level interview, a dictionary row. `unresolved`
+ * means it names a parent that could not be read, which is NOT the same thing: treating it as `none`
+ * would let one failed join hand a private candidate's row to an actor who may not see it. `none` is
+ * decided by the tool (see CANDIDATE_SUBSTANCE_TOOLS); `unresolved` is always withheld.
+ */
+type RowCandidate =
+  | { state: "resolved"; candidateId: number }
+  | { state: "none" }
+  | { state: "unresolved" };
+
+async function resolveRowCandidate(
+  row: Record<string, unknown>,
+  context: ScopeContext
+): Promise<RowCandidate> {
+  let current = row;
+  // One iteration per possible hop plus the terminal read; a chain longer than the declared hops
+  // cannot exist, and bounding the walk means a cyclic parent shape cannot spin here.
+  for (let depth = 0; depth <= CANDIDATE_PARENT_HOPS.length; depth += 1) {
+    const direct = extractAssociatedCandidateId(current);
+    if (direct !== null) return { state: "resolved", candidateId: direct };
+    const next = candidateParentHopFor(current);
+    if (!next) return { state: "none" };
+    const parent = await loadParentRecord(context, next.hop.endpoint, next.id);
+    if (!parent) return { state: "unresolved" };
+    current = parent;
+  }
+  return { state: "unresolved" };
+}
 
 /**
  * Enforce "View Private Candidates" on whatever survived scoping, whichever engine did the scoping.
@@ -1168,13 +1536,28 @@ async function applyCandidatePrivacyGate(
   if (rows.length === 0) return filtered;
 
   const mustResolveCandidate = CANDIDATE_SUBSTANCE_TOOLS.has(toolName);
-  // Two bounded batches, in order: the applications the kept rows hang off (so a row that names no
-  // candidate directly can still reach one), then the candidates themselves. Both are no-ops for
+  const candidateRowTool = CANDIDATE_ROW_TOOLS.has(toolName);
+  // Bounded batches, in dependency order: the parent chain the kept rows hang off (so a row that
+  // names no candidate directly can still reach one, however many hops away), then the candidates
+  // named ON the rows, then the candidates reached only THROUGH those parents. All are no-ops for
   // ids already cached, which is the common case — the row filters and the scope-policy join have
   // usually loaded them already.
-  await primeApplicationsForRows(rows, context);
+  await primeCandidateParents(rows, context);
   await prefetchScopeParents(rows, context);
-  await prefetchCandidatesBehindApplications(rows, context);
+  await prefetchCandidatesBehindParents(rows, context);
+  // The deferred private-capable resolution (operator branch), taken only now: every parent and
+  // privacy answer this needs is already cached, so deciding whether the page holds a private row
+  // at all costs no round trip — and a page with none never triggers the permission sweep.
+  const resolveLater = context.resolvePrivateCapableJobIds;
+  if (resolveLater) {
+    context.resolvePrivateCapableJobIds = undefined;
+    if (await pageHoldsPrivateCandidate(rows, context, candidateRowTool)) {
+      context.privateCapableJobIds = await resolveLater();
+    }
+  }
+  // Last, and only when the actor holds a private-capable role somewhere: the applications of the
+  // private candidates whose per-job admission is about to be decided one row at a time.
+  await primePrivateCandidateApplications(rows, context, candidateRowTool);
 
   const kept: Record<string, unknown>[] = [];
   let withheld = 0;
@@ -1185,7 +1568,7 @@ async function applyCandidatePrivacyGate(
     // propagates, because that is the caller giving up rather than a scoping failure.
     let verdict: "keep" | "withhold";
     try {
-      if (CANDIDATE_ROW_TOOLS.has(toolName)) {
+      if (candidateRowTool) {
         // Private — kept only where Greenhouse itself grants this actor private access, exactly as
         // the join-backed branch below decides it.
         verdict =
@@ -1199,16 +1582,27 @@ async function applyCandidatePrivacyGate(
         kept.push(row);
         continue;
       }
-      const candidateId = await resolveRowCandidateId(row, context);
-      if (candidateId === null) {
-        // Not candidate substance at all (a job, an opening, a dictionary row) — nothing to gate,
-        // unless this is a tool whose every row must resolve to a candidate.
+      const candidate = await resolveRowCandidate(row, context);
+      if (candidate.state === "unresolved") {
+        // A parent this row's candidate sits behind could not be read, so whether the row is a
+        // private candidate's is UNKNOWN — and unknown privacy has never been "not private"
+        // anywhere else in this file. Withheld for every tool, not just the candidate-substance
+        // ones: the tool list decides what a row with genuinely NO candidate means, never what a
+        // failed join means.
+        verdict = "withhold";
+      } else if (candidate.state === "none") {
+        // Not candidate substance at all (a job, an opening, a job-level interview, a dictionary
+        // row) — nothing to gate, unless this is a tool whose every row must resolve to a candidate.
         verdict = mustResolveCandidate ? "withhold" : "keep";
-      } else if (!(await loadCandidateIsPrivate(context, candidateId))) {
+      } else if (!(await loadCandidateIsPrivate(context, candidate.candidateId))) {
         verdict = "keep";
       } else {
-        // Private — kept only where Greenhouse itself grants this actor private access.
-        verdict = (await actorHoldsPrivateAccessToRow(row, context)) ? "keep" : "withhold";
+        // Private — kept only where Greenhouse itself grants this actor private access. The
+        // resolved candidate id is handed down because a multi-hop row carries no candidate of its
+        // own, and the per-job rule has to be decided on the person the row is actually about.
+        verdict = (await actorHoldsPrivateAccessToRow(row, context, candidate.candidateId))
+          ? "keep"
+          : "withhold";
       }
     } catch (error) {
       if (context.signal?.aborted) throw context.signal.reason;
@@ -1257,7 +1651,11 @@ async function applyCandidatePrivacyGate(
  */
 async function actorHoldsPrivateAccessToRow(
   row: Record<string, unknown>,
-  context: ScopeContext
+  context: ScopeContext,
+  // The candidate the privacy gate resolved for this row, for the multi-hop shapes that carry no
+  // candidate id of their own. Optional and consulted only after the row's own association: every
+  // pre-existing caller passes nothing and behaves exactly as before.
+  resolvedCandidateId?: number
 ): Promise<boolean> {
   if (context.privateCapableJobIds.size === 0) return false;
 
@@ -1287,7 +1685,8 @@ async function actorHoldsPrivateAccessToRow(
     });
   }
 
-  const candidateId = extractAssociatedCandidateId(row) ?? extractCandidateId(row);
+  const candidateId =
+    extractAssociatedCandidateId(row) ?? resolvedCandidateId ?? extractCandidateId(row);
   if (candidateId === null) return false;
   const applications = await loadCandidateApplications(context, candidateId);
   return applications.some((application) => {
@@ -1296,95 +1695,221 @@ async function actorHoldsPrivateAccessToRow(
   });
 }
 
-function isApplicationsEndpoint(endpoint: string): boolean {
-  return endpoint.replace(/^\/v3(?=\/)/, "") === "/applications";
-}
-
 /**
- * Load, in 50-id batches, the applications the kept rows hang off but that nothing has cached yet.
+ * Batch-load the whole parent chain the kept rows hang off, one level at a time.
  *
- * Without this the gate would fall back to `loadApplication` per row — one round trip each — which
- * on a full page is precisely the sequential-join latency the batching elsewhere exists to avoid.
- * Best-effort by the same rule as the other primers: on failure it seeds nothing and the per-row
- * loader raises its own PermissionJoinError.
+ * Without this the resolver would fall back to a per-row parent read — one round trip each, per
+ * hop — which on a full page is precisely the sequential-join latency the batching elsewhere exists
+ * to avoid. Each level issues one read per 50 ids per endpoint and then walks the records it loaded,
+ * so a three-hop chain over a hundred rows costs three batched reads rather than three hundred.
+ *
+ * Best-effort by the same rule as the other primers: a failed batch seeds nothing and the per-row
+ * loader does its own read (and raises its own PermissionJoinError, which the gate turns into a
+ * withhold for that row). Never swallows an abort.
  */
-async function primeApplicationsForRows(
+async function primeCandidateParents(
   rows: readonly Record<string, unknown>[],
   context: ScopeContext
 ): Promise<void> {
-  const applicationIds = new Set<number>();
-  for (const row of rows) {
-    if (extractAssociatedCandidateId(row) !== null) continue;
-    const applicationId = readPositiveInteger(row.application_id);
-    if (applicationId !== null && !context.applicationCache.has(applicationId)) {
-      applicationIds.add(applicationId);
+  let frontier: readonly Record<string, unknown>[] = rows;
+  for (let depth = 0; depth < CANDIDATE_PARENT_HOPS.length && frontier.length > 0; depth += 1) {
+    const wanted = new Map<string, Set<number>>();
+    for (const row of frontier) {
+      if (extractAssociatedCandidateId(row) !== null) continue;
+      const next = candidateParentHopFor(row);
+      if (!next) continue;
+      if (parentCacheFor(context, next.hop.endpoint).has(next.id)) continue;
+      const ids = wanted.get(next.hop.endpoint) ?? new Set<number>();
+      ids.add(next.id);
+      wanted.set(next.hop.endpoint, ids);
     }
-  }
-  if (applicationIds.size === 0) return;
+    if (wanted.size === 0) return;
 
-  const pages = await mapWithConcurrency(chunks([...applicationIds], PARENT_BATCH_SIZE), async (ids) => {
-    try {
-      const response = await context.rawReader.read<unknown[]>(
-        "/applications",
-        { ids: ids.join(","), per_page: 100 },
-        undefined,
-        context.signal
-      );
-      return Array.isArray(response.data) ? response.data.filter(isRecord) : [];
-    } catch (error) {
-      if (context.signal?.aborted) throw context.signal.reason;
-      return null;
+    const loaded: Record<string, unknown>[] = [];
+    for (const [endpoint, ids] of wanted) {
+      const pages = await mapWithConcurrency(chunks([...ids], PARENT_BATCH_SIZE), async (batch) => {
+        try {
+          const response = await context.rawReader.read<unknown[]>(
+            endpoint,
+            { ids: batch.join(","), per_page: 100 },
+            undefined,
+            context.signal
+          );
+          return Array.isArray(response.data) ? response.data.filter(isRecord) : [];
+        } catch (error) {
+          if (context.signal?.aborted) throw context.signal.reason;
+          return null;
+        }
+      });
+      const cache = parentCacheFor(context, endpoint);
+      for (const page of pages) {
+        if (page === null) continue;
+        for (const parent of page) {
+          const id = readPositiveInteger(parent.id);
+          if (id === null || cache.has(id)) continue;
+          cache.set(id, Promise.resolve(parent));
+          loaded.push(parent);
+        }
+      }
     }
-  });
-
-  for (const page of pages) {
-    if (page === null) continue;
-    for (const application of page) {
-      const id = readPositiveInteger(application.id);
-      if (id === null || context.applicationCache.has(id)) continue;
-      context.applicationCache.set(id, Promise.resolve(application));
-    }
+    frontier = loaded;
   }
 }
 
 /**
- * Batch the privacy lookup for candidates reachable only THROUGH an application.
+ * Batch the privacy lookup for candidates reachable only THROUGH the parent chain.
  *
- * Runs after the applications are cached, so it reads each row's candidate id out of the cache
- * without a round trip and hands the whole set to one batched privacy read.
+ * Runs after the parents are cached, so it resolves each row's candidate id out of the caches
+ * without a round trip and hands the whole set to one batched privacy read. A row whose chain
+ * cannot be walked is skipped here and decided (as a withhold) by the gate itself.
  */
-async function prefetchCandidatesBehindApplications(
+async function prefetchCandidatesBehindParents(
   rows: readonly Record<string, unknown>[],
   context: ScopeContext
 ): Promise<void> {
   const carriers: Record<string, unknown>[] = [];
   for (const row of rows) {
     if (extractAssociatedCandidateId(row) !== null) continue;
-    const applicationId = readPositiveInteger(row.application_id);
-    if (applicationId === null) continue;
-    const application = await context.applicationCache.get(applicationId);
-    if (application) carriers.push(application);
+    let resolved: RowCandidate;
+    try {
+      resolved = await resolveRowCandidate(row, context);
+    } catch (error) {
+      if (context.signal?.aborted) throw context.signal.reason;
+      continue;
+    }
+    if (resolved.state === "resolved") carriers.push({ candidate_id: resolved.candidateId });
   }
   if (carriers.length > 0) await prefetchScopeParents(carriers, context);
 }
 
 /**
- * Reach the candidate behind a kept row: named on the row, or on the application it hangs off.
+ * Batch the applications of the PRIVATE candidates whose per-job admission is about to be decided.
  *
- * Returns null when the row belongs to no candidate. The application hop reads through the cache
- * the primers above have filled, so it costs no extra round trip on the common path.
+ * `actorHoldsPrivateAccessToRow` falls back to "does any of this candidate's applications sit on a
+ * private-capable job", which reads `/applications?candidate_ids=<one id>` — one round trip per
+ * private row, sequentially, inside the decision loop. That is the same N+1 the parent primers
+ * exist to kill, and it fires exactly when the actor DOES hold a per-job private role, i.e. on the
+ * path the amendment added.
+ *
+ * Costs nothing when the actor holds no private-capable role (the fallback is never reached), and
+ * nothing for rows that resolve their job directly or through an application they name. A batch
+ * that fails, or that paginates past a sane page cap, seeds nothing and leaves the per-row loader
+ * to do its own read.
  */
-async function resolveRowCandidateId(
-  row: Record<string, unknown>,
-  context: ScopeContext
-): Promise<number | null> {
-  const direct = extractAssociatedCandidateId(row);
-  if (direct !== null) return direct;
+/**
+ * Does this page contain a row whose candidate is flagged private?
+ *
+ * Read entirely out of the caches the primers just filled, so it costs no round trip. Any row whose
+ * chain cannot be walked is skipped — it will be withheld by the gate regardless, and it is not a
+ * reason to spend a permission sweep.
+ */
+async function pageHoldsPrivateCandidate(
+  rows: readonly Record<string, unknown>[],
+  context: ScopeContext,
+  candidateRowTool: boolean
+): Promise<boolean> {
+  for (const row of rows) {
+    try {
+      if (candidateRowTool) {
+        if (row.private !== false) return true;
+        continue;
+      }
+      const candidate = await resolveRowCandidate(row, context);
+      if (candidate.state !== "resolved") continue;
+      if (await loadCandidateIsPrivate(context, candidate.candidateId)) return true;
+    } catch (error) {
+      if (context.signal?.aborted) throw context.signal.reason;
+      continue;
+    }
+  }
+  return false;
+}
 
-  const applicationId = readPositiveInteger(row.application_id);
-  if (applicationId === null) return null;
-  const application = await loadApplication(context, applicationId);
-  return application ? extractAssociatedCandidateId(application) : null;
+async function primePrivateCandidateApplications(
+  rows: readonly Record<string, unknown>[],
+  context: ScopeContext,
+  candidateRowTool: boolean
+): Promise<void> {
+  if (context.privateCapableJobIds.size === 0) return;
+
+  const wanted = new Set<number>();
+  for (const row of rows) {
+    // Only rows that will actually reach the candidate-applications fallback: a row whose own job,
+    // named application, or embedded applications answer the question never gets there.
+    if (rowOwnJob(row, context.applicationTerminal).state !== "absent") continue;
+    if (readPositiveInteger(row.application_id) !== null) continue;
+    if (readRecordArray(row.applications)) continue;
+
+    let candidateId: number | null = null;
+    let isPrivate = false;
+    try {
+      if (candidateRowTool) {
+        candidateId = extractCandidateId(row);
+        isPrivate = row.private !== false;
+      } else {
+        const resolved = await resolveRowCandidate(row, context);
+        candidateId = resolved.state === "resolved" ? resolved.candidateId : null;
+        isPrivate = candidateId !== null && (await loadCandidateIsPrivate(context, candidateId));
+      }
+    } catch (error) {
+      if (context.signal?.aborted) throw context.signal.reason;
+      continue;
+    }
+    if (!isPrivate || candidateId === null) continue;
+    if (context.candidateApplicationsCache.has(candidateId)) continue;
+    wanted.add(candidateId);
+  }
+  if (wanted.size === 0) return;
+
+  for (const batch of chunks([...wanted], PARENT_BATCH_SIZE)) {
+    const applications: Record<string, unknown>[] = [];
+    let usable = true;
+    let cursor: string | null = null;
+    let pagesRead = 0;
+    try {
+      do {
+        const response: ApiResponse<unknown[]> = await context.rawReader.read<unknown[]>(
+          "/applications",
+          cursor ? {} : { candidate_ids: batch.join(","), per_page: 500 },
+          cursor ?? undefined,
+          context.signal
+        );
+        if (!Array.isArray(response.data)) {
+          usable = false;
+          break;
+        }
+        applications.push(...response.data.filter(isRecord));
+        cursor = response.nextCursor;
+        pagesRead += 1;
+        // 50 candidates x 500 rows a page is already an implausible fan-out; past this the batch is
+        // abandoned rather than paginated forever, and each candidate pays its own single read.
+        if (pagesRead >= 10 && cursor) {
+          usable = false;
+          break;
+        }
+      } while (cursor);
+    } catch (error) {
+      if (context.signal?.aborted) throw context.signal.reason;
+      usable = false;
+    }
+    if (!usable) continue;
+
+    const byCandidate = new Map<number, Record<string, unknown>[]>();
+    for (const candidateId of batch) byCandidate.set(candidateId, []);
+    for (const application of applications) {
+      const candidateId = extractAssociatedCandidateId(application);
+      if (candidateId === null) continue;
+      byCandidate.get(candidateId)?.push(application);
+      const applicationId = readPositiveInteger(application.id);
+      if (applicationId !== null && !context.applicationCache.has(applicationId)) {
+        context.applicationCache.set(applicationId, Promise.resolve(application));
+      }
+    }
+    for (const [candidateId, rowsForCandidate] of byCandidate) {
+      if (context.candidateApplicationsCache.has(candidateId)) continue;
+      context.candidateApplicationsCache.set(candidateId, Promise.resolve(rowsForCandidate));
+    }
+  }
 }
 
 async function filterWithScopePolicy(
@@ -1533,13 +2058,17 @@ async function loadPolicyParents(
 
   const parentsById = new Map<number, Record<string, unknown>[]>();
   for (const row of readsByBatch.flatMap((read) => read.rows)) {
-    // A join whose target IS /applications has just loaded, in bounded batches, exactly the rows
-    // the privacy gate would otherwise have to fetch one at a time to reach each row's candidate.
-    // Seed the shared application cache so the gate reuses this read instead of duplicating it.
-    if (isApplicationsEndpoint(dependency.targetEndpoint)) {
-      const applicationId = readPositiveInteger(row.id);
-      if (applicationId !== null && !context.applicationCache.has(applicationId)) {
-        context.applicationCache.set(applicationId, Promise.resolve(row));
+    // A join whose target is one of the privacy chain's hops has just loaded, in bounded batches,
+    // exactly the rows the gate would otherwise fetch one at a time to reach each row's candidate.
+    // Seed the shared parent cache so the gate reuses this read instead of duplicating it — for
+    // /applications, and equally for the /scorecards, /interviews and /scorecard_question_answers
+    // hops the multi-hop tools travel through.
+    const targetEndpoint = dependency.targetEndpoint.replace(/^\/v3(?=\/)/, "");
+    if (CANDIDATE_PARENT_HOPS.some((hop) => hop.endpoint === targetEndpoint)) {
+      const parentId = readPositiveInteger(row.id);
+      const cache = parentCacheFor(context, targetEndpoint);
+      if (parentId !== null && !cache.has(parentId)) {
+        cache.set(parentId, Promise.resolve(row));
       }
     }
     for (const id of extractIds(row[dependency.targetField])) {
@@ -1820,6 +2349,7 @@ function listTool(
         outcomes: filtered.outcomes,
       };
     },
+    rowFilter: filterRow,
   };
 }
 
@@ -1858,6 +2388,7 @@ function getTool(path: string, filterRow: RowFilter): ToolRegistration {
         outcomes: countDecision(filtered),
       };
     },
+    rowFilter: filterRow,
   };
 }
 

@@ -142,7 +142,9 @@ describe("production scoped reader configuration", () => {
       const result = await reader.scopedRead(testSession(), "list_applications", {});
 
       assert.equal(result.ok, true);
-      assert.equal(result.ok && result.scoped, true);
+      // scoped stays FALSE for an operator envelope: leakage-sample.ts:160, rollout-gate.ts:775 and
+      // rollout-gate.ts:3203 all require it. The withholding is disclosed on permissionScope.
+      assert.equal(result.ok && result.scoped, false);
       assert.deepEqual(result.ok && result.permissionScope, {
         kind: "operator",
         permittedJobCount: null,
@@ -150,8 +152,11 @@ describe("production scoped reader configuration", () => {
       });
       assert.deepEqual(result.ok && result.data, [{ id: 1, jobs: [{ id: 111 }], candidate_id: 501 }]);
       assert.equal(result.ok && result.rowCounts.privacyWithheld, 1);
-      assert.equal(calls.some((url) => url.includes("/user_job_permissions")), false,
-        "an unattested operator is still an operator: no permission sweep, only a privacy gate");
+      // The page DOES hold a private row, so the operator's own private-capable reqs have to be
+      // resolved before one can be withheld for lacking them — that is the permission sweep. A page
+      // with no private row on it never triggers it (the case below).
+      assert.equal(calls.some((url) => url.includes("/user_job_permissions")), true,
+        "a private row must be decided against the operator's own Private Job Admin grants");
     } finally {
       globalThis.fetch = originalFetch;
       _resetClientState();

@@ -35,6 +35,11 @@ const CANDIDATE_SUBSTANCE_SURFACE: ReadonlyArray<{ tool: string; why: string }> 
   { tool: "list_notes", why: "notes written about the candidate" },
   { tool: "list_attachments", why: "resumes and other attachments" },
   { tool: "list_scorecard_question_answers", why: "the free text of interview feedback" },
+  {
+    tool: "list_scorecard_question_answer_options",
+    why: "which rubric option an interviewer picked on the candidate's scorecard — FK-only rows, but " +
+      "every one of them is one private candidate's interview record",
+  },
   { tool: "list_interviews", why: "interviews on the candidate's application" },
   { tool: "list_interviewers", why: "who interviewed them" },
 ];
@@ -72,9 +77,12 @@ describe("private-candidate coverage cannot drift between the two scope engines"
 
   it("documents the policy-driven tools that are deliberately NOT privacy gated", () => {
     // These reach a candidate's application through their join chain but return no candidate
-    // substance: approval chains, kit staffing, post/comp config, pool structure, rubric structure,
-    // and the answer-option JOIN rows, which /v3 documents as exposing "only the foreign keys" —
-    // the answer text and the option labels live on endpoints that are themselves gated.
+    // substance: approval chains, kit staffing, post/comp config, pool structure and rubric
+    // structure. `list_scorecard_question_answer_options` used to sit here on the grounds that its
+    // rows carry "only the foreign keys"; it does not any more. An answer-option row names the
+    // scorecard answer it belongs to, and that answer belongs to exactly one candidate's interview,
+    // so an unattested actor reading them learns which rubric option was recorded for a private
+    // candidate. It is gated with the rest of the chain now.
     //
     // Listed explicitly so a NEW policy-driven tool cannot join them silently: adding one fails this
     // test until someone states which of the two it is.
@@ -86,7 +94,6 @@ describe("private-candidate coverage cannot drift between the two scope engines"
       "list_pay_input_ranges",
       "list_prospect_pool_stages",
       "list_prospect_pools",
-      "list_scorecard_question_answer_options",
       "list_scorecard_question_options",
       "list_scorecard_questions",
     ];
