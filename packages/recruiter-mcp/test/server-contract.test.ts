@@ -180,12 +180,22 @@ describe("recruiter MCP server contract", () => {
       // read; it must still be exactly the read-only one. A deep-equal against the shared constant
       // can no longer express that, because each registration now carries its own `title` — a
       // per-tool value that cannot live on a shared frozen object.
-      assert.equal(emitted!.readOnlyHint, RECRUITER_READ_ONLY_TOOL_ANNOTATIONS.readOnlyHint, name);
-      assert.equal(emitted!.destructiveHint, RECRUITER_READ_ONLY_TOOL_ANNOTATIONS.destructiveHint, name);
-      assert.equal(emitted!.idempotentHint, RECRUITER_READ_ONLY_TOOL_ANNOTATIONS.idempotentHint, name);
-      assert.equal(emitted!.openWorldHint, RECRUITER_READ_ONLY_TOOL_ANNOTATIONS.openWorldHint, name);
+      // The LITERAL values, not equality with the constant: comparing each field to the constant
+      // passes just as happily after the constant itself is flipped, which is the mutation this is
+      // supposed to catch.
+      assert.equal(emitted!.readOnlyHint, true, name);
+      assert.equal(emitted!.destructiveHint, false, name);
+      assert.equal(emitted!.idempotentHint, true, name);
+      assert.equal(emitted!.openWorldHint, true, name);
       assert.equal(typeof emitted!.title, "string", `${name} must carry a human-readable title`);
       assert.ok(String(emitted!.title).length > 0, `${name} must carry a non-empty title`);
+      // EXACTLY the shared keys plus `title`: an annotation the registrar smuggles in — a
+      // client-facing hint nobody reviewed — would otherwise ride along invisibly.
+      assert.deepStrictEqual(
+        Object.keys(emitted!).sort(),
+        [...Object.keys(RECRUITER_READ_ONLY_TOOL_ANNOTATIONS), "title"].sort(),
+        `${name} carries an annotation key outside the reviewed set`
+      );
       // And the shared constant itself must never have been mutated into carrying one.
       assert.equal((RECRUITER_READ_ONLY_TOOL_ANNOTATIONS as { title?: unknown }).title, undefined);
     }

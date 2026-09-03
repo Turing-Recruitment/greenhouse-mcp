@@ -72,12 +72,24 @@ export interface RecruitingCapabilities {
  * preview_/apply_ prefix, so a half-grant (preview without apply, or the reverse) is reported as the
  * pair it belongs to AND by its actual tool count — the two numbers disagreeing is itself the signal.
  */
+/**
+ * Only a COMPLETE pair is a usable write action: an apply is gated on a fresh preview and its signed
+ * intent, so `apply_x` without `preview_x` cannot be carried out. Counting one granted half as a pair
+ * promised the model a capability the session does not have; the half-grants are still named, as what
+ * they are, rather than hidden.
+ */
 function writeActionsSentence(grantedNames: string[]): string {
-  const pairs = new Set(grantedNames.map((name) => name.replace(/^(preview|apply)_/, "")));
+  const granted = new Set(grantedNames);
+  const bases = [...new Set(grantedNames.map((name) => name.replace(/^(preview|apply)_/, "")))].sort();
+  const complete = bases.filter((base) => granted.has(`preview_${base}`) && granted.has(`apply_${base}`));
+  const halfGranted = bases.filter((base) => !complete.includes(base));
+  const head =
+    `Write actions are available to this session as ${complete.length} preview/apply pair${complete.length === 1 ? "" : "s"} ` +
+    `(${grantedNames.length} tool${grantedNames.length === 1 ? "" : "s"}): ${grantedNames.join(", ")}. `;
+  if (halfGranted.length === 0) return `${head}Every apply is gated on a fresh preview and its signed intent.`;
   return (
-    `Write actions are available to this session as ${pairs.size} preview/apply pair${pairs.size === 1 ? "" : "s"} ` +
-    `(${grantedNames.length} tool${grantedNames.length === 1 ? "" : "s"}): ${grantedNames.join(", ")}. ` +
-    `Every apply is gated on a fresh preview and its signed intent.`
+    `${head}Every apply is gated on a fresh preview and its signed intent, so ${halfGranted.length} ` +
+    `half-granted action${halfGranted.length === 1 ? "" : "s"} (${halfGranted.join(", ")}) cannot be completed on this session.`
   );
 }
 
