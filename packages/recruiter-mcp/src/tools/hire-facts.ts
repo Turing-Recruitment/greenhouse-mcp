@@ -245,6 +245,11 @@ export async function readHireSet(
     if (chainResult.kind === "cancelled") return { kind: "denial", result: chainResult.result };
     if (chainResult.kind === "failed") {
       read.warnings.push(chainResult.warning);
+      // A read the caller ASKED FOR and did not get is not the same as one nobody asked for. Both
+      // leave `chain` unset; only this one means a population is missing from the answer, and the
+      // status is where a caller aggregating these reads can see it. Leaving it undefined reported
+      // "complete" on a line whose second population had failed.
+      chainRead = failedReadStatus(chainResult.warning);
     } else {
       chain = chainResult.value.rows;
       chainRead = chainResult.value.read;
@@ -266,6 +271,8 @@ export async function readHireSet(
         ...(chain ? { chain } : {}),
         read,
         ...(chainRead ? { chainRead } : {}),
+        // Requested and not delivered: the status says so, exactly as the chain's does above.
+        candidatesRead: failedReadStatus(bridgedResult.warning),
         scope,
         window,
       };
@@ -481,6 +488,26 @@ async function contain<T extends { kind: "rows" | "counts" } | { kind: "denial";
   return { kind: "value", value: result as Exclude<T, { kind: "denial" }> };
 }
 
+/**
+ * The read status of an enrichment that WAS requested and did not come back.
+ *
+ * `incomplete_upstream` rather than a truncation status: nothing about this is recoverable by
+ * asking again with a longer deadline, and combineReadStatuses ranks it first for that reason.
+ */
+function failedReadStatus(warning: string): HireReadStatus {
+  return {
+    status: "incomplete_upstream",
+    complete: false,
+    pagesRead: 0,
+    rawRowsRead: 0,
+    privacyWithheld: 0,
+    rowsMissingField: 0,
+    windowAppliedLocally: false,
+    dateParamsRejected: [],
+    warnings: [warning],
+  };
+}
+
 function foldRead(
   read: RowsResult,
   rows: Array<Record<string, unknown>>,
@@ -518,6 +545,20 @@ export interface ReconciliationCount {
    * complete offer count — the confident wrong number this line exists to prevent.
    */
   partial: boolean;
+  /**
+   * WHICH KIND of partial, because the two do not share a sentence.
+   *
+   * `floor` — the value can only GROW when the rest of the read arrives: a monotone count, or a
+   * partial numerator over a denominator that is complete. Rendered "at least N".
+   *
+   * `uncertain` — the value can move in EITHER direction: a ratio whose denominator is short.
+   * "at least 100 offer rows per hire" over one observed hire, when the 99 unread hires each have
+   * one version and the true figure is 1.99, is a number no read produced and the arithmetic
+   * refutes. Rendered as the value plus "the true value may be higher or lower".
+   *
+   * Absent when `partial` is false — a completed read carries no hedge of either kind.
+   */
+  partial_reading?: "floor" | "uncertain";
   /** The field this count is dated on. Three counts, three clocks. */
   clock: string;
   window_label: string;
@@ -600,12 +641,14 @@ export async function reconciliationLine(
     ...base,
     value: hireFacts.facts.length,
     not_read: false,
-    partial: !hireSet.read.complete,
+    // A count of rows: every chunk that has not arrived can only ADD hires, so a short read is a
+    // floor and never an over-count.
+    ...partialReading(!hireSet.read.complete, "floor"),
     clock: "offers.resolved_at",
     privacy_withheld: hireSet.read.privacyWithheld,
     dated_from_fallback: datedFromSentOn,
     notes: [
-      ...floorNotes(hireSet.read.complete, "the hire read", hireSet.read.status),
+      ...shortReadNotes(hireSet.read.complete, "the hire read", hireSet.read.status, "floor"),
       ...(hireSet.read.windowAppliedLocally
         ? ["the upstream rejected the resolved_at filter, so the window was applied locally to the complete scoped set"]
         : []),
@@ -623,15 +666,20 @@ export async function reconciliationLine(
           ? Number((hireSet.chain.length / hireFacts.facts.length).toFixed(2))
           : null,
         not_read: false,
-        // A ratio over a short numerator or a short denominator is not a floor, it is simply
-        // uncertain — so it is flagged partial and the sentence says which read stopped.
-        partial: !hireSet.read.complete || hireSet.chainRead?.complete === false,
+        // The DENOMINATOR decides the word. Hires complete + versions short is a genuine lower
+        // bound: every version still to arrive belongs to a hire already counted. Hires short is
+        // not a bound at all — the unread hires carry their own versions and can pull the ratio
+        // down as easily as up.
+        ...partialReading(
+          !hireSet.read.complete || hireSet.chainRead?.complete === false,
+          hireSet.read.complete ? "floor" : "uncertain"
+        ),
         clock: "offers.resolved_at (accepted set), counted across every version",
         privacy_withheld: hireSet.chainRead?.privacyWithheld ?? 0,
         dated_from_fallback: 0,
         notes: [
-          ...floorNotes(hireSet.read.complete, "the hire read", hireSet.read.status),
-          ...floorNotes(hireSet.chainRead?.complete !== false, "the offer version chain read", hireSet.chainRead?.status ?? "complete"),
+          ...shortReadNotes(hireSet.read.complete, "the hire read", hireSet.read.status, hireSet.read.complete ? "floor" : "uncertain"),
+          ...shortReadNotes(hireSet.chainRead?.complete !== false, "the offer version chain read", hireSet.chainRead?.status ?? "complete", hireSet.read.complete ? "floor" : "uncertain"),
           ...(hireFacts.facts.length > 0
             ? []
             : ["there are no hires in this window, so offer rows per hire has no denominator"]),
@@ -645,7 +693,8 @@ export async function reconciliationLine(
         clock: "offers.resolved_at (accepted set), counted across every version",
         privacy_withheld: 0,
         dated_from_fallback: 0,
-        notes: ["superseded versions were not read"],
+        // A chain that was ASKED for and failed says which failure; one nobody asked for says so.
+        notes: hireSet.chainRead ? hireSet.chainRead.warnings : ["superseded versions were not read"],
       };
   if (hireSet.chainRead) statuses.push(hireSet.chainRead.status);
 
@@ -690,7 +739,8 @@ export async function reconciliationLine(
         value: bridged.rows.filter((row) => normalizedText(row.status) === "hired").length,
         not_read: false,
         // The hire read bounds this count too: a bridge keyed off a short accepted set is short.
-        partial: !bridged.read.complete || !hireSet.read.complete,
+        // Monotone either way — more ids or more batches can only add hired applications.
+        ...partialReading(!bridged.read.complete || !hireSet.read.complete, "floor"),
         // Deliberately NOT dated: /v3/applications carries no hire timestamp, so this count is a
         // snapshot of the accepted set's applications as they stand right now.
         clock: "applications.status (point-in-time, not dated)",
@@ -698,12 +748,15 @@ export async function reconciliationLine(
         dated_from_fallback: 0,
         notes: [
           "Greenhouse sets status=hired only once the hire endpoint has fired, so this count trails the accepted-offer count rather than contradicting it",
-          ...floorNotes(bridged.read.complete, "the applications bridge", bridged.read.status),
-          ...floorNotes(hireSet.read.complete, "the hire read", hireSet.read.status),
+          ...shortReadNotes(bridged.read.complete, "the applications bridge", bridged.read.status, "floor"),
+          ...shortReadNotes(hireSet.read.complete, "the hire read", hireSet.read.status, "floor"),
         ],
       };
   if (bridged.kind === "failed") {
     warnings.push(bridged.warning);
+    // A population the caller's question needs and this run never read. The aggregate has to say
+    // so, or the line reports "complete" over an answer that is missing half its reconciliation.
+    statuses.push("incomplete_upstream");
   } else {
     statuses.push(bridged.read.status);
     warnings.push(...bridged.read.warnings);
@@ -717,6 +770,7 @@ export async function reconciliationLine(
     if (allTimeResult.kind === "cancelled") return { kind: "denial", result: allTimeResult.result };
     if (allTimeResult.kind === "failed") {
       warnings.push(allTimeResult.warning);
+      statuses.push("incomplete_upstream");
       applications_status_hired_scope_all_time = {
         value: null,
         not_read: true,
@@ -735,7 +789,7 @@ export async function reconciliationLine(
       applications_status_hired_scope_all_time = {
         value: allTime.hired,
         not_read: false,
-        partial: !allTime.read.complete,
+        ...partialReading(!allTime.read.complete, "floor"),
         clock: "applications.status (point-in-time, not dated)",
         window_label: "all time",
         scope_label: scope.label,
@@ -743,7 +797,7 @@ export async function reconciliationLine(
         dated_from_fallback: 0,
         notes: [
           "this count is NOT windowed — it is every hired application in scope, whenever it was hired",
-          ...floorNotes(allTime.read.complete, "the all-time hired-application read", allTime.read.status),
+          ...shortReadNotes(allTime.read.complete, "the all-time hired-application read", allTime.read.status, "floor"),
           ...(allTime.rowsNotHired > 0
             ? [`${allTime.rowsNotHired} row(s) the status=hired filter returned do not carry status=hired and were excluded here`]
             : []),
@@ -764,13 +818,14 @@ export async function reconciliationLine(
   }
   if (openingsResult?.kind === "failed") {
     warnings.push(openingsResult.warning);
+    statuses.push("incomplete_upstream");
   }
   const openings_closed_by_hire: OpeningsClosedByHireCount = openings
     ? {
         ...base,
         value: openings.hireClosed,
         not_read: false,
-        partial: openings.status !== "complete",
+        ...partialReading(openings.status !== "complete", "floor"),
         clock: "openings.closed_at",
         privacy_withheld: openings.privacyWithheld,
         dated_from_fallback: 0,
@@ -780,7 +835,7 @@ export async function reconciliationLine(
         // that had silently fallen back to a local window over an unfiltered read read as a clean
         // server-side number.
         notes: [
-          ...floorNotes(openings.status === "complete", "the closed-openings read", openings.status),
+          ...shortReadNotes(openings.status === "complete", "the closed-openings read", openings.status, "floor"),
           ...(openings.windowAppliedLocally
             ? [`the upstream rejected the closed_at filter (${openings.dateParamsRejected.join(", ")}), so the window was applied locally to the complete scoped set of closed openings`]
             : []),
@@ -1052,46 +1107,74 @@ export function hireReconciliationSummary(line: HireReconciliationLine): string 
   sentences.push(
     line.accepted_current_offers.not_read
       ? "Accepted current offers were not read."
-      : `${countValue(line.accepted_current_offers)} accepted current offers${withheldClause(line.accepted_current_offers)}, dated on ${line.accepted_current_offers.clock} over ${line.window.label} across ${line.scope.label}${datedFromFallbackClause(line.accepted_current_offers)}.`
+      : `${countValue(line.accepted_current_offers)} accepted current offers${withheldClause(line.accepted_current_offers)}, dated on ${line.accepted_current_offers.clock} over ${line.window.label} across ${line.scope.label}${datedFromFallbackClause(line.accepted_current_offers)}${uncertaintyClause(line.accepted_current_offers)}.`
   );
   sentences.push(
     line.accepted_offer_applications_marked_hired.not_read
       ? `The accepted set's applications were not read${line.accepted_offer_applications_marked_hired.notes.length > 0 ? ` — ${line.accepted_offer_applications_marked_hired.notes[0]}` : "."}`
-      : `${countValue(line.accepted_offer_applications_marked_hired)} of those applications are marked hired in Greenhouse${withheldClause(line.accepted_offer_applications_marked_hired)} — ${line.accepted_offer_applications_marked_hired.clock}, so it trails the offer count until the hire endpoint fires.`
+      : `${countValue(line.accepted_offer_applications_marked_hired)} of those applications are marked hired in Greenhouse${withheldClause(line.accepted_offer_applications_marked_hired)}${uncertaintyClause(line.accepted_offer_applications_marked_hired)} — ${line.accepted_offer_applications_marked_hired.clock}, so it trails the offer count until the hire endpoint fires.`
   );
   sentences.push(
     line.openings_closed_by_hire.not_read
       ? "Openings closed by a hire were not read."
-      : `${countValue(line.openings_closed_by_hire)} openings closed on a hire reason${withheldClause(line.openings_closed_by_hire)}, dated on ${line.openings_closed_by_hire.clock}; ${line.openings_closed_by_hire.closed_with_no_reason} closed with no reason at all and ${line.openings_closed_by_hire.closed_reason_unresolved} on a reason this read could not resolve, so neither can be called a hire or a cancel.`
+      : `${countValue(line.openings_closed_by_hire)} openings closed on a hire reason${withheldClause(line.openings_closed_by_hire)}, dated on ${line.openings_closed_by_hire.clock}${uncertaintyClause(line.openings_closed_by_hire)}; ${line.openings_closed_by_hire.closed_with_no_reason} closed with no reason at all and ${line.openings_closed_by_hire.closed_reason_unresolved} on a reason this read could not resolve, so neither can be called a hire or a cancel.`
   );
   sentences.push(
     line.offer_rows_per_hire.not_read
       ? "Superseded versions were not read, so offer rows per hire is not reported."
       : line.offer_rows_per_hire.value === null
         ? "There are no hires in this window, so offer rows per hire is undefined rather than zero."
-        : `${countValue(line.offer_rows_per_hire)} offer rows per hire across every version${withheldClause(line.offer_rows_per_hire)}.`
+        : `${countValue(line.offer_rows_per_hire)} offer rows per hire across every version${withheldClause(line.offer_rows_per_hire)}${uncertaintyClause(line.offer_rows_per_hire)}.`
   );
   if (line.applications_status_hired_scope_all_time) {
     sentences.push(
       line.applications_status_hired_scope_all_time.not_read
         ? "The all-time hired-application count was asked for but could not be read."
-        : `Separately, and over all time rather than ${line.window.label}: ${countValue(line.applications_status_hired_scope_all_time)} applications in scope carry status=hired${withheldClause(line.applications_status_hired_scope_all_time)}.`
+        : `Separately, and over all time rather than ${line.window.label}: ${countValue(line.applications_status_hired_scope_all_time)} applications in scope carry status=hired${withheldClause(line.applications_status_hired_scope_all_time)}${uncertaintyClause(line.applications_status_hired_scope_all_time)}.`
     );
   }
   sentences.push("These count different populations on different clocks; they are not expected to match, and no total across them is meaningful.");
   return sentences.join(" ");
 }
 
-/** Which read stopped, on the count it made a floor of. Empty when the read finished. */
-function floorNotes(complete: boolean, which: string, status: ReadAllStatus): string[] {
-  return complete
-    ? []
-    : [`${which} stopped before it had read everything in scope (${status}), so this count is a floor rather than the number`];
+/**
+ * `partial` and, when it is true, WHICH reading of partial. Spread onto the count so the two
+ * always travel together and a completed read can never carry a stray `partial_reading`.
+ */
+function partialReading(
+  partial: boolean,
+  reading: "floor" | "uncertain"
+): { partial: boolean; partial_reading?: "floor" | "uncertain" } {
+  return partial ? { partial: true, partial_reading: reading } : { partial: false };
 }
 
-/** "at least 50" when the read behind the count stopped early; "50" when it finished. */
+/** Which read stopped, and what that does to the count. Empty when the read finished. */
+function shortReadNotes(
+  complete: boolean,
+  which: string,
+  status: ReadAllStatus,
+  reading: "floor" | "uncertain"
+): string[] {
+  if (complete) return [];
+  const consequence = reading === "floor"
+    ? "so this count is a floor rather than the number"
+    : "so this count is uncertain rather than the number — it can be higher or lower once the rest is read";
+  return [`${which} stopped before it had read everything in scope (${status}), ${consequence}`];
+}
+
+/** "at least 50" for a floor; the bare value for an uncertainty, which the sentence then qualifies. */
 function countValue(count: ReconciliationCount): string {
-  return `${count.partial ? "at least " : ""}${count.value}`;
+  return `${count.partial && count.partial_reading === "floor" ? "at least " : ""}${count.value}`;
+}
+
+/**
+ * The qualifier a floor does NOT need: an "at least" already says which way the number can move,
+ * whereas an uncertain value has to say out loud that it can move either way.
+ */
+function uncertaintyClause(count: ReconciliationCount): string {
+  return count.partial && count.partial_reading === "uncertain"
+    ? " — from a partial read; the true value may be higher or lower"
+    : "";
 }
 
 /** The labeled approximation, said out loud: N of these hires are dated off the send date. */

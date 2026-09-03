@@ -39,6 +39,16 @@ export interface DateFallbackOutcome<T extends Record<string, unknown>> {
   /** Rows dropped by the local window because they carried none of those fields. */
   rowsMissingField: number;
   /**
+   * The rows as the upstream returned them, BEFORE the local window ran — set only on the leg where
+   * the native filter was rejected and the window had to be applied here.
+   *
+   * It exists for one caller: the fallback-field legs, which have to decide which rows are theirs
+   * (the ones no earlier field can date) BEFORE the window drops anything, or their missing-date
+   * count is taken over the whole scoped set and reports rows the primary field dates perfectly
+   * well as undatable. Never the set an answer is computed from — `read.rows` is.
+   */
+  rowsBeforeLocalWindow?: T[];
+  /**
    * The declared fallback fields this read ALSO asked the upstream for, on the leg where the
    * native filter WORKED. Empty when no fallback field was declared, or when the native filter was
    * rejected and the whole window ran locally instead.
@@ -163,7 +173,10 @@ export async function readAllWithDateFallback<T extends Record<string, unknown>>
       windowAppliedLocally: false,
       dateParamsRejected: [],
       windowFields,
-      rowsMissingField: 0,
+      // The supplemental legs' own missing-date count, folded up rather than dropped: a leg that
+      // re-read unwindowed and found a row carrying NEITHER clock is the only place that number
+      // exists, and hardcoding zero here reported a read that had lost rows as one that had not.
+      rowsMissingField: supplement.rowsMissingField,
       fallbackFieldsQueried: supplement.fieldsQueried,
       fallbackFieldRowsAdded: supplement.rows.length,
       fallbackFieldPrivacyWithheld: supplement.privacyWithheld,
@@ -193,6 +206,7 @@ export async function readAllWithDateFallback<T extends Record<string, unknown>>
     const windowed = applyLocalWindow(read.rows, windowSpecs);
     return {
       read: { ...read, rows: windowed.rows },
+      rowsBeforeLocalWindow: read.rows,
       windowAppliedLocally: true,
       dateParamsRejected: rejected.sort(),
       windowFields,
@@ -210,6 +224,8 @@ interface FallbackLegResult<T extends Record<string, unknown>> {
   rawRowsRead: number;
   pagesRead: number;
   privacyWithheld: number;
+  /** Rows THIS leg was responsible for that carried no parseable value in its own field. */
+  rowsMissingField: number;
   statuses: ReadAllStatus[];
   warnings: string[];
   /** Legs ATTEMPTED, including ones that returned nothing or failed. Drives the read merge. */
@@ -254,6 +270,7 @@ async function readFallbackFieldLegs<T extends Record<string, unknown>>(
     rawRowsRead: 0,
     pagesRead: 0,
     privacyWithheld: 0,
+    rowsMissingField: 0,
     statuses: [],
     warnings: [],
     legsRun: 0,
@@ -307,17 +324,37 @@ async function readFallbackFieldLegs<T extends Record<string, unknown>>(
           `the upstream rejected the ${field} filter (${outcome.dateParamsRejected.join(", ")}), so that leg's window was applied locally to the complete scoped set`
         );
       }
-      // Only the rows this leg alone can supply: everything earlier in the fallback order absent.
+      // Only the rows this leg alone can supply: everything earlier in the fallback order carries
+      // no USABLE date. "Usable" is `Date.parse` succeeding, the same test facts.ts applies before
+      // it will date a hire on a field — an unparseable `resolved_at` is not a date, so the row is
+      // this leg's to recover rather than one the primary leg silently dropped.
+      //
+      // Selected from the rows BEFORE the leg's own local window ran: the window drops every row
+      // without the leg's field, including rows the primary field dates fine, so counting missing
+      // dates after it would report most of the scoped set as undatable.
       const earlier = [spec.field, ...fallbacks.slice(0, index)];
-      const recovered = read.rows.filter((row) => earlier.every((name) => !isPresentString(row[name])));
-      result.rows.push(...applyLocalWindow(recovered, [legSpec]).rows);
+      const source = outcome.rowsBeforeLocalWindow ?? read.rows;
+      const recovered = source.filter((row) => earlier.every((name) => parseableDate(row[name]) === null));
+      const windowed = applyLocalWindow(recovered, [legSpec]);
+      result.rows.push(...windowed.rows);
+      result.rowsMissingField += windowed.missing;
     }
   }
   return result;
 }
 
-function isPresentString(value: unknown): boolean {
-  return typeof value === "string" && value.length > 0;
+/**
+ * A date field's value, or null when the field carries nothing this code will treat AS a date.
+ *
+ * Non-empty is not enough. `{ resolved_at: "garbage", sent_on: "2026-05-05" }` used to read as
+ * "the primary field is present", which both suppressed the declared sent_on fallback and lost the
+ * row to a string comparison against the window's upper bound — dropped, uncounted, on a read that
+ * still reported complete. Parseability is the same test facts.ts already applies (timestampField)
+ * before it will date a hire on a field, so the read layer and the fact layer now agree.
+ */
+function parseableDate(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return Number.isFinite(Date.parse(value)) ? value : null;
 }
 
 /** The `read.window_applied_locally` envelope, or undefined when the native filter held. */
@@ -328,30 +365,54 @@ export function localWindowDisclosure<T extends Record<string, unknown>>(
   return { fields: outcome.windowFields, rows_missing_field: outcome.rowsMissingField, note: LOCAL_WINDOW_NOTE };
 }
 
-// Date-only bounds (YYYY-MM-DD) are END-of-day inclusive for upper bounds under local windowing —
-// a timestamp ON the lte date must stay in-window, matching the upstream filters' semantics.
+// Date-only bounds (YYYY-MM-DD) are END-of-day inclusive for INCLUSIVE upper bounds under local
+// windowing — a timestamp ON the lte date must stay in-window, matching the upstream filters'
+// semantics. It applies to `lte` and to nothing else: expanding an EXCLUSIVE lower bound to the end
+// of its day excluded `2026-05-01T12:00:00Z` under `gt: "2026-05-01"`, which is a full day of rows
+// the caller asked for, dropped by a bound that was supposed to admit them.
 const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
-function upperBound(bound: string): string {
-  return DATE_ONLY_PATTERN.test(bound) ? `${bound}T23:59:59.999Z` : bound;
+function boundInstant(bound: string, field: string, operator: string): number {
+  const at = Date.parse(bound);
+  if (!Number.isFinite(at)) {
+    // Loud rather than silent. A bound nobody can parse would otherwise compare false against
+    // everything and quietly widen the window to all time.
+    throw new Error(`Local date window received an unparseable ${field}[${operator}] bound: ${bound}`);
+  }
+  return at;
+}
+
+function inclusiveUpperInstant(bound: string, field: string): number {
+  return boundInstant(DATE_ONLY_PATTERN.test(bound) ? `${bound}T23:59:59.999Z` : bound, field, "lte");
 }
 
 export function applyLocalWindow<T extends Record<string, unknown>>(
   rows: T[],
   specs: readonly DateWindowSpec[]
 ): { rows: T[]; missing: number } {
+  // Bounds are compared as INSTANTS, not as strings: "2026-05-01" and "2026-05-01T00:00:00.000Z"
+  // are the same moment and sorted differently as text, and a string comparison is what let a
+  // malformed value ("garbage") lose an inequality and disappear.
+  const bounds = specs.map((spec) => ({
+    spec,
+    gte: spec.gte === undefined ? null : boundInstant(spec.gte, spec.field, "gte"),
+    gt: spec.gt === undefined ? null : boundInstant(spec.gt, spec.field, "gt"),
+    lte: spec.lte === undefined ? null : inclusiveUpperInstant(spec.lte, spec.field),
+    lt: spec.lt === undefined ? null : boundInstant(spec.lt, spec.field, "lt"),
+  }));
   let missing = 0;
   const kept = rows.filter((row) => {
-    for (const spec of specs) {
-      const value = firstPresentField(row, spec);
+    for (const bound of bounds) {
+      const value = firstPresentField(row, bound.spec);
       if (value === null) {
         missing += 1;
         return false;
       }
-      if (spec.gte && value < spec.gte) return false;
-      if (spec.gt && value <= upperBound(spec.gt)) return false;
-      if (spec.lte && value > upperBound(spec.lte)) return false;
-      if (spec.lt && value >= spec.lt) return false;
+      const at = Date.parse(value);
+      if (bound.gte !== null && at < bound.gte) return false;
+      if (bound.gt !== null && at <= bound.gt) return false;
+      if (bound.lte !== null && at > bound.lte) return false;
+      if (bound.lt !== null && at >= bound.lt) return false;
     }
     return true;
   });
@@ -360,8 +421,8 @@ export function applyLocalWindow<T extends Record<string, unknown>>(
 
 function firstPresentField(row: Record<string, unknown>, spec: DateWindowSpec): string | null {
   for (const field of [spec.field, ...(spec.fallbackFields ?? [])]) {
-    const value = row[field];
-    if (typeof value === "string" && value.length > 0) return value;
+    const value = parseableDate(row[field]);
+    if (value !== null) return value;
   }
   return null;
 }

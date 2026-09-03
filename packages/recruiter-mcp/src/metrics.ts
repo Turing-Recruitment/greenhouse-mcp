@@ -14,7 +14,7 @@ import type {
   ScorecardFact,
   ScorecardQuestionAnswerFact,
 } from "./facts.js";
-import { classifyOfferStatus } from "./facts.js";
+import { classifyOfferStatus, type OfferStatusClass } from "./facts.js";
 import type { RecruiterProjectionProfileName } from "./types.js";
 
 export type MetricFactName =
@@ -73,6 +73,18 @@ export interface MetricComputeContext {
     permissionExcluded?: number;
     /** Offers excluded by the window for having no resolved_at while still being unresolved. */
     offersOutstanding?: number;
+    /**
+     * Every offer the window could NOT place, counted by its verbatim status.
+     *
+     * The window runs on `resolved_at`, so a row without one is removed before the metric sees it.
+     * Removing it silently made the mix contradict itself: the outstanding count re-entered
+     * `groups` while `total` had never counted it, so three grouped offers sat under an omission
+     * that said zero were unresolved, and an unrecognized status with no timestamp skipped its own
+     * disclosure. These rows are counted in `total` and in `groups`, classified by the SAME
+     * classifier as the rest of the mix, and never folded into the rate: a row the window cannot
+     * place cannot be claimed as accepted or rejected inside it.
+     */
+    statusesWithoutWindowField?: Record<string, number>;
     /** Whether the full version chain was read. False means re-extension counts are not claimed. */
     supersededVersionsRead?: boolean;
   };
@@ -604,6 +616,29 @@ function computeOpeningFillStatus(context: MetricComputeContext): MetricResult {
   };
 }
 
+/**
+ * The group an offer the window could not place is counted under, by what its status MEANS.
+ *
+ * Not by its verbatim value: `outstanding_no_resolved_at` is the group every consumer already
+ * reads, and splitting it per tenant status string would break that while saying nothing extra —
+ * the verbatim values are named in the omissions instead.
+ */
+type OfferStatusClassGroup =
+  | "outstanding_no_resolved_at"
+  | "superseded_no_resolved_at"
+  | "unrecognized_status_no_resolved_at"
+  | "resolved_status_no_resolved_at";
+
+const UNDATED_GROUP_BY_CLASS: Record<OfferStatusClass, OfferStatusClassGroup> = {
+  outstanding: "outstanding_no_resolved_at",
+  superseded: "superseded_no_resolved_at",
+  unknown: "unrecognized_status_no_resolved_at",
+  // An offer that says it was accepted or rejected but carries no resolved_at is a real data gap,
+  // not a normal state. It is counted and named apart from the offers that are simply still out.
+  accepted: "resolved_status_no_resolved_at",
+  rejected: "resolved_status_no_resolved_at",
+};
+
 function computeOfferResolutionMix(context: MetricComputeContext): MetricResult {
   const readiness = metricReadiness("offer_resolution", offerFacts(context));
   if (readiness) return readiness;
@@ -624,16 +659,40 @@ function computeOfferResolutionMix(context: MetricComputeContext): MetricResult 
     else if (offerClass === "rejected") rejected += 1;
     else if (offerClass === "unknown") unrecognized.set(key, (unrecognized.get(key) ?? 0) + 1);
   }
+  // The offers the window could not place, classified BEFORE it removed them. Each one joins
+  // `total` and a group of its own class, and none of them joins the rate: a row with no
+  // resolved_at cannot be claimed as accepted or rejected INSIDE a resolved_at window.
+  const undated = context.offerRead?.statusesWithoutWindowField;
+  const undatedByClass = new Map<OfferStatusClassGroup, number>();
+  if (undated) {
+    for (const [status, count] of Object.entries(undated)) {
+      total += count;
+      const offerClass = classifyOfferStatus(status);
+      undatedByClass.set(UNDATED_GROUP_BY_CLASS[offerClass], (undatedByClass.get(UNDATED_GROUP_BY_CLASS[offerClass]) ?? 0) + count);
+      // An unrecognized status is unrecognized whether or not it carried a date. Skipping the
+      // disclosure for the undated ones is how a renamed tenant status moves a rate unremarked.
+      if (offerClass === "unknown") unrecognized.set(status, (unrecognized.get(status) ?? 0) + count);
+    }
+  }
   const resolved = accepted + rejected;
   // The offers that were sent and have not come back. Windowing on `resolved_at` — the clock every
   // published hire report uses — structurally excludes them, because an unresolved offer has no
   // resolved_at to place. Before this they simply vanished, and the "N unresolved excluded"
   // disclosure below was a guaranteed 0 sitting under an answer that had silently dropped them.
-  // They are counted, grouped and named instead.
-  const outstanding = context.offerRead?.offersOutstanding ?? 0;
+  // They are counted, grouped and named instead. The reader's own tally is the fallback for a
+  // caller that hands over `offersOutstanding` without the fuller class breakdown.
+  const outstanding = undated
+    ? undatedByClass.get("outstanding_no_resolved_at") ?? 0
+    : context.offerRead?.offersOutstanding ?? 0;
+  if (!undated && outstanding > 0) {
+    total += outstanding;
+    undatedByClass.set("outstanding_no_resolved_at", outstanding);
+  }
   const groups: Array<Record<string, string | number | null>> = [
     ...[...byStatus.entries()].map(([offer_status, offer_count]) => ({ offer_status, offer_count })),
-    ...(outstanding > 0 ? [{ offer_status: "outstanding_no_resolved_at", offer_count: outstanding }] : []),
+    ...[...undatedByClass.entries()]
+      .filter(([, offer_count]) => offer_count > 0)
+      .map(([offer_status, offer_count]) => ({ offer_status, offer_count })),
   ];
   const readOmissions: string[] = [];
   if (unrecognized.size > 0) {
@@ -647,6 +706,18 @@ function computeOfferResolutionMix(context: MetricComputeContext): MetricResult 
   if (outstanding > 0) {
     readOmissions.push(
       `offers_outstanding: ${outstanding} offer(s) in scope are still open (no resolved_at yet), so the resolved_at window cannot place them and they are outside the rate. They are counted here rather than dropped.`
+    );
+  }
+  const supersededUndated = undatedByClass.get("superseded_no_resolved_at") ?? 0;
+  if (supersededUndated > 0) {
+    readOmissions.push(
+      `${supersededUndated} superseded offer version(s) carry no resolved_at; they are counted in the mix and are outside the rate, because a superseded version is a previous draft rather than an outcome.`
+    );
+  }
+  const resolvedUndated = undatedByClass.get("resolved_status_no_resolved_at") ?? 0;
+  if (resolvedUndated > 0) {
+    readOmissions.push(
+      `${resolvedUndated} offer(s) say they were accepted or rejected but carry no resolved_at, so no window can place them. They are counted in the mix and left out of the rate rather than dated by guesswork.`
     );
   }
   const rawRowsRead = context.offerRead?.rawRowsRead;

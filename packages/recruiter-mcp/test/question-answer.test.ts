@@ -1424,3 +1424,200 @@ describe("H3b the planner's offer path contains its own errors", () => {
     assert.equal(events[0]!.denialCode, "UPSTREAM_ERROR");
   });
 });
+
+// ---------------------------------------------------------------------------
+// H3d: what the planner PUBLISHES as complete is the answer's completeness, not
+// the offer read's.
+//
+// The bridge is a second population the lead sentence needs. When it failed, the
+// answer kept the metric (right) and still published `read.complete: true` off
+// the offer read alone (wrong): the envelope said the whole answer was complete
+// while half its reconciliation had never been read.
+// ---------------------------------------------------------------------------
+describe("H3d the planner's published completeness covers every read the answer used", () => {
+  function offerRows() {
+    return [
+      { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01", resolved_at: "2026-06-05T10:00:00.000Z" },
+      { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-06-02", resolved_at: "2026-06-06T10:00:00.000Z" },
+    ];
+  }
+
+  it("marks the answer incomplete_upstream when the requested bridge failed", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") return scopedSuccess(toolName, offerRows());
+      if (toolName === "list_applications") {
+        throw new Error("Greenhouse API error: 500 Internal Server Error (/applications) [correlation_id=test]");
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, true, "the metric that was computed still answers");
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.completeness_status, "incomplete_upstream");
+    assert.equal(data.answer.read.complete, false, "the ANSWER is not complete; one of its reads failed");
+    assert.equal(data.answer.read.status, "incomplete_upstream");
+    assert.equal(data.answer.read.offer_read.complete, true, "the offer read's own verdict is kept, and labelled as its own");
+  });
+
+  it("still publishes complete when every read the answer used finished", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") return scopedSuccess(toolName, offerRows());
+      if (toolName === "list_applications") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.completeness_status, "complete");
+    assert.equal(data.answer.read.complete, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H3e: a row is classified BEFORE the window removes it, or the mix contradicts
+// itself.
+//
+// The planned-domain filter drops every fact with no parseable window field, so
+// those rows left the metric's `total` while the outstanding count re-entered its
+// `groups` — three offers in a group under a metric whose value counted none of
+// them, and a generic "0 unresolved excluded" omission printed underneath. An
+// unrecognized status with no timestamp went further: it skipped the unknown
+// disclosure entirely.
+// ---------------------------------------------------------------------------
+describe("H3e the offer mix counts what the window could not place", () => {
+  function readerFor(rows: Array<Record<string, unknown>>) {
+    return fakeScopedReader((toolName, params) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") return scopedSuccess(toolName, rows);
+      if (toolName === "list_applications") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+  }
+
+  const RESOLVED = [
+    { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01", resolved_at: "2026-06-05T10:00:00.000Z" },
+    { id: 2, job_id: 10, application_id: 102, status: "Accepted", sent_on: "2026-06-02", resolved_at: "2026-06-06T10:00:00.000Z" },
+    { id: 3, job_id: 10, application_id: 103, status: "Rejected", sent_on: "2026-06-03", resolved_at: "2026-06-07T10:00:00.000Z" },
+  ];
+  const OUTSTANDING = [4, 5, 6].map((id) => ({
+    id, job_id: 10, application_id: 100 + id, status: "Created", sent_on: "2026-06-10",
+  }));
+
+  it("makes '<n> unresolved' equal the outstanding group, not zero", async () => {
+    const { runtime } = testRuntime(readerFor([...RESOLVED, ...OUTSTANDING]));
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    const data = result.ok ? (result.data as any) : null;
+    const groups = data.answer.metric.groups as Array<Record<string, unknown>>;
+    const outstanding = groups.find((group) => group.offer_status === "outstanding_no_resolved_at");
+    assert.equal(outstanding?.offer_count, 3);
+    const omissions = data.answer.metric.omissions as string[];
+    assert.ok(
+      omissions.some((line) => /3 unresolved offer\(s\) excluded from the rate/.test(line)),
+      `the arithmetic under the mix must match the group above it, got ${JSON.stringify(omissions)}`
+    );
+    assert.ok(
+      !omissions.some((line) => /0 unresolved offer\(s\)/.test(line)),
+      "a guaranteed zero printed under three grouped offers is the contradiction itself"
+    );
+  });
+
+  it("discloses an unrecognized status the window could not place", async () => {
+    const rows = [
+      ...RESOLVED,
+      { id: 7, job_id: 10, application_id: 107, status: "Verbal yes", sent_on: "2026-06-11" },
+    ];
+    const { runtime } = testRuntime(readerFor(rows));
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    const data = result.ok ? (result.data as any) : null;
+    const omissions = data.answer.metric.omissions as string[];
+    assert.ok(
+      omissions.some((line) => /outside the published \/v3\/offers enum/.test(line) && /Verbal yes \(1\)/.test(line)),
+      `an unrecognized status is named whether or not it carried a date, got ${JSON.stringify(omissions)}`
+    );
+    const groups = data.answer.metric.groups as Array<Record<string, unknown>>;
+    assert.ok(
+      groups.some((group) => group.offer_status === "unrecognized_status_no_resolved_at" && group.offer_count === 1),
+      `and it is counted in a group of its own, got ${JSON.stringify(groups)}`
+    );
+    assert.equal(data.answer.metric.denominator, 3, "it is NOT folded into the rate on a guess");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H3f: one status vocabulary for the whole answer, asserted on the ANSWER.
+//
+// classifyOfferStatus was unit-tested, so restoring substring logic in the metric
+// or in the planner's own lead passed the suite. This asserts the four consumers
+// together on one read: the rate's denominator, the ids the reconciliation bridge
+// asks for, the outstanding group, and the unknown-status disclosure.
+// ---------------------------------------------------------------------------
+describe("H3f the planner's four status consumers agree on one read", () => {
+  it("keeps 'Not Accepted' and 'Verbal yes' out of the rate, the lead and the outstanding group", async () => {
+    const rows = [
+      { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01", resolved_at: "2026-06-05T10:00:00.000Z" },
+      { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-06-02", resolved_at: "2026-06-06T10:00:00.000Z" },
+      { id: 3, job_id: 10, application_id: 103, status: "Not Accepted", sent_on: "2026-06-03", resolved_at: "2026-06-07T10:00:00.000Z" },
+      { id: 4, job_id: 10, application_id: 104, status: "Verbal yes", sent_on: "2026-06-04", resolved_at: "2026-06-08T10:00:00.000Z" },
+      { id: 5, job_id: 10, application_id: 105, status: "Created", sent_on: "2026-06-10" },
+    ];
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") return scopedSuccess(toolName, rows);
+      if (toolName === "list_applications") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    // 1. the rate: one accepted over one accepted + one rejected. "Not Accepted" is not a rejection.
+    assert.equal(data.answer.metric.numerator, 1);
+    assert.equal(data.answer.metric.denominator, 2);
+    // 2. the reconciliation bridge asks only about the offer that really was accepted.
+    const bridged = reader.calls.filter((call) => call.toolName === "list_applications");
+    assert.equal(bridged.length, 1);
+    assert.deepStrictEqual(String(bridged[0]!.params?.ids ?? "").split(",").sort(), ["101"]);
+    assert.match(String(data.answer.message), /^1 accepted current offers; 1 of their applications is marked hired/);
+    // 3. the outstanding group is the Created offer alone — an unknown status is not "still open".
+    const groups = data.answer.metric.groups as Array<Record<string, unknown>>;
+    assert.equal(groups.find((group) => group.offer_status === "outstanding_no_resolved_at")?.offer_count, 1);
+    // 4. and both unrecognized values are named rather than bucketed.
+    const omissions = data.answer.metric.omissions as string[];
+    assert.ok(
+      omissions.some((line) => /Not Accepted \(1\)/.test(line) && /Verbal yes \(1\)/.test(line)),
+      `both unrecognized statuses are named, got ${JSON.stringify(omissions)}`
+    );
+  });
+});

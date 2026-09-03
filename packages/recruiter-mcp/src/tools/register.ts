@@ -135,8 +135,11 @@ const evidencePackSchema = {
   evidence_pack_limit: z.number().int().positive().optional().describe("Maximum evidence references returned in evidence_pack, capped by the runtime."),
 };
 
+// `.trim().min(1)`, not a bare string: a present-but-BLANK handle is a scope the caller named and
+// then emptied, and the planner used to read it as absent and answer across everything the actor's
+// Greenhouse permissions reach. Absent still means permission-wide; blank means nothing at all.
 const scopeHandleSchema = {
-  scope_handle: z.string().optional().describe("Signed scope_handle from resolve_job_scope/confirm_job_scope. Preferred over job_ids; if both are present, scope_handle wins. Free-text job/role inputs are rejected here — resolve scope first."),
+  scope_handle: z.string().trim().min(1).optional().describe("Signed scope_handle from resolve_job_scope/confirm_job_scope. Preferred over job_ids; if both are present, scope_handle wins. Free-text job/role inputs are rejected here — resolve scope first."),
 };
 
 const jobScopeFiltersSchema = z
@@ -423,8 +426,10 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
         query: z.string().optional().describe("Optional structured job/role intent extracted from the question; resolved server-side before analysis."),
         aliases: z.array(z.string()).optional().describe("Optional acronyms/aliases (e.g. FDE) to resolve before analysis."),
         role_families: z.array(z.string()).optional().describe("Optional role-family phrases to resolve before analysis."),
-        requisition_ids: z.array(z.string()).optional().describe("Optional requisition ids to resolve before analysis."),
-        greenhouse_job_ids: z.array(z.number().int().positive()).optional().describe("Optional exact Greenhouse job ids to validate and resolve before analysis."),
+        // `.nonempty()` for the same reason as scope_handle above: an EMPTY explicit id list names a
+        // scope of zero reqs, and reading it as absent answered across the whole permitted book.
+        requisition_ids: z.array(z.string()).nonempty().optional().describe("Optional requisition ids to resolve before analysis. Omit the key entirely to analyze across every job your permissions return; an empty list is rejected."),
+        greenhouse_job_ids: z.array(z.number().int().positive()).nonempty().optional().describe("Optional exact Greenhouse job ids to validate and resolve before analysis. Omit the key entirely to analyze across every job your permissions return; an empty list is rejected."),
         // Generated from the planner's own executable list. The hand-written copy this replaces had
         // gone stale: it omitted rejection_reason_drift, and the alias parser silently DROPS a token
         // it does not know, so a model asking for the unlisted recipe got a different analysis with
