@@ -26,6 +26,44 @@ const ROUTING_ATTESTATION = {
   resumeInstructionsTreatedAsUntrusted: true,
 } as const;
 
+describe("desktop user-test evidence: the catalog it was taken against", () => {
+  /**
+   * `EXPECTED_CATALOG_TOOL_COUNTS` was consumed only inside an error-message string, so setting it to
+   * {1, 1} passed the whole suite, and the comment claiming "the counts still get checked" was false.
+   * Both numbers are derived assertions now, and the evidence records an observed count and an
+   * ordered-name hash the rollout gate re-derives — so evidence copied past a catalog change fails.
+   */
+  it("derives both attestation counts from the registrar rather than restating them", async () => {
+    const { EXPECTED_CATALOG_TOOL_COUNTS, catalogToolNamesHash } = await import("../src/desktop-user-test.js");
+    const { ACTION_DEFINITIONS } = await import("../../action-mcp/dist/index.js");
+    assert.equal(EXPECTED_CATALOG_TOOL_COUNTS.read_only_full_catalog, PILOT_TOOL_NAMES.length);
+    assert.equal(
+      EXPECTED_CATALOG_TOOL_COUNTS.write_entitled_full_catalog,
+      PILOT_TOOL_NAMES.length + 2 * ACTION_DEFINITIONS.length
+    );
+    // And the two catalogs are distinguishable: one hash for the read catalog, another for the read
+    // catalog plus the write plane.
+    assert.notEqual(
+      catalogToolNamesHash("read_only_full_catalog"),
+      catalogToolNamesHash("write_entitled_full_catalog")
+    );
+    assert.match(catalogToolNamesHash("read_only_full_catalog"), /^[0-9a-f]{64}$/);
+  });
+
+  it("hashes the ORDER, not just the membership", async () => {
+    const { catalogToolNamesHash } = await import("../src/desktop-user-test.js");
+    const { createHash } = await import("node:crypto");
+    const reordered = createHash("sha256")
+      .update([...PILOT_TOOL_NAMES].reverse().join("\n"))
+      .digest("hex");
+    assert.notEqual(catalogToolNamesHash("read_only_full_catalog"), reordered);
+    assert.equal(
+      catalogToolNamesHash("read_only_full_catalog"),
+      createHash("sha256").update([...PILOT_TOOL_NAMES].join("\n")).digest("hex")
+    );
+  });
+});
+
 describe("desktop user-test evidence", () => {
   it("builds token-free attestation evidence bound to issued and desktop manifests", async () => {
     const tmp = await mkdtemp(join(tmpdir(), "greenhouse-desktop-user-test-"));
@@ -57,6 +95,8 @@ describe("desktop user-test evidence", () => {
 
     assert.equal(report.status, "pass");
     assert.equal(report.containsTokens, false);
+    assert.equal(report.catalogToolCount, PILOT_TOOL_NAMES.length, "the evidence records the catalog it saw");
+    assert.match(report.catalogToolNamesHash, /^[0-9a-f]{64}$/);
     assert.equal(report.testerEmail, "recruiter.one@company.com");
     assert.equal(report.sessionTokenId, "chatgpt-token-id");
     assert.equal(report.sessionTokenIdAfterRestart, "chatgpt-token-id");

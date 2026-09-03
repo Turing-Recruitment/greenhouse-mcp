@@ -8,11 +8,12 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(scriptDir, "..");
 const repoRoot = resolve(packageRoot, "..", "..", "..");
 const dockerfilePath = "packages/recruiter-mcp/deploy/Dockerfile";
-// The size of the mounted read catalog. R2a made the registrar the catalog — every registered read
-// tool is exposed and nothing is hidden — so this equals RECRUITER_TOOL_DEFINITIONS.length. This file
-// is plain .mjs and cannot import the TypeScript source, so the number is a literal that
-// test/deployment-artifacts.test.ts asserts against PILOT_TOOL_NAMES.length; it cannot drift silently.
-const EXPECTED_CATALOG_TOOL_COUNT = 82;
+// No catalog SIZE literal lives here any more. The container's own self-check already asserts the
+// exact ordered catalog against the registrar it was built from (container-self-check.ts,
+// assertExactCatalog) — a stronger check than a count, and one this file cannot get wrong. What the
+// smoke test verifies is that the self-check ran and reported a catalog it is happy with: a positive
+// count, and nothing hidden. Pinning a second copy of the number here only ever produced a second
+// place to forget to update.
 const imageTag = process.env.GREENHOUSE_RECRUITER_DOCKER_SMOKE_IMAGE ?? "greenhouse-recruiter-mcp:smoke";
 const shouldRunContainer = process.env.GREENHOUSE_RECRUITER_DOCKER_SMOKE_RUN === "true";
 const hostPort = normalizePort(process.env.GREENHOUSE_RECRUITER_DOCKER_SMOKE_PORT);
@@ -162,9 +163,11 @@ function runDockerJson(args) {
     if (
       parsed?.ok !== true ||
       parsed?.authenticatedHttpSimulated !== false ||
-      // R2a: the registrar IS the catalog, so nothing is hidden. The self-check derives both numbers
-      // from RECRUITER_TOOL_DEFINITIONS; asserting hidden === 0 is the smoke test's copy of that.
-      parsed?.catalogToolCount !== EXPECTED_CATALOG_TOOL_COUNT ||
+      // R2a: the registrar IS the catalog, so nothing is hidden. The self-check proved the exact
+      // ordered list inside the container; these two are the shape of its answer, not a second copy
+      // of the number.
+      !Number.isInteger(parsed?.catalogToolCount) ||
+      parsed?.catalogToolCount <= 0 ||
       parsed?.hiddenToolCount !== 0 ||
       parsed?.catalogOrder !== true ||
       parsed?.readOnlyAnnotations !== true ||

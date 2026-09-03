@@ -12,7 +12,7 @@ import {
 import { RECRUITER_MCP_READINESS_CHECK_NAMES } from "../src/readiness.js";
 import { PILOT_TOOL_NAMES } from "../src/tools/register.js";
 import { buildClaudeMcpb } from "../src/claude-mcpb.js";
-import { DESKTOP_ROUTING_CASES, DESKTOP_USER_TEST_EVIDENCE_WARNING, MIN_ROUTING_RUNS, ROUTING_TEST_VERSION } from "../src/desktop-user-test.js";
+import { DESKTOP_ROUTING_CASES, DESKTOP_USER_TEST_EVIDENCE_WARNING, EXPECTED_CATALOG_TOOL_COUNTS, MIN_ROUTING_RUNS, ROUTING_TEST_VERSION, catalogToolNamesHash } from "../src/desktop-user-test.js";
 import { ACTION_DEFINITIONS } from "../../action-mcp/dist/index.js";
 
 type DesktopSurface = "chatgpt_desktop" | "claude_desktop";
@@ -53,6 +53,8 @@ interface DesktopReportFixture {
   attachmentMethod: string;
   exercisedTools: string[];
   catalogAttestation: string;
+  catalogToolCount: number;
+  catalogToolNamesHash: string;
   containsTokens: boolean;
   taskOutcome: "useful" | "not_useful" | "could_not_use";
   taskOutcomeReason: "wrong_scope" | "timeout_error" | "installation_blocked" | "answer_received" | "not_yet_needed";
@@ -1542,7 +1544,11 @@ describe("rollout evidence gate", () => {
     const dir = await mkdtemp(join(tmpdir(), "greenhouse-rollout-gate-"));
     await writeCompleteEvidence(dir, {
       desktopOverrides: {
-        chatgpt_desktop: { catalogAttestation: "write_entitled_full_catalog" },
+        chatgpt_desktop: {
+          catalogAttestation: "write_entitled_full_catalog",
+          catalogToolCount: EXPECTED_CATALOG_TOOL_COUNTS.write_entitled_full_catalog,
+          catalogToolNamesHash: catalogToolNamesHash("write_entitled_full_catalog"),
+        },
       },
     });
 
@@ -1550,6 +1556,36 @@ describe("rollout evidence gate", () => {
     const check = report.checks.find((entry) => entry.name === "desktop_chatgpt_codex_host");
     assert.equal(check?.status, "pass");
     assert.equal(check?.details?.catalogAttestation, undefined, "pass details stay lean; the attestation is recorded in the evidence file");
+  });
+
+  it("fails desktop evidence recorded against a DIFFERENT catalog than the one shipping", async () => {
+    // The attestation is an enum, so evidence copied forward past a catalog change stayed green: the
+    // tester attested "the full catalog" and the full catalog had moved. The recorded ordered-name
+    // hash is re-derived here from the current catalog; a stale one no longer passes.
+    const dir = await mkdtemp(join(tmpdir(), "greenhouse-rollout-gate-stale-catalog-"));
+    await writeCompleteEvidence(dir, {
+      desktopOverrides: {
+        chatgpt_desktop: { catalogToolNamesHash: "0".repeat(64) },
+      },
+    });
+
+    const report = await runRolloutGate({ manifestPath: join(dir, "manifest.json") });
+    const check = report.checks.find((entry) => entry.name === "desktop_chatgpt_codex_host");
+    assert.equal(report.ok, false);
+    assert.equal(check?.status, "fail");
+    assert.equal(check?.details?.catalogToolNamesHash, "0".repeat(64));
+    assert.equal(check?.details?.expectedCatalogToolNamesHash, catalogToolNamesHash("read_only_full_catalog"));
+  });
+
+  it("fails desktop evidence whose recorded catalog COUNT is not the shipping one", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "greenhouse-rollout-gate-stale-count-"));
+    await writeCompleteEvidence(dir, {
+      desktopOverrides: { chatgpt_desktop: { catalogToolCount: 1 } },
+    });
+
+    const report = await runRolloutGate({ manifestPath: join(dir, "manifest.json") });
+    assert.equal(report.ok, false);
+    assert.equal(report.checks.find((entry) => entry.name === "desktop_chatgpt_codex_host")?.status, "fail");
   });
 
   it("fails desktop evidence from a tester email outside the preflighted roster", async () => {
@@ -2949,6 +2985,10 @@ function desktopReport(client: RecruiterClient, overrides: Partial<DesktopReport
     attachmentMethod: client === "claude_desktop_chat" ? "claude_desktop_mcpb" : client === "claude_code" ? "claude_code_http_mcp" : "chatgpt_developer_mode_remote_mcp",
     exercisedTools: ROUTING_TOOLS,
     catalogAttestation: "read_only_full_catalog",
+    // Recorded against the catalog the evidence was taken from; the gate recomputes both from the
+    // CURRENT catalog, so a fixture that ignores a catalog change fails exactly like stale evidence.
+    catalogToolCount: EXPECTED_CATALOG_TOOL_COUNTS.read_only_full_catalog,
+    catalogToolNamesHash: catalogToolNamesHash("read_only_full_catalog"),
     containsTokens: false,
     taskOutcome: "useful",
     taskOutcomeReason: "answer_received",

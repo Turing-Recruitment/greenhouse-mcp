@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmod, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { isClientSurfaceCompatible, isRecruiterClient, normalizeSessionIssuedAt, normalizeSessionTokenId } from "./auth.js";
@@ -38,6 +39,8 @@ const DESKTOP_USER_TEST_REPORT_FIELDS = new Set([
   "attachmentMethod",
   "exercisedTools",
   "catalogAttestation",
+  "catalogToolCount",
+  "catalogToolNamesHash",
   "containsTokens",
   "taskOutcome",
   "taskOutcomeReason",
@@ -332,6 +335,28 @@ export const EXPECTED_CATALOG_TOOL_COUNTS: Readonly<Record<DesktopCatalogAttesta
   write_entitled_full_catalog: PILOT_TOOL_NAMES.length + ACTION_DEFINITIONS.length * 2,
 };
 
+const ACTION_TOOL_NAMES: readonly string[] = ACTION_DEFINITIONS.flatMap((definition) => [
+  definition.previewTool,
+  definition.applyTool,
+]);
+
+/**
+ * The catalog this evidence was recorded against, as a hash of the ORDERED tool names.
+ *
+ * The attestation token carries no count on purpose (a count baked into the vocabulary invalidated
+ * recorded evidence on every catalog change and forced a rename across nine files). That left the
+ * evidence unable to say WHICH catalog the tester saw, so a copied file stayed green through the next
+ * catalog change — the exact staleness the release gate exists to catch. The hash is recorded here,
+ * at build time, and the rollout gate recomputes it from the CURRENT catalog and requires a match:
+ * change the catalog and yesterday's evidence stops passing, which is the point.
+ */
+export function catalogToolNamesHash(attestation: DesktopCatalogAttestation): string {
+  const names = attestation === "write_entitled_full_catalog"
+    ? [...PILOT_TOOL_NAMES, ...ACTION_TOOL_NAMES]
+    : [...PILOT_TOOL_NAMES];
+  return createHash("sha256").update(names.join("\n")).digest("hex");
+}
+
 export interface DesktopUserTestReport {
   status: "pass";
   surface: DesktopUserTestSurface;
@@ -350,6 +375,10 @@ export interface DesktopUserTestReport {
   attachmentMethod: DesktopAttachmentMethod;
   exercisedTools: string[];
   catalogAttestation: DesktopCatalogAttestation;
+  /** The number of tools the attestation stands for, so the runbook and the gate quote one figure. */
+  catalogToolCount: number;
+  /** sha256 of the ordered catalog names this evidence was recorded against (see catalogToolNamesHash). */
+  catalogToolNamesHash: string;
   containsTokens: false;
   taskOutcome: "useful" | "not_useful" | "could_not_use";
   taskOutcomeReason: "wrong_scope" | "timeout_error" | "installation_blocked" | "answer_received" | "not_yet_needed";
@@ -446,6 +475,8 @@ export async function buildDesktopUserTestEvidenceFromManifests(
     attachmentMethod,
     exercisedTools,
     catalogAttestation,
+    catalogToolCount: EXPECTED_CATALOG_TOOL_COUNTS[catalogAttestation],
+    catalogToolNamesHash: catalogToolNamesHash(catalogAttestation),
     containsTokens: false,
     ...taskOutcome,
     clientVersion,

@@ -18,6 +18,10 @@ import type { AuthenticatedSession } from "../src/types.js";
  *   after R2a+R2b, 70 tools       159,961 B      +  4,003 B              = 163,964 B (~41.0k tokens)
  *   after R2c,     70 tools       120,918 B      +  5,046 B              = 125,964 B (~31.5k tokens)
  *   after R2d,     81 tools       139,220 B      +  5,046 B              = 144,266 B (~36.1k tokens)
+ *   after the fold, 82 tools      140,255 B      +  5,173 B              = 145,428 B (~36.4k tokens)
+ *
+ * The fold added one reader (get_my_bulk_request, +821 B), the date preprocess (0 B — the advertised
+ * schema is the same string), and the copy corrections (+341 B across descriptions and instructions).
  *
  * So the surface ends at 81 read tools — 37 more than a recruiter could reach before week two — for
  * 8,654 B LESS than the 66-tool catalog cost, and 20,743 B less than the 44 mounted tools plus the
@@ -33,10 +37,16 @@ import type { AuthenticatedSession } from "../src/types.js";
  */
 
 /**
- * The ceiling: no growth over the 66-tool catalog this repo already had, after R2b and R2d add
- * sixteen tools and R2c adds a description to every previously bare parameter.
+ * The ceiling, RATCHETED to the measured figure plus a working margin rather than left at the round
+ * number the first pass picked. 150,000 left 5.7 KB of slack, which is four more tools' worth of
+ * growth that no test would have noticed. Measured after the fold: 145,428 B over 82 tools.
+ *
+ * The fold asked for 145,000. That predates get_my_bulk_request, which the same fold bound (+821 B),
+ * so the honest ratchet is just above the measurement, not below it — a budget the build cannot meet
+ * is a broken test, not a tighter budget. 146,000 leaves ~570 B: enough for a description edit, not
+ * enough for a new tool to arrive unannounced.
  */
-const BUDGET_BYTES = 150_000;
+const BUDGET_BYTES = 146_000;
 
 function session(): AuthenticatedSession {
   return { subject: "google-subject-sam", surface: "test", client: "claude_desktop_chat", tokenId: "recruiter-token-abc123" };
@@ -87,8 +97,8 @@ describe("R2c the catalog fits its context budget", () => {
     assert.ok(
       measured.totalBytes <= BUDGET_BYTES,
       `catalog is ${measured.totalBytes} B (${measured.toolsBytes} B tools + ${measured.instructionsBytes} B instructions) `
-        + `across ${measured.toolCount} tools, over the ${BUDGET_BYTES} B budget. The 66-tool catalog before R2c was `
-        + `152,920 B, so this is growth, not slimming.`
+        + `across ${measured.toolCount} tools, over the ${BUDGET_BYTES} B budget (measured at the fold: 145,428 B). `
+        + `The 66-tool catalog before R2c was 152,920 B, so this is growth, not slimming.`
     );
     // Instructions ride in the initialize payload, so they are part of the bill, not free.
     assert.ok(measured.instructionsBytes > 0, "instructions must actually reach the client");
@@ -146,16 +156,41 @@ describe("R2c the catalog fits its context budget", () => {
     // Several clients truncate server instructions around 2 KB. A convention stated after the cut is
     // a convention the model never reads, which is how the per-parameter restating started.
     const head = measured.instructions.slice(0, 2048);
-    for (const fragment of [
+    // One fragment per convention BULLET, each unique to that bullet. The previous list asserted
+    // "scope_handle" — a string the routing ladder above the conventions also contains, so deleting
+    // or moving the scope-carrier line passed — and asserted nothing at all for the narrow-big-
+    // endpoints rule. Each fragment below appears in exactly one line of the instructions.
+    const CONVENTION_FRAGMENTS = [
       "COMPLETE scoped set",
       "per_page is a RESULT cap",
-      "next_offset",
+      "result_truncated.next_offset",
       "2026-04-01..2026-06-30",
-      "scope_handle",
-    ]) {
+      "two scope carriers",
+      "ALWAYS narrow big endpoints",
+    ];
+    for (const fragment of CONVENTION_FRAGMENTS) {
       assert.ok(
         head.includes(fragment),
         `"${fragment}" falls after the 2,048-character boundary, where a truncating client never sees it`
+      );
+      assert.equal(
+        measured.instructions.split(fragment).length - 1,
+        1,
+        `"${fragment}" appears more than once, so asserting it does not pin the convention line it stands for`
+      );
+    }
+    // And every BULLET is covered by at least one of them, derived from the instructions themselves:
+    // a sixth convention added without a fragment fails here rather than going untested.
+    const conventionBullets = measured.instructions
+      .split("EVIDENCE READ CONVENTIONS")[1]
+      ?.split("\n\n")[0]
+      ?.split("\n")
+      .filter((line) => line.startsWith("- ")) ?? [];
+    assert.equal(conventionBullets.length, 5, "the conventions block is five bullets");
+    for (const bullet of conventionBullets) {
+      assert.ok(
+        CONVENTION_FRAGMENTS.some((fragment) => bullet.includes(fragment)),
+        `no fragment pins this convention, so deleting it would pass: ${bullet.slice(0, 60)}`
       );
     }
   });

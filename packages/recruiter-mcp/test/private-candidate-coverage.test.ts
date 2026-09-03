@@ -1,9 +1,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { CANDIDATE_SUBSTANCE_TOOLS } from "../../scoped-core/src/index.js";
-import { SCOPED_TOOL_SCOPE_POLICIES } from "../src/tools/scoped-endpoint-adapters.js";
+import { CANDIDATE_ROW_TOOLS, CANDIDATE_SUBSTANCE_TOOLS, DEFAULT_FILTER_REGISTRY } from "../../scoped-core/src/index.js";
+import {
+  SCOPED_ENDPOINT_ADAPTERS_BY_EVIDENCE_TOOL,
+  SCOPED_TOOL_SCOPE_POLICIES,
+} from "../src/tools/scoped-endpoint-adapters.js";
 
 /**
+ * THE OTHER HALF OF THIS GUARD LIVES IN `scoped-core/test/private-candidate-multihop.test.ts`
+ * ("classifies every registered endpoint that can carry candidate substance"), which walks the WHOLE
+ * filter registry by endpoint and fails on any registration nobody classified. This file is the
+ * recruiter-side half: it works from the tool's SCOPE CLASS, so a reader whose rows reach a candidate
+ * has to be classified whichever engine ends up scoping it.
+ *
  * Whether a tool's private candidates are protected depends on WHICH SCOPE ENGINE it happens to use,
  * and nothing in the type system says so.
  *
@@ -74,6 +83,55 @@ describe("private-candidate coverage cannot drift between the two scope engines"
       "CANDIDATE_SUBSTANCE_TOOLS names a tool that is not on the candidate-substance surface. " +
         "Because that set denies any row it cannot resolve to a candidate, this withholds every row " +
         "of that tool rather than leaking one."
+    );
+  });
+
+  it("derives the surface from the registry's scope classes, not only from this hand-written list", () => {
+    // The list above is human judgement and stays; this is the tripwire under it. Every reader the
+    // REGISTRY classifies as candidate-, application- or scorecard-backed carries rows that resolve to
+    // a candidate, so each one must be named on the surface above — whether it is row-filtered or
+    // policy-driven, which is the half the previous predicate skipped.
+    const CANDIDATE_REACHING_CLASSES = new Set(["candidate_backed", "application_backed", "scorecard_backed", "interview_backed"]);
+    const surface = new Set(CANDIDATE_SUBSTANCE_SURFACE.map(({ tool }) => tool));
+    const unclassified = [...SCOPED_ENDPOINT_ADAPTERS_BY_EVIDENCE_TOOL.values()]
+      .filter((adapter) => CANDIDATE_REACHING_CLASSES.has(adapter.scopeClass))
+      .map((adapter) => adapter.scopedToolName)
+      .filter((scopedToolName) => !surface.has(scopedToolName))
+      .sort();
+
+    assert.deepEqual(
+      [...new Set(unclassified)],
+      [],
+      "a reader whose registry scope class reaches a candidate is missing from the candidate-substance " +
+        "surface, so nobody has decided whether the private-candidate gate covers it"
+    );
+  });
+
+  it("names the gate on every ROW-FILTERED reader on the surface, not only the policy-driven ones", () => {
+    // The original predicate only looked at policy-driven tools, so the row-filtered half of the
+    // surface was unguarded here. Each of them is now held to a NAMED gate: the universal backstop,
+    // the candidate-row path (the row IS the candidate, so `private` is decided on the row itself), or
+    // the filter's own inline walk. A new row-filtered candidate reader fails this until someone says
+    // which of the three covers it.
+    const GATED_BY_THEIR_OWN_FILTER_WALK = new Set([
+      // The row carries no candidate id at all; the filter walks interview -> application -> job and
+      // the privacy gate rides that walk. scoped-core's own sweep classifies both as non-candidate
+      // rows for exactly this reason.
+      "list_interviews",
+      "list_interviewers",
+    ]);
+    const rowFiltered = CANDIDATE_SUBSTANCE_SURFACE
+      .filter(({ tool }) => DEFAULT_FILTER_REGISTRY.get(tool)?.rowFilter !== undefined)
+      .map(({ tool }) => tool);
+    assert.ok(rowFiltered.length > 0, "the surface must actually contain row-filtered readers");
+    const ungated = rowFiltered.filter((tool) =>
+      !CANDIDATE_SUBSTANCE_TOOLS.has(tool) && !CANDIDATE_ROW_TOOLS.has(tool) && !GATED_BY_THEIR_OWN_FILTER_WALK.has(tool)
+    );
+    assert.deepEqual(
+      ungated,
+      [],
+      "these row-filtered candidate-substance readers name no gate at all: add them to " +
+        "CANDIDATE_SUBSTANCE_TOOLS, or state which walk covers them"
     );
   });
 

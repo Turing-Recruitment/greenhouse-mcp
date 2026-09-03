@@ -101,7 +101,7 @@ describe("hosted deployment artifacts", () => {
     assert.match(dockerSmokeScript, /runDockerJson\(\[/);
     assert.match(dockerSmokeScript, /greenhouse-recruiter-container-self-check\.mjs/);
     assert.match(dockerSmokeScript, /authenticatedMcpHttpValidated: false/);
-    assert.match(dockerSmokeScript, /catalogToolCount !== EXPECTED_CATALOG_TOOL_COUNT/);
+    assert.match(dockerSmokeScript, /Number\.isInteger\(parsed\?\.catalogToolCount\)/);
     assert.match(dockerSmokeScript, /hiddenToolCount !== 0/);
     assert.match(dockerSmokeScript, /real issued recruiter session/);
     assert.match(dockerSmokeScript, /GREENHOUSE_RECRUITER_DOCKER_SMOKE_RUN/);
@@ -231,10 +231,17 @@ describe("hosted deployment artifacts", () => {
     assert.match(productionEnvExample, /DEPLOY STEP: delete GREENHOUSE_RECRUITER_ALLOWED_TOOLS from the Cloud Run service/);
     assert.match(productionEnvExample, /^GREENHOUSE_RECRUITER_DISABLE_TOOLS=$/m);
 
-    // The smoke script is plain .mjs and cannot import the catalog, so its literal is pinned here.
-    const smokeCatalogCount = Number(dockerSmokeScript.match(/const EXPECTED_CATALOG_TOOL_COUNT = (\d+);/)?.[1]);
-    assert.equal(smokeCatalogCount, expected.length, "docker-smoke-test.mjs must expect the mounted catalog size");
+    // The smoke script no longer carries a catalog-size literal at all: the container's self-check
+    // asserts the exact ordered catalog inside the image, which is stronger than a count and cannot
+    // be forgotten in a second file. What the script must still check is that the self-check ran and
+    // hid nothing.
+    assert.equal(
+      /EXPECTED_CATALOG_TOOL_COUNT/.test(dockerSmokeScript),
+      false,
+      "the catalog-size literal is retired; the container self-check owns exactness"
+    );
     assert.match(dockerSmokeScript, /parsed\?\.hiddenToolCount !== 0/, "nothing is hidden any more");
+    assert.match(dockerSmokeScript, /Number\.isInteger\(parsed\?\.catalogToolCount\)/, "the self-check's answer is still shape-checked");
 
     assert.deepEqual(chatGptExample.allowed_tools, expected);
     for (const example of distributionExamples) {
