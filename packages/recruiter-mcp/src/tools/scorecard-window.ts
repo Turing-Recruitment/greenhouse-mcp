@@ -178,6 +178,7 @@ async function readScorecardsByApplicationIds<T extends ScorecardWindowRow>(
   let rawRowsRead = 0;
   let rowsReturnedRead = 0;
   let permissionExcluded = 0;
+  let privacyWithheld = 0;
   let unresolvedRows = 0;
   let pagesRead = 0;
   let rateLimitRetries = 0;
@@ -208,6 +209,7 @@ async function readScorecardsByApplicationIds<T extends ScorecardWindowRow>(
     rawRowsRead += read.rawRowsRead;
     rowsReturnedRead += read.rowsReturnedRead ?? read.rows.length;
     permissionExcluded += read.permissionExcluded;
+    privacyWithheld += read.privacyWithheld;
     unresolvedRows += read.unresolvedRows;
     pagesRead += read.pagesRead;
     rateLimitRetries += read.rateLimitRetries;
@@ -228,6 +230,7 @@ async function readScorecardsByApplicationIds<T extends ScorecardWindowRow>(
     rawRowsRead,
     rowsReturnedRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     pagesRead,
     status,
@@ -303,6 +306,9 @@ function unionScorecardReads<T extends ScorecardWindowRow>(
     rowsReturnedRead:
       sum(reads, (read) => read.rowsReturnedRead ?? read.rows.length) - duplicateRowsDropped + (bridge?.returnedRowsRead ?? 0),
     permissionExcluded: sum(reads, (read) => read.permissionExcluded) + (bridge?.permissionExcluded ?? 0),
+    // The privacy gate's count rides on each read like every other counter; a card withheld by both
+    // filters is the same card, so the union nets duplicates out of the returned rows, not this count.
+    privacyWithheld: sum(reads, (read) => read.privacyWithheld) + ((bridge as { privacyWithheld?: number } | null | undefined)?.privacyWithheld ?? 0),
     unresolvedRows: sum(reads, (read) => read.unresolvedRows) + (bridge?.unresolvedRows ?? 0),
     pagesRead: sum(reads, (read) => read.pagesRead) + (bridge?.pagesRead ?? 0),
     status,
