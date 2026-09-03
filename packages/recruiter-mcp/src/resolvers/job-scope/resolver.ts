@@ -459,7 +459,13 @@ export function resolveJobScope(input: ResolveJobScopeInput, ctx: ResolverContex
       if (isAdmin) {
         reasonCodes.add("admin_scope");
         warnings.push(
-          "You have broad Greenhouse visibility, so this scope was resolved across more than your own assigned reqs."
+          deterministicOwnerScope
+            // An owner-resolved scope IS the actor's own recruiter/sourcer assignments, so the
+            // generic wording below ("across more than your own assigned reqs") states the
+            // opposite of what happened. Broad visibility is still disclosed; the false claim
+            // about what the scope covers is not.
+            ? "You have broad Greenhouse visibility; this scope is nonetheless limited to the reqs you are the recruiter or sourcer on."
+            : "You have broad Greenhouse visibility, so this scope was resolved across more than your own assigned reqs."
         );
       }
     }

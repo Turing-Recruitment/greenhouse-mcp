@@ -385,6 +385,7 @@ export function getRecruitingCapabilities(modelVisibleTools?: ReadonlySet<string
         "answer_my_recruiting_question answers without a pre-resolved scope: a req or role the question NAMES becomes the scope, and a question that names none is answered across every job the caller can see, with that scope stated on the answer.",
         "Resolve first with resolve_job_scope when you want to pin a scope explicitly, reuse one across calls, or the question matched several requisitions.",
         "Analysis tools accept a scope_handle or exact greenhouse job_ids only; they reject free-text job_query/role/alias inputs. Called with neither, they analyze everything the caller can see and disclose that scope in the response header.",
+        "A scope the question NAMED but that resolved to nothing is never widened: \"my reqs\" with no recruiter/sourcer assignment, or \"all open reqs\" where none are open, answers an explicit empty scope rather than substituting a different population.",
       ],
     },
     user_modes: [
@@ -396,6 +397,7 @@ export function getRecruitingCapabilities(modelVisibleTools?: ReadonlySet<string
           "Auto-confirms only unique, high-confidence, active-job matches over a complete inventory.",
           "Ambiguous role-family or multi-job matches require confirmation.",
           "A question that names no req is answered across the recruiter's permitted book, and the answer's scope header names that set.",
+          "A req or requisition id named inside the QUESTION narrows the answer to it when it matches one job at high confidence; a weaker or ambiguous match keeps the permitted-book default rather than asking.",
         ],
       },
       {

@@ -32,7 +32,7 @@ export const QUESTION_ANSWER_TOOL: RecruiterToolDefinition = {
   name: "answer_my_recruiting_question",
   kind: "analysis",
   description:
-    'THE FRONT DOOR for aggregate analytical questions — metrics, rates, counts, time trends, aggregate comparisons, and time-boxed questions. Ask in plain English ("What\'s our offer acceptance rate last quarter?", "Where are candidates stuck in my reqs?", "How have rejection reasons drifted?"). ONE call resolves the scope (including "my reqs"), reads the complete scoped data, applies the time window server-side (this/last quarter, this year, last N days/weeks/months), and computes the answer with honest disclosures. Prefer this whenever the question wants a NUMBER or aggregate ANALYSIS. For individual resume, scorecard, note, or candidate-history comparisons, use the corresponding scoped evidence/read tools instead. Questions outside the covered domains return the closest available analyses by name instead of a guess.',
+    'THE FRONT DOOR for aggregate analytical questions — metrics, rates, counts, time trends, aggregate comparisons, and time-boxed questions. Ask in plain English ("What\'s our offer acceptance rate last quarter?", "Where are candidates stuck in my reqs?", "How have rejection reasons drifted?"). ONE call resolves the scope (including "my reqs"), reads the complete scoped data, applies the time window server-side (this/last quarter, this year, last N days/weeks/months), and computes the answer with honest disclosures. Prefer this whenever the question wants a NUMBER or aggregate ANALYSIS. For individual resume, scorecard, note, or candidate-history comparisons, use the corresponding scoped evidence/read tools instead. A question outside the covered domains still gets an answer: the broad diagnostic panel runs and the result is LABELLED an approximation (mode approximate_composite, domain_recognized false) naming both what ran and the analyses to rephrase toward.',
 };
 
 type RecipeId =
@@ -148,7 +148,7 @@ const RECIPES: RecipeDefinition[] = [
 // The default ceiling is the full recipe panel, so a broad diagnostic runs every recipe (an
 // explicit max_recipes still overrides). DERIVED, not typed: the hand-written 6 would have
 // silently selected a seventh registered recipe out of every broad run.
-const DEFAULT_MAX_RECIPES = RECIPES.length;
+export const DEFAULT_MAX_RECIPES = RECIPES.length;
 
 // The recipe ids the planner can actually execute (one analyze_* tool each).
 // get_recruiting_capabilities must only mark these as availability: "available";
@@ -254,6 +254,45 @@ export async function runRecruitingQuestionAnswer(
     const auditDenied = await emitPlannerAudit(runtime, startedAt, correlationId, result, null, null, actAsUser);
     return auditDenied ?? result;
   }
+  if (plannerScope.kind === "empty_scope") {
+    // An honest zero, not a refusal and not a silently-substituted population. No recipe runs
+    // because there is nothing in scope to read.
+    const result: RecruiterToolResult = {
+      ok: true,
+      toolName,
+      scoped: true,
+      data: {
+        summary: {
+          question,
+          planner: "keyword-routed recipe planner",
+          domain_recognized: false,
+          selected_recipe_count: 0,
+          recipes_run_count: 0,
+          selected_recipes: [],
+          rows_read: 0,
+          rows_considered: 0,
+          completeness_status: "complete",
+          applied_time_window: resolveQuestionTimeWindow(question, params, runtime.now()),
+          scope_boundary: "The scope this question asked for is empty, so no scoped read ran.",
+          ...(plannerScope.header ? { scope: plannerScope.header } : {}),
+        },
+        answer: {
+          mode: "empty_scope",
+          domain_recognized: false,
+          message: plannerScope.message,
+        },
+        analyses: [],
+        denials: [],
+        next_steps: [
+          "Ask the same question without the scope word to cover every job your Greenhouse permissions return.",
+          "Or name a req, role, or requisition id to analyze a specific requisition.",
+        ],
+      },
+      nextCursor: null,
+    };
+    const auditDenied = await emitPlannerAudit(runtime, startedAt, correlationId, result, 0, 0, actAsUser);
+    return auditDenied ?? result;
+  }
   const scopeHeader = plannerScope.header;
   params = plannerScope.jobIds !== undefined ? withPlannerJobIds(params, plannerScope.jobIds) : stripScopeHandle(params);
 
@@ -270,7 +309,7 @@ export async function runRecruitingQuestionAnswer(
     let executed: RecruiterToolResult | null;
     try {
       executed = await executePlannedDomain(
-        runtime, question, params, missingDomain, scopeHeader, plannerScope.jobIds, plannerDeadline
+        runtime, question, appliedTimeWindow, missingDomain, scopeHeader, plannerScope.jobIds, plannerDeadline
       );
     } catch (error) {
       if (!isToolCancelledError(error)) throw error;
@@ -354,7 +393,10 @@ export async function runRecruitingQuestionAnswer(
   // refusal is kept, and made louder: mode says approximate_composite, domain_recognized stays
   // false, and the message names both what ran and the recipes to rephrase toward.
   const approximateComposite = matchedRecipes.length === 0;
-  const selected = approximateComposite ? broadDiagnosticPanel() : matchedRecipes;
+  // The ceiling applies here too. The composite bypassed selectRecipes entirely, so an explicit
+  // max_recipes — the one control a caller has over how much the panel reads — was honored for
+  // every routed question and silently ignored on the one path that runs everything.
+  const selected = approximateComposite ? broadDiagnosticPanel(params) : matchedRecipes;
   const plan = approximateComposite
     ? { ...buildAnalysisPlan(question, selected, scopeHeader), stopReason: "approximate_composite:unrecognized_question" }
     : buildAnalysisPlan(question, selected, scopeHeader);
@@ -520,9 +562,15 @@ export async function runRecruitingQuestionAnswer(
             ? "composite_analysis"
             : "single_recipe_analysis",
         domainRecognized: !approximateComposite,
-        ...(approximateComposite
-          ? { message: composeCompositeMessage(scopeHeader, appliedTimeWindow, analyses, denials) }
-          : {}),
+        // Every recipe answer carries the message now, not only the composite: the scope it ran
+        // over and the recipes that did/did not run are the same disclosures either way.
+        message: approximateComposite
+          ? composeCompositeMessage(scopeHeader, appliedTimeWindow, selected, analyses, denials)
+          : composeAnswerMessage({
+              scopeHeader,
+              appliedTimeWindow,
+              clause: `ran ${panelClause(selected, analyses, denials)}`,
+            }),
       }),
       analyses,
       denials,
@@ -725,9 +773,14 @@ const PLANNED_DOMAIN_BINDINGS: ReadonlyMap<string, PlannedDomainBinding> = new M
   ["offer_resolution", { scopedToolName: "list_offers", factName: "offer_fact", buildFactsFromRows: (rows) => buildOfferFacts(rows), factJobIdField: "job_id", factWindowField: "sent_on" }],
 ]);
 
-// Deterministic NL time windows for the planned-domain path ("this quarter" was silently ignored
-// in the live pilot — an all-time number answered a quarter question). Calendar-anchored in UTC;
-// explicit window_start/window_end params always win over the parsed phrase.
+// Deterministic NL time windows ("this quarter" was silently ignored in the live pilot — an
+// all-time number answered a quarter question). Calendar-anchored in UTC; explicit
+// window_start/window_end params always win over the parsed phrase.
+//
+// A CLOSED period ends at its final instant, not at the first instant of the next one. Every
+// consumer filters inclusively (`at <= endMs`; source-quality.ts:330 and the planned-domain filter
+// below), and a date-only stamp ("sent_on": "2026-06-01") parses to exactly midnight — so an
+// endMs of "the 1st at 00:00" put every first-of-the-period, date-only event in the WRONG period.
 export function parseQuestionTimeWindow(
   question: string,
   nowMs: number
@@ -741,13 +794,13 @@ export function parseQuestionTimeWindow(
     return { startMs: Date.UTC(year, quarterStartMonth, 1), endMs: nowMs, label: "this quarter" };
   }
   if (/\blast quarter\b/.test(normalized)) {
-    return { startMs: Date.UTC(year, quarterStartMonth - 3, 1), endMs: Date.UTC(year, quarterStartMonth, 1), label: "last quarter" };
+    return { startMs: Date.UTC(year, quarterStartMonth - 3, 1), endMs: Date.UTC(year, quarterStartMonth, 1) - 1, label: "last quarter" };
   }
   if (/\bthis month\b/.test(normalized)) {
     return { startMs: Date.UTC(year, month, 1), endMs: nowMs, label: "this month" };
   }
   if (/\blast month\b/.test(normalized)) {
-    return { startMs: Date.UTC(year, month - 1, 1), endMs: Date.UTC(year, month, 1), label: "last month" };
+    return { startMs: Date.UTC(year, month - 1, 1), endMs: Date.UTC(year, month, 1) - 1, label: "last month" };
   }
   if (/\bthis year\b/.test(normalized)) {
     return { startMs: Date.UTC(year, 0, 1), endMs: nowMs, label: "this year" };
@@ -774,16 +827,28 @@ export interface AppliedTimeWindow {
  * of it would silently overwrite half of what the caller asked for. A one-sided explicit window is
  * reported as exactly that; no second bound is invented, because each recipe's own summary already
  * states the interval it resolved.
+ *
+ * Presence is KEY presence, not string-ness. Testing `typeof === "string"` meant a non-string
+ * window_start (a number, a Date) read as absent, so the phrase in the sentence was parsed and
+ * WROTE OVER the caller's own param — the bad value never reached the recipe's validator and the
+ * answer silently covered a different interval. A present-but-unusable bound is left exactly as
+ * the caller passed it (limits.ts readAnalysisWindowDate rejects it, loudly) and disclosed as null,
+ * because there is no ISO instant to state.
  */
 export function resolveQuestionTimeWindow(
   question: string,
   params: Record<string, unknown>,
   nowMs: number
 ): AppliedTimeWindow | null {
-  const explicitStart = typeof params.window_start === "string" ? params.window_start : null;
-  const explicitEnd = typeof params.window_end === "string" ? params.window_end : null;
-  if (explicitStart !== null || explicitEnd !== null) {
-    return { label: null, window_start: explicitStart, window_end: explicitEnd, origin: "explicit" };
+  const startPresent = params.window_start !== undefined && params.window_start !== null;
+  const endPresent = params.window_end !== undefined && params.window_end !== null;
+  if (startPresent || endPresent) {
+    return {
+      label: null,
+      window_start: typeof params.window_start === "string" ? params.window_start : null,
+      window_end: typeof params.window_end === "string" ? params.window_end : null,
+      origin: "explicit",
+    };
   }
   const parsed = parseQuestionTimeWindow(question, nowMs);
   if (!parsed) return null;
@@ -798,7 +863,7 @@ export function resolveQuestionTimeWindow(
 async function executePlannedDomain(
   runtime: RecruiterToolRuntime,
   question: string,
-  params: Record<string, unknown>,
+  appliedTimeWindow: AppliedTimeWindow | null,
   missingDomain: MissingDomain,
   scopeHeader: AnalysisContextHeader | null,
   resolvedJobIds: string | undefined,
@@ -844,16 +909,13 @@ async function executePlannedDomain(
   }
 
   // Apply the question's time window ("this quarter") — the live pilot showed an all-time number
-  // silently answering a quarter-scoped question. Explicit window params win; a parsed phrase is
-  // applied to the domain's event timestamp; either way the applied window (or its absence) is
-  // DISCLOSED, and a point-in-time domain says so instead of pretending.
-  const explicitStart = typeof params.window_start === "string" ? Date.parse(params.window_start) : Number.NaN;
-  const explicitEnd = typeof params.window_end === "string" ? Date.parse(params.window_end) : Number.NaN;
-  const parsedWindow = Number.isFinite(explicitStart) && Number.isFinite(explicitEnd)
-    ? { startMs: explicitStart, endMs: explicitEnd, label: "explicit window params" }
-    : parseQuestionTimeWindow(question, runtime.now());
-  let appliedWindow: { startMs: number; endMs: number; label: string } | null = null;
-  if (parsedWindow) {
+  // silently answering a quarter-scoped question. The window is the SAME AppliedTimeWindow the
+  // recipe path discloses, computed once by resolveQuestionTimeWindow from key presence. This path
+  // used to recompute it and require BOTH explicit bounds, so `window_start` alone plus "this
+  // month" in the sentence silently became June and dropped the May rows the caller asked for.
+  // A one-sided bound is honored as one-sided: the missing side is simply unbounded.
+  const bounds = plannedDomainBounds(appliedTimeWindow);
+  if (bounds) {
     if (binding.factWindowField) {
       let missingTimestamp = 0;
       const facts = (scopedFactResult.facts as Array<Record<string, unknown>>).filter((fact) => {
@@ -863,17 +925,16 @@ async function executePlannedDomain(
           missingTimestamp += 1;
           return false;
         }
-        return at >= parsedWindow.startMs && at <= parsedWindow.endMs;
+        return at >= bounds.startMs && at <= bounds.endMs;
       });
       scopedFactResult = { ...scopedFactResult, facts } as FactBuildResult<unknown>;
-      appliedWindow = parsedWindow;
       omissions.push(
-        `Time window applied (${parsedWindow.label}): ${new Date(parsedWindow.startMs).toISOString().slice(0, 10)} to ${new Date(parsedWindow.endMs).toISOString().slice(0, 10)} on ${binding.factWindowField}` +
+        `Time window applied (${bounds.label}): ${bounds.startLabel} to ${bounds.endLabel} on ${binding.factWindowField}` +
           (missingTimestamp > 0 ? `; ${missingTimestamp} row(s) without a ${binding.factWindowField} excluded.` : ".")
       );
     } else {
       omissions.push(
-        `A time window ("${parsedWindow.label}") was asked, but this metric is point-in-time (current state) — the window does not apply.`
+        `A time window ("${bounds.label}") was asked, but this metric is point-in-time (current state) — the window does not apply.`
       );
     }
   } else if (binding.factWindowField) {
@@ -894,7 +955,6 @@ async function executePlannedDomain(
     requiredProjectionProfile: missingDomain.requiredProjectionProfile,
     needsUserConfirmation: false,
   };
-  void params;
   return {
     ok: true,
     toolName: QUESTION_ANSWER_TOOL.name,
@@ -914,17 +974,10 @@ async function executePlannedDomain(
         rows_read: read.rawRowsRead,
         rows_considered: (scopedFactResult.facts as unknown[]).length,
         completeness_status: completeness,
-        // The same disclosure the recipe path carries. This path runs BEFORE the router forwards a
-        // phrase window, so its origin is read from the caller's own params: a phrase keeps its own
-        // label ("this month"), never the "explicit window params" wording.
-        applied_time_window: appliedWindow
-          ? {
-              label: appliedWindow.label,
-              window_start: new Date(appliedWindow.startMs).toISOString(),
-              window_end: new Date(appliedWindow.endMs).toISOString(),
-              origin: Number.isFinite(explicitStart) && Number.isFinite(explicitEnd) ? "explicit" : "question",
-            }
-          : null,
+        // Literally the same object the recipe path discloses — one window, computed once, so a
+        // phrase keeps its own label ("this month") and an explicit window says "explicit" on
+        // both paths. Recomputing it here is what let the two paths disagree.
+        applied_time_window: appliedTimeWindow,
         data_domains: missingDomain.requiredEndpoints,
         projection_profile: missingDomain.requiredProjectionProfile,
         scope_boundary: scopeIds && binding.factJobIdField
@@ -936,6 +989,10 @@ async function executePlannedDomain(
       answer: {
         mode: "planned_metric",
         domain_recognized: true,
+        // The same composition contract every other answer shape carries: scope first, then the
+        // window. This branch used to carry no message at all, so the one disclosure a recruiter
+        // reads first was missing on exactly the path that answers a metric question.
+        message: composeAnswerMessage({ scopeHeader, appliedTimeWindow, clause: `computed ${metricId}` }),
         metric,
         read: {
           complete: read.complete,
@@ -965,27 +1022,35 @@ function isBroadDiagnosticIntent(question: string, params: Record<string, unknow
   return /\b(overall|health check|full diagnostic|full picture|everything|comprehensive|end to end|across all|across my)\b/.test(normalized);
 }
 
-/** The full diagnostic panel, resolved from the registry so a newly registered recipe joins it. */
-function broadDiagnosticPanel(): RecipeDefinition[] {
+/**
+ * The full diagnostic panel, resolved from the registry so a newly registered recipe joins it, and
+ * bounded by the SAME ceiling selectRecipes applies (an explicit max_recipes wins; DEFAULT_MAX_RECIPES
+ * is derived from the registry, so the default runs everything).
+ */
+function broadDiagnosticPanel(params: Record<string, unknown>): RecipeDefinition[] {
+  const maxRecipes = readPositiveInt(params.max_recipes) ?? DEFAULT_MAX_RECIPES;
   return BROAD_DIAGNOSTIC_RECIPES
     .map((id) => RECIPES.find((recipe) => recipe.id === id))
-    .filter((recipe): recipe is RecipeDefinition => recipe !== undefined);
+    .filter((recipe): recipe is RecipeDefinition => recipe !== undefined)
+    .slice(0, maxRecipes);
 }
 
 /**
- * One composition contract for every answer that carries a message: what scope it ran over, then
- * the shape-specific lead, then the time window when there is one, then what to do next. Written
- * once so a recruiter reads the same disclosures in the same order whichever branch answered.
+ * One composition contract for every answer that carries a message — planned, matched-recipe and
+ * composite alike. First sentence: what scope this ran over, plus (joined into it, never stranded
+ * in a second sentence) the shape's own clause — what ran, what could not, what was never tried.
+ * Then the time window when there is one, then what to do next. Written once so a recruiter reads
+ * the same disclosures in the same order whichever branch answered.
  */
 function composeAnswerMessage(input: {
   scopeHeader: AnalysisContextHeader | null;
   appliedTimeWindow: AppliedTimeWindow | null;
+  clause?: string;
   lead?: string;
   trailer?: string;
 }): string {
-  const sentences: string[] = [
-    `Answered over ${input.scopeHeader?.scope_label ?? "the reqs your Greenhouse permissions return"}.`,
-  ];
+  const scope = input.scopeHeader?.scope_label ?? "the reqs your Greenhouse permissions return";
+  const sentences: string[] = [`Answered over ${scope}${input.clause ? ` — ${input.clause}` : ""}.`];
   if (input.lead) sentences.push(input.lead);
   const window = input.appliedTimeWindow;
   if (window?.origin === "question" && window.window_start && window.window_end) {
@@ -997,23 +1062,60 @@ function composeAnswerMessage(input: {
   return sentences.join(" ");
 }
 
-function composeCompositeMessage(
-  scopeHeader: AnalysisContextHeader | null,
-  appliedTimeWindow: AppliedTimeWindow | null,
+/**
+ * What the panel actually did, in the recruiter's terms. A recipe that was INVOKED and denied used
+ * to vanish from the message (only successes were listed as "ran"), which read as a clean panel;
+ * so did the four recipes a deadline meant were never attempted at all. Both are named.
+ */
+function panelClause(
+  selected: RecipeDefinition[],
   analyses: Array<Record<string, unknown>>,
   denials: Array<Record<string, unknown>>
 ): string {
   const ran = analyses.filter((entry) => entry.status === "ok").map((entry) => String(entry.recipe));
   const blocked = denials.map((entry) => String(entry.recipe));
-  const lead = ran.length > 0
-    ? `No single analysis matched this question; the broad panel ran instead (${ran.join(", ")}).`
-    : `No single analysis matched this question; the broad panel ran instead (none of it could complete: ${blocked.join(", ")}).`;
+  const notAttempted = Math.max(0, selected.length - ran.length - blocked.length);
+  const parts: string[] = [];
+  parts.push(ran.length > 0 ? ran.join(", ") : `none of it could complete: ${blocked.join(", ")}`);
+  if (ran.length > 0 && blocked.length > 0) parts.push(`${blocked.join(", ")} could not run`);
+  if (notAttempted > 0) parts.push(`${notAttempted} further analyses were not attempted`);
+  return parts.join("; ");
+}
+
+function composeCompositeMessage(
+  scopeHeader: AnalysisContextHeader | null,
+  appliedTimeWindow: AppliedTimeWindow | null,
+  selected: RecipeDefinition[],
+  analyses: Array<Record<string, unknown>>,
+  denials: Array<Record<string, unknown>>
+): string {
   return composeAnswerMessage({
     scopeHeader,
     appliedTimeWindow,
-    lead,
+    clause: `no single analysis matched this question, so the broad panel ran instead (${panelClause(selected, analyses, denials)})`,
     trailer: `Treat this as an approximation and rephrase toward one of: ${PLANNER_RECIPE_IDS.join(", ")}.`,
   });
+}
+
+/**
+ * The planned-domain filter bounds, derived from the one AppliedTimeWindow the whole planner
+ * shares. A one-sided explicit window is one-sided here too: the absent side is unbounded rather
+ * than a reason to fall back to reading the sentence.
+ */
+function plannedDomainBounds(
+  window: AppliedTimeWindow | null
+): { startMs: number; endMs: number; label: string; startLabel: string; endLabel: string } | null {
+  if (!window) return null;
+  const start = window.window_start ? Date.parse(window.window_start) : Number.NaN;
+  const end = window.window_end ? Date.parse(window.window_end) : Number.NaN;
+  if (!Number.isFinite(start) && !Number.isFinite(end)) return null;
+  return {
+    startMs: Number.isFinite(start) ? start : Number.NEGATIVE_INFINITY,
+    endMs: Number.isFinite(end) ? end : Number.POSITIVE_INFINITY,
+    label: window.label ?? "explicit window params",
+    startLabel: Number.isFinite(start) ? new Date(start).toISOString().slice(0, 10) : "the earliest record",
+    endLabel: Number.isFinite(end) ? new Date(end).toISOString().slice(0, 10) : "now",
+  };
 }
 
 function buildAnalysisPlan(
@@ -1243,6 +1345,10 @@ async function emitPlannerAudit(
 type PlannerScopeOutcome =
   | { ok: true; kind: "scoped"; jobIds?: string; header: AnalysisContextHeader | null }
   | { ok: true; kind: "resolution_required"; resolution: ResolveJobScopeOutput }
+  // The scope the question asked for is KNOWN and EMPTY — "my reqs" for someone assigned to none,
+  // "all open reqs" where none are open. Zero is the answer; running the analysis over a different
+  // population (their whole permitted book, or the closed reqs) would answer a different question.
+  | { ok: true; kind: "empty_scope"; header: AnalysisContextHeader | null; message: string }
   | { ok: false; code: RecruiterDenialCode; message: string };
 
 async function resolvePlannerScope(
@@ -1292,14 +1398,11 @@ async function resolvePlannerScope(
     ownerScopedJobIds = owner.ownerScopedJobIds;
   }
 
-  // A narrow recruiter with no named job intent: the scoped core already bounds every read to
-  // their permitted jobs, so the reads are byte-identical to before. The only change is that the
-  // answer now says which set it covered — including for "across all my open reqs", which is a
-  // request for exactly that permitted set, not a job/role reference to resolve.
-  if (!orgWideEligible && !ownerIntent && !hasResolverIntent(params)) {
-    return { ok: true, kind: "scoped", header: buildPermissionScopeHeader(load.inventory) };
-  }
-
+  // The probe is PURE — resolveJobScope reads nothing, it ranks the question against the inventory
+  // already in hand — so every actor gets it, narrow ones included. Skipping it for a narrow
+  // recruiter was the live defect: "why is req SAIS-US-401 slow" was answered across their whole
+  // book because the permitted-set shortcut ran before the resolver ever saw the sentence.
+  const explicitNarrowing = hasResolverIntent(params);
   const { signer, ephemeral } = resolveScopeSigner(runtime);
   const output = resolveJobScope(buildPlannerResolverInput(question, params, ownerIntent), {
     inventory: load.inventory,
@@ -1312,13 +1415,44 @@ async function resolvePlannerScope(
   if (output.resolution_status === "resolved" && output.scope.job_ids.length > 0) {
     return resolvedScopeOutcome(output, []);
   }
-  if (!orgWideEligible) {
-    // A narrow recruiter who NAMED a job or role that did not resolve keeps today's behavior: the
-    // ask is about specific reqs, so answering across their whole book would answer a different
-    // question. Their unnamed questions never reach here (they took the permitted-set path above).
+
+  // EXPLICIT NARROWING THAT MISSED NEVER WIDENS. The org-wide default answers a question that
+  // named nothing; it must not answer one that named something the index could not find. Owner
+  // intent ("my reqs") and explicit resolver params are both the caller saying WHICH reqs.
+  if (ownerIntent) {
+    if (output.scope.job_ids.length > 0) {
+      // A closed/stale/confidential flag on the actor's OWN reqs is a disclosure, not a reason to
+      // ask which reqs they meant — they said which.
+      return resolvedScopeOutcome(
+        output,
+        probeDisclosures(output, new Set(output.confirmation.reason_codes), false)
+      );
+    }
+    return {
+      ok: true,
+      kind: "empty_scope",
+      header: null,
+      message:
+        "You are not the recruiter or sourcer on any open req in Greenhouse, so there is nothing to analyze under \"my reqs\". Ask the same question without the possessive to cover every job you can see, or name a req.",
+    };
+  }
+  if (explicitNarrowing) {
+    // query / requisition_ids / greenhouse_job_ids / aliases / role_families that resolved to
+    // nothing: stay unresolved and hand back the resolver's own message. Widening here would
+    // answer a different question than the one the caller pinned.
     return { ok: true, kind: "resolution_required", resolution: output };
   }
+
   const decision = classifyScopeProbe(output, load.inventory);
+  if (!orgWideEligible) {
+    // A narrow recruiter's free-text question: a req they NAMED at high confidence becomes the
+    // scope; anything weaker keeps today's permitted-set default byte for byte, so their plain
+    // questions never gain a confirmation round-trip they did not have before.
+    if (decision.kind === "use_scope" && output.confidence.band === "high" && output.scope.job_ids.length > 0) {
+      return resolvedScopeOutcome(output, decision.warnings);
+    }
+    return { ok: true, kind: "scoped", header: buildPermissionScopeHeader(load.inventory) };
+  }
   if (decision.kind === "confirm") {
     return { ok: true, kind: "resolution_required", resolution: output };
   }
@@ -1358,6 +1492,24 @@ function orgWideScopeOutcome(question: string, inventory: JobInventory, warnings
     .filter((record) => record.status.trim().toLowerCase() === "open")
     .map((record) => record.greenhouse_job_id);
   const openOnly = wantsOpenReqPopulation(question);
+
+  if (openOnly && inventory.complete && openIds.length === 0) {
+    // A complete index with ZERO open jobs used to fall through to the unbounded permitted-set
+    // path — so an "all open reqs" question was answered by analyzing the CLOSED ones. Zero open
+    // reqs is the honest answer to a question about open reqs.
+    return {
+      ok: true,
+      kind: "empty_scope",
+      header: {
+        source: "permission_scope",
+        primary_scope_domain: "job_scope",
+        scope_label: "0 open jobs you can see in Greenhouse",
+        job_count: 0,
+        warnings,
+      },
+      message: `You can see ${total} job(s) in Greenhouse and no open req among them, so a question about open reqs has nothing to run over. Ask about all reqs, or name a closed req, to include them.`,
+    };
+  }
 
   if (openOnly && inventory.complete && openIds.length > 0) {
     const excluded = total - openIds.length;
@@ -1400,6 +1552,39 @@ export type ScopeProbeDecision =
 const NO_REQ_NAMED_WARNING =
   "No specific requisition was named; answered across all jobs you can see. Name a req or role to narrow.";
 
+// A question that DID name something the index could not match is a different disclosure, and
+// telling the recruiter "you named nothing" when they named a req that missed is simply false.
+const NO_REQ_MATCHED_WARNING =
+  "The terms in this question matched no requisition you can see; answered across all jobs you can see. Name a req or its requisition id to narrow.";
+
+// The resolver's own warnings ride the answer (they explain the question's terms), except its two
+// internal notices about candidate-preview mechanics, which describe neither the question nor the
+// unbounded read this header is disclosing.
+const RESOLVER_INTERNAL_WARNING_PREFIXES = ["scope_signing_key_ephemeral", "Excluded ", "Showing the top "];
+
+function carriedResolverWarnings(output: ResolveJobScopeOutput): string[] {
+  return output.warnings.filter(
+    (warning) => !RESOLVER_INTERNAL_WARNING_PREFIXES.some((prefix) => warning.startsWith(prefix))
+  );
+}
+
+// The candidate set the resolver SYNTHESIZES for a role-less or broad-phrased question: one entry
+// per permitted job, scored 0.3 (band "none"), tagged with the reason it was manufactured
+// (resolver.ts selectBySearch). It is the resolver saying "you named nothing", not a match.
+const SYNTHESIZED_MATCH_REASONS = new Set(["all_accessible", "broad_phrase"]);
+
+function isSynthesizedAllPermittedSelection(output: ResolveJobScopeOutput): boolean {
+  if (output.matches.length === 0) return false;
+  if (output.confidence.band === "none") return true;
+  return output.matches.every(
+    (match) => match.match_reasons.length > 0 && match.match_reasons.every((reason) => SYNTHESIZED_MATCH_REASONS.has(reason))
+  );
+}
+
+function unnamedScopeWarning(output: ResolveJobScopeOutput): string {
+  return isSynthesizedAllPermittedSelection(output) ? NO_REQ_NAMED_WARNING : NO_REQ_MATCHED_WARNING;
+}
+
 /**
  * CLO-274, the whole org-wide default policy in one pure, TOTAL function: given the resolver's
  * probe of the question, either use the scope it found, answer across the actor's permission floor,
@@ -1423,13 +1608,18 @@ export function classifyScopeProbe(output: ResolveJobScopeOutput, inventory: Job
       // rather than reading org-wide off the back of a failure.
       return { kind: "confirm" };
     case "no_match":
-      return { kind: "org_wide", warnings: [NO_REQ_NAMED_WARNING] };
+      // no_match is only reachable when the question CARRIED terms (an empty or role-less one is
+      // synthesized to the permitted set instead), so the disclosure says the terms missed. The
+      // resolver's own warnings — which name the terms that missed — used to be dropped here.
+      return { kind: "org_wide", warnings: [unnamedScopeWarning(output), ...carriedResolverWarnings(output)] };
     case "incomplete":
+      // A truncated index cannot tell "named nothing" from "named something unread", so this
+      // branch claims neither.
       return {
         kind: "org_wide",
         warnings: [
-          NO_REQ_NAMED_WARNING,
           `The job index could not be read completely (${inventory.accessibleSeen} req(s) enumerated), so no named requisition could be confirmed from it. The answer itself does not depend on the index — it runs over what your Greenhouse permissions return.`,
+          ...carriedResolverWarnings(output),
         ],
       };
     case "ambiguous":
@@ -1441,17 +1631,31 @@ export function classifyScopeProbe(output: ResolveJobScopeOutput, inventory: Job
   if (codes.has("duplicate_req_id")) return { kind: "confirm" };
 
   // A "named" selection is one the question actually pointed at: real matches, at a real lexical
-  // band, not the synthesized all-permitted set the resolver offers for a role-less question.
-  const namedSelection = !codes.has("broad_scope") && output.matches.length > 0 && (band === "high" || band === "medium");
+  // band, not the synthesized all-permitted set the resolver offers for a role-less question. The
+  // discriminator keys off THAT set's own signal, never off the absence of `broad_scope`:
+  // resolver.ts sets broad_scope on the PHRASE alone ("all", "every", "entire"), so
+  // "why is the entire Staff Backend req stalled" threw away a real, unique, high-band match and
+  // answered org-wide instead — the exact opposite of what the recruiter asked.
+  const namedSelection =
+    output.matches.length > 0 && (band === "high" || band === "medium") && !isSynthesizedAllPermittedSelection(output);
   if (namedSelection && codes.has("multiple_matches")) return { kind: "confirm" };
 
-  const warnings = probeDisclosures(output, codes);
-  if (namedSelection) return { kind: "use_scope", warnings };
-  return { kind: "org_wide", warnings: [NO_REQ_NAMED_WARNING, ...warnings] };
+  const warnings = probeDisclosures(output, codes, namedSelection);
+  if (namedSelection) return { kind: "use_scope", warnings: [...warnings, ...carriedResolverWarnings(output)] };
+  return { kind: "org_wide", warnings: [unnamedScopeWarning(output), ...warnings, ...carriedResolverWarnings(output)] };
 }
 
-function probeDisclosures(output: ResolveJobScopeOutput, codes: Set<ConfirmationReasonCode>): string[] {
+function probeDisclosures(
+  output: ResolveJobScopeOutput,
+  codes: Set<ConfirmationReasonCode>,
+  namedSelection: boolean
+): string[] {
   const warnings: string[] = [];
+  if (namedSelection && codes.has("broad_scope")) {
+    warnings.push(
+      `A broad word in this question ("all"/"every"/"entire") was read as analysis wording, not as scope — the answer is scoped to "${output.scope.scope_label}". Drop the req name to run across every job you can see.`
+    );
+  }
   const closed = output.matches.filter((match) => match.status.trim().toLowerCase() !== "open").length;
   if (codes.has("contains_closed_jobs") && closed > 0) {
     warnings.push(`Scope includes ${closed} closed req(s).`);

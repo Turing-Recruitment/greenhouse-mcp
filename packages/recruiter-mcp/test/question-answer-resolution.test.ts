@@ -555,6 +555,232 @@ describe("answer_my_recruiting_question — org-wide default (CLO-274)", () => {
     assert.equal(out.summary.scope.job_count, 1);
   });
 
+  // ---------------------------------------------------------------------------
+  // Item 0: the live defect A5's lock was hiding. A NARROW recruiter who names a req in free
+  // text never reached the resolver at all (the permitted-set shortcut ran first), so
+  // "why is req X slow" was answered across their whole book. The probe now runs for them
+  // too; only a high-band named match narrows, and everything else keeps today's default.
+  // ---------------------------------------------------------------------------
+  it("A0: a narrow recruiter who names a req id in free text gets THAT req, not their whole book", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_applications") {
+        assert.equal(params?.job_ids, "9001006", "the req the recruiter named is the scope");
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 9001006, stage_id: 7, stage_name: "Phone Screen", status: "active", current_stage_at: "2026-06-01T00:00:00.000Z", last_activity_at: "2026-06-01T00:00:00.000Z" },
+        ]);
+      }
+      if (toolName === "list_application_stages") {
+        return scopedSuccess(toolName, [
+          { id: 4001, application_id: 100, job_interview_stage_id: 7, entered_at: "2026-06-01T00:00:00.000Z", exited_at: null, days_in_stage: 22, current: true },
+        ]);
+      }
+      throw new Error(`unexpected ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "narrow_recruiter"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: "Why is req SAIS-US-401 slow?" });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope_resolution_required, undefined, "a req the recruiter named is not a reason to bounce");
+    assert.equal(out.summary.scope.source, "scope_handle");
+    assert.equal(out.summary.scope.job_count, 1);
+    assert.ok(reader.calls.some((c) => c.toolName === "list_application_stages"), "the analysis actually ran");
+  });
+
+  it("A0b: a narrow recruiter's question that names a role AMBIGUOUSLY keeps the permitted-set default", async () => {
+    // Frontier Data matches several of this recruiter's reqs at a real band. For an org-wide actor
+    // that is a confirmation; for a narrow recruiter it must stay today's behavior — answer over
+    // the permitted book — never a NEW confirmation round-trip they did not get before.
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_applications") {
+        assert.equal(params?.job_ids, undefined, "the permitted-set default passes no job_ids");
+        return scopedSuccess(toolName, []);
+      }
+      if (toolName === "list_application_stages") return scopedSuccess(toolName, []);
+      throw new Error(`unexpected ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "narrow_recruiter"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "Where are candidates stuck on Frontier Data?",
+    });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope_resolution_required, undefined);
+    assert.equal(out.summary.scope.source, "permission_scope");
+    assert.equal(out.summary.scope.job_count, 7);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Items 1 + 11: explicit narrowing that MISSES must never broaden. The classifier's
+  // no_match/incomplete -> org_wide rule is for an UNNAMED natural-language probe only.
+  // ---------------------------------------------------------------------------
+  it("item 1: an org-wide actor's explicit query that matched nothing stays unresolved, never org-wide", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      throw new Error(`an explicit query that missed must not widen to an org-wide read (called ${toolName})`);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "How is the pipeline health right now?",
+      query: "Blockchain Wizard",
+    });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope_resolution_required, true);
+    assert.equal(out.answer.mode, "resolution_required");
+    assert.equal(out.summary.scope, undefined, "an unresolved explicit narrowing carries no permission_scope header");
+  });
+
+  it("item 1: an org-wide actor's requisition_ids that matched nothing stays unresolved", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      throw new Error(`an explicit requisition_ids miss must not widen (called ${toolName})`);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "How is the pipeline health right now?",
+      requisition_ids: ["NOT-A-REAL-REQ"],
+    });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope_resolution_required, true);
+    assert.equal(reader.calls.length, 0);
+  });
+
+  it("item 11: 'my reqs' with an EMPTY owned set answers zero-scope, never the whole tenant", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_job_owners") return scopedSuccess(toolName, []);
+      throw new Error(`an empty owned set must not fall back to an org-wide read (called ${toolName})`);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: "Which of my reqs are stalling?" });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope?.source, undefined, "no permission_scope header — the actor asked about THEIR reqs");
+    assert.equal(out.answer.mode, "empty_scope");
+    assert.match(String(out.answer.message), /recruiter or sourcer/i);
+    assert.deepStrictEqual(out.analyses, []);
+    assert.equal(reader.calls.some((c) => c.toolName === "list_applications"), false);
+  });
+
+  // Item 3: an "all open reqs" question over a complete index with ZERO open jobs used to fall
+  // through to the unscoped permission-wide path and analyze the CLOSED ones.
+  it("item 3: 'all open reqs' with no open jobs returns an empty result, not an analysis of closed reqs", async () => {
+    const allClosed = {
+      ...fixture,
+      jobs: fixture.jobs.map((job) => ({ ...job, status: "closed" })),
+    } as JobScopeFixture;
+    const reader = fakeScopedReader((toolName) => {
+      throw new Error(`no open req means no analysis of closed ones (called ${toolName})`);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(allClosed, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this quarter across all open reqs?",
+    });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.answer.mode, "empty_scope");
+    assert.match(String(out.answer.message), /no open req/i);
+    assert.equal(reader.calls.some((c) => c.toolName === "list_offers"), false);
+  });
+
+  // Item 9 (principal: ACCEPTED AS IS — owner intent is the better reading of this phrase).
+  it("item 9: 'across all my open reqs' resolves to the OWNED scope with no confirmation", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_job_owners") {
+        return scopedSuccess(toolName, [{ id: 1, job_id: 9001003, user_id: 7009000, responsible: true, type: "recruiter" }]);
+      }
+      if (toolName === "list_offers") {
+        // The planned-domain path reads the permitted set and narrows in memory by job_id, so the
+        // proof that the OWNED scope was applied is the metric, not the read params.
+        assert.equal(params?.job_ids, undefined);
+        return scopedSuccess(toolName, [
+          { id: 1, job_id: 9001003, application_id: 101, status: "Accepted", sent_on: "2026-06-01" },
+          { id: 2, job_id: 9001001, application_id: 102, status: "Rejected", sent_on: "2026-06-02" },
+        ]);
+      }
+      throw new Error(`unexpected ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate across all my open reqs?",
+    });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope_resolution_required, undefined);
+    assert.equal(out.summary.scope.source, "scope_handle", "owner intent wins over the permitted-set reading");
+    assert.equal(out.summary.scope.job_count, 1);
+    assert.ok(out.summary.scope.warnings.some((w: string) => /Owner filter applied/.test(w)));
+    assert.equal(out.summary.rows_considered, 1, "only the owned req's offer is in scope");
+  });
+
+  // Item 12: `broad_scope` rides the PHRASE alone, so "the entire <req>" threw away a real match.
+  it("item 12: a broad word next to a NAMED req keeps the req's scope and says why", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_applications") {
+        assert.equal(params?.job_ids, "9001006", "the named req survives the broad wording");
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 9001006, stage_id: 7, stage_name: "Phone Screen", status: "active", current_stage_at: "2026-06-01T00:00:00.000Z", last_activity_at: "2026-06-01T00:00:00.000Z" },
+        ]);
+      }
+      if (toolName === "list_application_stages") {
+        return scopedSuccess(toolName, [
+          { id: 4001, application_id: 100, job_interview_stage_id: 7, entered_at: "2026-06-01T00:00:00.000Z", exited_at: null, days_in_stage: 22, current: true },
+        ]);
+      }
+      throw new Error(`unexpected ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "Where is the entire Senior AI Solutions Engineer - US pipeline stuck?",
+    });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope_resolution_required, undefined);
+    assert.equal(out.summary.scope.job_count, 1);
+    assert.ok(
+      out.summary.scope.warnings.some((w: string) => /analysis (wording|phrasing)/i.test(w)),
+      `the broad wording must be disclosed as read-as-analysis, got ${JSON.stringify(out.summary.scope.warnings)}`
+    );
+  });
+
   it("A5: a narrow recruiter's reads are unchanged; only the disclosed header is new", async () => {
     const broadPhrase = offerReader();
     const { runtime: broadRuntime } = testRuntime(broadPhrase, {
@@ -579,13 +805,20 @@ describe("answer_my_recruiting_question — org-wide default (CLO-274)", () => {
     const broadOut = broadResult.ok ? (broadResult.data as any) : null;
     const plainOut = plainResult.ok ? (plainResult.data as any) : null;
 
-    // Identical reads: the scoped core already bounds a narrow recruiter to their permitted jobs,
-    // so a broad phrase changes nothing about what is read.
+    // Item 19: pinned ABSOLUTELY, not relative to a sibling run. Two runs that both silently
+    // narrowed would still be deepStrictEqual to each other; only naming the expected read
+    // catches a regression that changes BOTH.
+    const expectedReads = [{ toolName: "list_offers", job_ids: undefined }];
     assert.deepStrictEqual(
       broadPhrase.calls.map((c) => ({ toolName: c.toolName, job_ids: c.params?.job_ids })),
-      plain.calls.map((c) => ({ toolName: c.toolName, job_ids: c.params?.job_ids }))
+      expectedReads,
+      "a narrow recruiter's broad-phrase question reads exactly one unscoped list_offers"
     );
-    assert.deepStrictEqual(broadPhrase.calls.map((c) => c.toolName), ["list_offers"]);
+    assert.deepStrictEqual(
+      plain.calls.map((c) => ({ toolName: c.toolName, job_ids: c.params?.job_ids })),
+      expectedReads,
+      "and so does the same question without the broad phrase"
+    );
     for (const out of [broadOut, plainOut]) {
       assert.equal(out.summary.scope_resolution_required, undefined);
       assert.equal(out.summary.scope.source, "permission_scope");

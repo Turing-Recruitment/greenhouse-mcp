@@ -185,6 +185,36 @@ describe("job scope resolver — additional matrix cases", () => {
     );
   });
 
+  // Item 10: the resolved-admin disclosure said the scope was resolved "across more than your own
+  // assigned reqs" — false for a deterministic "my reqs" result, which is EXACTLY the assignments.
+  it("item 10: a deterministic admin owner scope discloses broad visibility without claiming it exceeded assignments", async () => {
+    const load = buildFixtureInventory(fixture, "site_admin");
+    assert.equal(load.ok, true);
+    if (!load.ok) throw new Error("inventory load failed");
+    const output = resolveJobScope(
+      { filters: { my_jobs_only: true }, purpose: "general_question" },
+      {
+        inventory: load.inventory,
+        subject: "email:site_admin",
+        signer,
+        nowMs: NOW,
+        ownerScopedJobIds: new Set([9001003]),
+      }
+    );
+
+    assert.equal(output.resolution_status, "resolved");
+    assert.ok(output.confirmation.reason_codes.includes("admin_scope"), "broad visibility is still disclosed");
+    assert.ok(
+      output.warnings.some((w) => /broad Greenhouse visibility/i.test(w)),
+      `expected a broad-visibility disclosure, got ${JSON.stringify(output.warnings)}`
+    );
+    assert.equal(
+      output.warnings.some((w) => /more than your own assigned reqs/i.test(w)),
+      false,
+      "an owner-resolved scope IS the actor's assignments; saying otherwise is false"
+    );
+  });
+
   it("CLO-274: a broad or multi-job admin scope still requires confirmation (the narrowing that survives)", async () => {
     const broad = await resolveCase("site_admin", { query: "all open jobs" });
     assert.equal(broad.resolution_status, "needs_confirmation");

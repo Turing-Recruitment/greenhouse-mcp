@@ -16,7 +16,9 @@ import { analysisRuntime, fakeScopedReader, scopedSuccess } from "./test-helpers
 // a labeled approximation is the planner declining to route the question, not the advertised recipe
 // executing. Counting it as a run would let a "planned" recipe pass on the strength of an
 // approximation that never touched its data.
-const NON_RUN_MODES = new Set(["missing_domain", "unrecognized_question", "resolution_required", "approximate_composite"]);
+// "empty_scope" is not-run for the same reason: the scope the question asked for resolved to
+// nothing, so no recipe touched its data.
+const NON_RUN_MODES = new Set(["missing_domain", "unrecognized_question", "resolution_required", "approximate_composite", "empty_scope"]);
 
 function genericReader() {
   const row = {

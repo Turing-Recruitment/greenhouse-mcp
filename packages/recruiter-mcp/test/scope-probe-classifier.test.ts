@@ -112,12 +112,15 @@ describe("classifyScopeProbe — the org-wide default policy (A7, CLO-274)", () 
     assert.equal(decision.kind, "use_scope");
   });
 
-  it("no_match -> org_wide with the 'no req named' warning", () => {
+  // Item 13: no_match is only reachable when the question DID carry terms (an empty/role-less
+  // question is synthesized to the permitted set instead), so the disclosure says the terms
+  // missed — not that nothing was named.
+  it("no_match -> org_wide saying the question's terms matched no requisition", () => {
     const decision = classifyScopeProbe(probeOutput({ status: "no_match" }), inventory());
     assert.equal(decision.kind, "org_wide");
     assert.ok(
-      decision.kind === "org_wide" && decision.warnings.some((w) => /No specific requisition was named/i.test(w)),
-      "the answer must say the question named no req"
+      decision.kind === "org_wide" && decision.warnings.some((w) => /matched no requisition|no requisition matched/i.test(w)),
+      "the answer must say the named terms matched nothing"
     );
   });
 
@@ -177,13 +180,89 @@ describe("classifyScopeProbe — the org-wide default policy (A7, CLO-274)", () 
     assert.ok(confidential.kind === "use_scope" && confidential.warnings.some((w) => /1 confidential req/i.test(w)));
   });
 
-  it("a stale index warns but never blocks", () => {
+  // Item 7 (principal's ruling): a named req found under a stale index is MORE useful than an
+  // org-wide answer, so the outcome is use_scope with the staleness disclosed. "not confirm" was
+  // too weak an assertion — it passed equally for org_wide, which is a different answer.
+  it("a stale index on a NAMED match uses that scope and warns (never blocks, never widens)", () => {
     const decision = classifyScopeProbe(
       probeOutput({ status: "needs_confirmation", reasonCodes: ["stale_index"], matches: [{ id: 9001006 }] }),
       inventory()
     );
-    assert.notEqual(decision.kind, "confirm");
-    assert.ok(decision.kind !== "confirm" && decision.warnings.some((w) => /stale/i.test(w)));
+    assert.equal(decision.kind, "use_scope");
+    assert.ok(decision.kind === "use_scope" && decision.warnings.some((w) => /stale/i.test(w)));
+  });
+
+  // Item 18: the two clauses of the named-selection discriminator, isolated. Each of these
+  // fails if the OTHER clause is deleted, so neither can rot unnoticed.
+  it("item 18 (band clause): ONE match at band low is not a named selection -> org_wide", () => {
+    const decision = classifyScopeProbe(
+      probeOutput({ status: "needs_confirmation", reasonCodes: ["low_confidence"], band: "low", matches: [{ id: 9001006 }] }),
+      inventory()
+    );
+    assert.equal(decision.kind, "org_wide");
+  });
+
+  it("item 18 (band clause): ONE match at band none is not a named selection -> org_wide", () => {
+    const decision = classifyScopeProbe(
+      probeOutput({ status: "needs_confirmation", reasonCodes: ["low_confidence"], band: "none", matches: [{ id: 9001006 }] }),
+      inventory()
+    );
+    assert.equal(decision.kind, "org_wide");
+  });
+
+  // Item 12: `broad_scope` rides the PHRASE alone (resolver.ts sets it for "all"/"every"/"entire"),
+  // so keying the discriminator off its absence threw away a real, unique, high-band match.
+  it("item 12 (broad clause): a broad token alongside a unique HIGH-band match still uses that scope", () => {
+    const decision = classifyScopeProbe(
+      probeOutput({
+        status: "needs_confirmation",
+        reasonCodes: ["broad_scope"],
+        band: "high",
+        matches: [{ id: 9001006 }],
+      }),
+      inventory()
+    );
+    assert.equal(decision.kind, "use_scope");
+    assert.ok(
+      decision.kind === "use_scope" && decision.warnings.some((w) => /analysis (wording|phrasing)/i.test(w)),
+      `the broad wording must be disclosed as read-as-analysis, got ${JSON.stringify(decision.kind === "use_scope" ? decision.warnings : [])}`
+    );
+  });
+
+  it("item 12: the SYNTHESIZED all-permitted set (broad_scope at band none) is still org_wide", () => {
+    const inv = inventory();
+    const decision = classifyScopeProbe(
+      probeOutput({
+        status: "needs_confirmation",
+        reasonCodes: ["broad_scope", "multiple_matches", "low_confidence"],
+        band: "none",
+        matches: inv.records.map((record) => ({ id: record.greenhouse_job_id })),
+      }),
+      inv
+    );
+    assert.equal(decision.kind, "org_wide");
+  });
+
+  // Item 13: the resolver's own warnings were dropped on the no_match branch, and every org_wide
+  // path claimed "no req was named" even when the question named one that missed.
+  it("item 13: the resolver's own warnings reach the answer, and a MISSED name says so", () => {
+    const output = probeOutput({ status: "no_match" });
+    output.warnings = ["Some query terms did not match any scoped job: brazil."];
+    const decision = classifyScopeProbe(output, inventory());
+    assert.equal(decision.kind, "org_wide");
+    assert.ok(
+      decision.kind === "org_wide" && decision.warnings.includes("Some query terms did not match any scoped job: brazil."),
+      `the resolver's warnings must not be dropped, got ${JSON.stringify(decision.kind === "org_wide" ? decision.warnings : [])}`
+    );
+    assert.ok(
+      decision.kind === "org_wide" && decision.warnings.some((w) => /matched no requisition|no requisition matched/i.test(w)),
+      "a question whose terms missed must not claim no req was named"
+    );
+    assert.equal(
+      decision.kind === "org_wide" && decision.warnings.some((w) => /No specific requisition was named/i.test(w)),
+      false,
+      "the 'named nothing' wording belongs only to a question that named nothing"
+    );
   });
 
   it("the REAL org-wide probe (multiple_matches + broad_scope + low_confidence + contains_confidential_jobs) -> org_wide", () => {
