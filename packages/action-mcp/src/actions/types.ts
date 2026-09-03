@@ -1,6 +1,7 @@
 import type { z } from "zod";
 import type {
   ActionKind,
+  AttributionMode,
   ActionRecord,
   Clock,
   GreenhouseGateway,
@@ -12,6 +13,7 @@ import type {
 
 export interface ActionContext {
   actorUserId: number;
+  readonly attributionMode?: AttributionMode;
   greenhouse: GreenhouseGateway;
   signingSecret: string;
   clock: Clock;

@@ -1,4 +1,5 @@
 import { GreenhouseError } from "../src/greenhouse.js";
+import type { AttributionMode } from "../src/greenhouse.js";
 import type {
   FenceTarget,
   TargetVisibilityProbe,
@@ -253,6 +254,8 @@ export class RouteGreenhouse implements GreenhouseGateway {
   private readonly listHandlers = new Map<string, ListHandler>();
   private readonly mutationHandlers = new Map<string, MutationHandler>();
 
+  constructor(readonly attributionMode: AttributionMode = "service_user") {}
+
   onList(path: string, handler: ListHandler): this {
     this.listHandlers.set(path, handler);
     return this;
@@ -290,8 +293,8 @@ export class RouteGreenhouse implements GreenhouseGateway {
 
 export type MutationBehavior = "success" | "definite_failure" | "ambiguous_desired" | "ambiguous_original";
 
-export function assignmentGreenhouse() {
-  const greenhouse = new RouteGreenhouse();
+export function assignmentGreenhouse(attributionMode: AttributionMode = "service_user") {
+  const greenhouse = new RouteGreenhouse(attributionMode);
   const state = {
     application: {
       id: 100,
@@ -314,6 +317,7 @@ export function assignmentGreenhouse() {
     candidate: { id: 300, first_name: "Priya", last_name: "Raman" } as GreenhouseRow,
     currentStage: { id: 500, application_id: 100, job_interview_stage_id: 601, current: true },
     permitted: true,
+    permittedUserIds: new Set([10, 40]),
     mutationBehavior: "success" as MutationBehavior,
   };
 
@@ -325,7 +329,7 @@ export function assignmentGreenhouse() {
     }))
     .onList("/jobs", (params) => params.ids === "200" ? [state.job] : [])
     .onList("/candidates", (params) => params.ids === "300" ? [state.candidate] : [])
-    .onList("/user_job_permissions", (params) => state.permitted
+    .onList("/user_job_permissions", (params) => state.permitted && state.permittedUserIds.has(Number(params.user_ids))
       ? [{ id: 900, user_id: Number(params.user_ids), job_id: Number(params.job_ids), role_id: 1, automated: false }]
       : [])
     .onList("/application_stages", () => [state.currentStage])

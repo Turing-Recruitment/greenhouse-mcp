@@ -74,12 +74,14 @@ export class GreenhouseActionService {
     // has been returned to the caller yet, so fencing here prevents every disclosure, including the
     // no-change echo of current state.
     await this.assertTargetsVisible(prepared.fenceTargets);
+    const attribution = await this.attribution(identity.greenhouseUserId, prepared.changeRequired);
     if (!prepared.changeRequired) {
       return {
         status: "no_change",
         change_required: false,
         high_impact: prepared.highImpact,
         actor: { greenhouse_user_id: identity.greenhouseUserId },
+        attribution,
         ...prepared.preview,
         approval: prepared.approval,
         intent: null,
@@ -90,6 +92,7 @@ export class GreenhouseActionService {
       session: this.config.session,
       identityId: identity.identityId,
       actorUserId: identity.greenhouseUserId,
+      attributionMode: this.config.greenhouse.attributionMode,
       applyTool: definition.applyTool,
       prepared,
       nowMs: this.clock.now(),
@@ -99,6 +102,7 @@ export class GreenhouseActionService {
       change_required: true,
       high_impact: prepared.highImpact,
       actor: { greenhouse_user_id: identity.greenhouseUserId },
+      attribution,
       ...prepared.preview,
       approval: prepared.approval,
       intent: issued.token,
@@ -154,6 +158,12 @@ export class GreenhouseActionService {
 
     let freshPrepared: PreparedAction;
     try {
+      if (intent.attributionMode !== this.config.greenhouse.attributionMode) {
+        throw new ActionDeniedError(
+          "ATTRIBUTION_MODE_CHANGED",
+          "Greenhouse attribution mode changed; create a new preview.",
+        );
+      }
       freshPrepared = await definition.prepareApply(approval, this.context(identity.greenhouseUserId));
       this.assertPreparedMatches(intent, freshPrepared);
       // The apply fence — §4.3. Fresh targets from the fresh preparation; a valid signed intent
@@ -246,9 +256,35 @@ export class GreenhouseActionService {
   private context(actorUserId: number): ActionContext {
     return {
       actorUserId,
+      attributionMode: this.config.greenhouse.attributionMode,
       greenhouse: this.config.greenhouse,
       signingSecret: this.config.signingSecret,
       clock: this.clock,
+    };
+  }
+
+  private async attribution(actorUserId: number, changeRequired: boolean): Promise<Record<string, unknown>> {
+    let actorName: string | null = null;
+    try {
+      const rows = await this.config.greenhouse.list("/users", {
+        ids: String(actorUserId), fields: "id,name", show_service_accounts: "true", per_page: "1",
+      }, actorUserId);
+      const actor = rows.find((row) => row.id === actorUserId);
+      actorName = actor && typeof actor.name === "string" && actor.name.length > 0 ? actor.name : null;
+    } catch {
+      // Attribution labels are disclosure only; authorization already ran in action preparation.
+    }
+    const mode = this.config.greenhouse.attributionMode;
+    return {
+      mode,
+      recorded_as: mode === "per_human" ? "actor" : "service_account",
+      actor_greenhouse_user_id: actorUserId,
+      actor_name: actorName,
+      sentence: !changeRequired
+        ? "No write will occur, so nothing will be recorded in Greenhouse."
+        : mode === "per_human"
+          ? `This change will be recorded in Greenhouse under ${actorName ?? "(name unavailable)"} (you).`
+          : "This change will be recorded in Greenhouse under the integration's service account, not your name.",
     };
   }
 
@@ -435,6 +471,7 @@ async function reconcileUnknown(
   const definition = actionDefinition(record.actionKind);
   const observation = await observeWithDelays(definition, record, {
     actorUserId: record.actorUserId,
+    attributionMode: greenhouse.attributionMode,
     greenhouse,
     signingSecret,
     clock,

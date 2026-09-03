@@ -215,26 +215,45 @@ describe("Greenhouse v3 gateway", () => {
     await assert.rejects(hostile.list("/users", {}, 10), /left the Harvest API origin/);
   });
 
-  test("per-human mode reuses the actor-sub token for reads and writes", async () => {
+  test("per-human mode keeps reads on the ISU token and writes on the actor token", async () => {
     const tokenBodies: string[] = [];
-    const apiAuth: string[] = [];
+    const readAuth: string[] = [];
+    const writeAuth: string[] = [];
+    let reads = 0;
     const gateway = createGreenhouseGateway({
       clientId: "client", clientSecret: "secret", attributionMode: "per_human",
       fetchImpl: async (input, init = {}) => {
         const url = String(input);
         if (url.includes("auth.greenhouse.io")) {
           tokenBodies.push(String(init.body));
-          return tokenResponse(10);
+          const sub = new URLSearchParams(String(init.body)).get("sub");
+          return Response.json({
+            access_token: `token-${tokenBodies.length}-${sub ?? "isu"}`,
+            expires_at: "2099-01-01T00:00:00.000Z",
+          });
         }
-        apiAuth.push(new Headers(init.headers).get("authorization") ?? "");
-        return init.method === "GET" ? Response.json([{ id: 100 }]) : Response.json({ id: 100 });
+        const authorization = new Headers(init.headers).get("authorization") ?? "";
+        if (init.method === "GET") {
+          readAuth.push(authorization);
+          reads += 1;
+          return reads === 1 ? new Response(null, { status: 401 }) : Response.json([{ id: 100 }]);
+        }
+        writeAuth.push(authorization);
+        return Response.json({ id: 100 });
       },
     });
     await gateway.list("/applications", { ids: "100" }, 10);
     await gateway.mutate({ method: "PATCH", path: "/applications/100", body: { recruiter_id: 40 }, actorUserId: 10 });
-    assert.deepEqual(tokenBodies, ["grant_type=client_credentials&sub=10"]);
-    assert.equal(new Set(apiAuth).size, 1);
-    assert.match(apiAuth[0]!, /^Bearer /);
+    assert.deepEqual(tokenBodies, [
+      "grant_type=client_credentials",
+      "grant_type=client_credentials",
+      "grant_type=client_credentials&sub=10",
+    ]);
+    assert.deepEqual(readAuth, [
+      "Bearer token-1-isu",
+      "Bearer token-2-isu",
+    ]);
+    assert.deepEqual(writeAuth, ["Bearer token-3-10"]);
   });
 
   test("per-human environment mode is closed until the live token probe is attested", () => {

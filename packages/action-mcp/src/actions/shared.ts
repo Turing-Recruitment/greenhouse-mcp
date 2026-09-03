@@ -29,10 +29,13 @@ export interface CurrentStage {
   current: boolean;
 }
 
-export async function authorizedApplication(applicationId: number, context: ActionContext): Promise<ApplicationState> {
+export async function authorizedApplication(
+  applicationId: number,
+  context: ActionContext,
+): Promise<ApplicationState & { jobConfidential: boolean }> {
   const application = await getApplication(applicationId, context);
-  await assertJobAccess(application.jobId, context);
-  return application;
+  const { job } = await assertJobAccess(application.jobId, context);
+  return { ...application, jobConfidential: job.confidential as boolean };
 }
 
 export async function getApplication(applicationId: number, context: ActionContext): Promise<ApplicationState> {
@@ -73,7 +76,7 @@ export async function getCurrentStage(applicationId: number, context: ActionCont
   };
 }
 
-export async function assertJobAccess(jobId: number, context: ActionContext): Promise<void> {
+export async function assertJobAccess(jobId: number, context: ActionContext): Promise<{ actor: GreenhouseRow; job: GreenhouseRow }> {
   const [users, jobs, permissions] = await Promise.all([
     context.greenhouse.list("/users", {
       ids: String(context.actorUserId),
@@ -97,24 +100,35 @@ export async function assertJobAccess(jobId: number, context: ActionContext): Pr
   if (!(actor.site_admin && job.confidential === false) && !explicit) {
     throw new ActionDeniedError("JOB_PERMISSION_DENIED", "Actor does not currently have access to this job.");
   }
+  return { actor, job };
 }
 
 export async function assertActiveUser(userId: number, context: ActionContext): Promise<GreenhouseRow> {
   const rows = await context.greenhouse.list("/users", {
-    ids: String(userId), fields: "id,name,deactivated,site_admin", show_service_accounts: "true",
+    ids: String(userId), fields: "id,name,deactivated,site_admin,agency_id", show_service_accounts: "true",
   }, context.actorUserId);
   const user = uniqueById(rows, userId, "Greenhouse user");
   if (user.deactivated !== false) throw new ActionDeniedError("USER_INACTIVE", "Selected Greenhouse user is not active.");
+  if (typeof user.site_admin !== "boolean") {
+    throw new ActionDeniedError("UPSTREAM_STATE_INVALID", "Greenhouse omitted the selected user's site-admin state.");
+  }
   return user;
 }
 
-export async function assertUserMayOwnJob(userId: number, jobId: number, context: ActionContext): Promise<GreenhouseRow> {
+export async function assertUserMayOwnJob(
+  userId: number,
+  jobId: number,
+  job: GreenhouseRow,
+  context: ActionContext,
+): Promise<GreenhouseRow> {
   const user = await assertActiveUser(userId, context);
-  if (user.site_admin === true) return user;
   const permissions = await context.greenhouse.list("/user_job_permissions", {
     user_ids: String(userId), job_ids: String(jobId), fields: "id,user_id,job_id,role_id,automated",
   }, context.actorUserId);
-  if (!permissions.some((row) => row.user_id === userId && row.job_id === jobId)) {
+  const explicit = permissions.some((row) => row.user_id === userId && row.job_id === jobId);
+  // Greenhouse Harvest v3 users schema 0169:798 limits implicit site-admin access to
+  // non-confidential jobs; a confidential job therefore still needs an explicit permission row.
+  if (!(user.site_admin === true && job.confidential === false) && !explicit) {
     throw new ActionDeniedError("USER_JOB_PERMISSION_DENIED", "Selected user does not have access to this job.");
   }
   return user;

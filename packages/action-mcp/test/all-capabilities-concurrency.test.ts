@@ -103,6 +103,44 @@ describe("all action kinds share exactly-once apply behavior", () => {
     assert.deepEqual([...SCENARIOS.map(({ kind }) => kind)].sort(), [...ACTION_KINDS].sort());
   });
 
+  test("every action kind discloses service-account and per-human attribution outside approval", async () => {
+    for (const scenario of SCENARIOS) {
+      const previews = [];
+      for (const mode of ["service_user", "per_human"] as const) {
+        const clock = new TestClock();
+        const store = new MemoryActionStore(clock);
+        const greenhouse = greenhouseFor(scenario.kind, mode);
+        const preview = await serviceFor(store, greenhouse, clock).preview(scenario.kind, scenario.preview);
+        assert.deepEqual(preview.attribution, {
+          mode,
+          recorded_as: mode === "per_human" ? "actor" : "service_account",
+          actor_greenhouse_user_id: 10,
+          actor_name: "Actor",
+          sentence: mode === "per_human"
+            ? "This change will be recorded in Greenhouse under Actor (you)."
+            : "This change will be recorded in Greenhouse under the integration's service account, not your name.",
+        }, `${scenario.kind}:${mode}`);
+        assert.equal(Object.hasOwn(preview.approval as object, "attribution"), false, scenario.kind);
+        previews.push(preview);
+      }
+      assert.deepEqual(previews[0]!.approval, previews[1]!.approval, `${scenario.kind}: approval is mode-independent`);
+    }
+
+    const clock = new TestClock();
+    const store = new MemoryActionStore(clock);
+    const greenhouse = greenhouseFor("application_assignment_change", "per_human");
+    const noChange = await serviceFor(store, greenhouse, clock).preview("application_assignment_change", {
+      application_id: 100, assignment_role: "recruiter", proposed_user_id: 20,
+    });
+    assert.deepEqual(noChange.attribution, {
+      mode: "per_human",
+      recorded_as: "actor",
+      actor_greenhouse_user_id: 10,
+      actor_name: "Actor",
+      sentence: "No write will occur, so nothing will be recorded in Greenhouse.",
+    });
+  });
+
   for (const scenario of SCENARIOS) {
     test(`${scenario.kind}: concurrent double-click and replay send one exact mutation`, async () => {
       const { service, greenhouse, store } = fixture(scenario.kind);
@@ -436,7 +474,7 @@ function serviceFor(
   });
 }
 
-function greenhouseFor(kind: ActionKind): RouteGreenhouse {
+function greenhouseFor(kind: ActionKind, attributionMode: "service_user" | "per_human" = "service_user"): RouteGreenhouse {
   const unreject = kind === "application_unreject";
   const application: GreenhouseRow = {
     id: 100,
@@ -505,7 +543,7 @@ function greenhouseFor(kind: ActionKind): RouteGreenhouse {
     custom_fields: {},
   }] : [];
 
-  const greenhouse = new RouteGreenhouse()
+  const greenhouse = new RouteGreenhouse(attributionMode)
     .onList("/applications", (params) => includesId(params.ids, 100) ? [application] : [])
     .onList("/users", (params) => users.filter((row) => includesId(params.ids, Number(row.id))))
     .onList("/jobs", (params) => includesId(params.ids, 200) ? [{ id: 200, confidential: false }] : [])

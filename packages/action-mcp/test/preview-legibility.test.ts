@@ -87,6 +87,24 @@ describe("preview legibility", () => {
     assert.equal(subject.job, "Staff Forward Deployed AI Engineer - India", "the other label still resolves");
   });
 
+  test("an actor-name lookup failure does not block attribution disclosure", async () => {
+    const { service, greenhouse } = fixture();
+    greenhouse.onList("/users", (params) => {
+      if (params.per_page === "1") throw new Error("actor label unavailable");
+      const id = Number(params.ids);
+      return [{ id, name: id === 10 ? "Actor" : "Proposed", deactivated: false, site_admin: false }];
+    });
+    const preview = await service.preview("application_stage_move", { application_id: 100, to_stage_id: 602 });
+    assert.equal(preview.status, "ready");
+    assert.deepEqual(preview.attribution, {
+      mode: "service_user",
+      recorded_as: "service_account",
+      actor_greenhouse_user_id: 10,
+      actor_name: null,
+      sentence: "This change will be recorded in Greenhouse under the integration's service account, not your name.",
+    });
+  });
+
   test("every capability that has a candidate names one", async () => {
     // The population, not one sample. An action whose preview omits the subject is one whose approval
     // a human cannot check, and there is no capability here without at least a job.

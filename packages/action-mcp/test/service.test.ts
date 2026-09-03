@@ -50,10 +50,62 @@ async function previewApplyInput(service: GreenhouseActionService): Promise<Reco
 }
 
 describe("GreenhouseActionService", () => {
+  test("an intent cannot cross attribution modes", async () => {
+    const clock = new TestClock();
+    const store = new MemoryActionStore(clock);
+    const { greenhouse } = assignmentGreenhouse("per_human");
+    const previewService = new GreenhouseActionService({
+      session: testSession(), store, greenhouse, signingSecret: TEST_SECRET,
+      visibility: allowAllVisibility(), writesEnabled: true, production: false, clock,
+    });
+    const preview = await previewService.preview("application_assignment_change", {
+      application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+    });
+    const serviceUserGreenhouse: GreenhouseGateway = {
+      attributionMode: "service_user",
+      probe: greenhouse.probe.bind(greenhouse),
+      list: greenhouse.list.bind(greenhouse),
+      mutate: greenhouse.mutate.bind(greenhouse),
+    };
+    const applyService = new GreenhouseActionService({
+      session: testSession(), store, greenhouse: serviceUserGreenhouse, signingSecret: TEST_SECRET,
+      visibility: allowAllVisibility(), writesEnabled: true, production: false, clock,
+    });
+
+    const result = await applyService.apply("application_assignment_change", {
+      intent: preview.intent, approval: preview.approval,
+    });
+    assert.equal(result.state, "failed");
+    assert.equal(result.error_code, "ATTRIBUTION_MODE_CHANGED");
+    assert.equal(greenhouse.mutationCalls.length, 0);
+  });
+
+  test("stage-move attribution survives signed preview and apply without changing approval", async () => {
+    const clock = new TestClock();
+    const store = new MemoryActionStore(clock);
+    const { greenhouse } = assignmentGreenhouse("per_human");
+    const service = new GreenhouseActionService({
+      session: testSession(), store, greenhouse, signingSecret: TEST_SECRET,
+      visibility: allowAllVisibility(), writesEnabled: true, production: false, clock,
+    });
+    const preview = await service.preview("application_stage_move", { application_id: 100, to_stage_id: 602 });
+    assert.equal((preview.attribution as { mode: string }).mode, "per_human");
+    const decoded = JSON.parse(Buffer.from(String(preview.intent).split(".")[0]!, "base64url").toString("utf8")) as {
+      attributionMode?: string;
+    };
+    assert.equal(decoded.attributionMode, "per_human");
+    const approval = structuredClone(preview.approval);
+    const result = await service.apply("application_stage_move", { intent: preview.intent, approval });
+    assert.equal(result.state, "succeeded");
+    assert.deepEqual(preview.approval, approval);
+    assert.equal(greenhouse.mutationCalls.length, 1);
+  });
+
   test("preserves only safe upstream diagnostics when preview reads fail", async () => {
     const clock = new TestClock();
     const store = new MemoryActionStore(clock);
     const greenhouse = {
+      attributionMode: "service_user" as const,
       async probe() {},
       async list() {
         throw new GreenhouseError("sensitive upstream detail", {

@@ -1,12 +1,90 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { actionDefinition } from "../src/actions/index.js";
+import { ActionDeniedError } from "../src/errors.js";
+import { GreenhouseActionService } from "../src/service.js";
 import type { ActionRecord, GreenhouseRow, MutationPlan, PreparedAction } from "../src/types.js";
-import { assignmentGreenhouse, RouteGreenhouse, TEST_SECRET, TestClock } from "./helpers.js";
+import {
+  MemoryActionStore,
+  assignmentGreenhouse,
+  RouteGreenhouse,
+  TEST_SECRET,
+  TestClock,
+  allowAllVisibility,
+  testSession,
+} from "./helpers.js";
 
 const clock = new TestClock();
 
 describe("action-specific variants", () => {
+  test("assignment previews disclose the proposed user's job access without denying internal users", async () => {
+    const warning = "Proposed has no permission row on req 200 and may not be able to open this application in Greenhouse; grant access in Greenhouse or add them as a job owner first.";
+    const existingEffect = "Changes only the selected assignment field; the sibling recruiter/coordinator field is not patched.";
+
+    {
+      const { greenhouse, state } = assignmentGreenhouse();
+      state.permittedUserIds.delete(40);
+      const action = await actionDefinition("application_assignment_change").preparePreview({
+        application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+      }, context(greenhouse));
+      assert.deepEqual((action.preview as { effects: string[] }).effects, [existingEffect, warning]);
+    }
+    {
+      const { greenhouse, state } = assignmentGreenhouse();
+      state.users.set(40, { ...state.users.get(40), id: 40, agency_id: 77 });
+      await assert.rejects(actionDefinition("application_assignment_change").preparePreview({
+        application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+      }, context(greenhouse)), (error: unknown) => error instanceof ActionDeniedError
+        && error.code === "USER_JOB_PERMISSION_DENIED" && /agency 77/.test(error.message));
+    }
+    {
+      const { greenhouse } = assignmentGreenhouse();
+      const action = await actionDefinition("application_assignment_change").preparePreview({
+        application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+      }, context(greenhouse));
+      assert.equal((action.preview as { effects: string[] }).effects.at(-1), "Proposed can open this job (explicit permission)");
+    }
+    {
+      const { greenhouse, state } = assignmentGreenhouse();
+      state.permittedUserIds.delete(40);
+      state.users.set(40, { ...state.users.get(40), id: 40, site_admin: true });
+      const action = await actionDefinition("application_assignment_change").preparePreview({
+        application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+      }, context(greenhouse));
+      assert.equal((action.preview as { effects: string[] }).effects.at(-1), "Proposed can open this job (site admin, non-confidential job)");
+    }
+    {
+      const { greenhouse, state } = assignmentGreenhouse();
+      state.permittedUserIds.delete(40);
+      state.users.set(40, { ...state.users.get(40), id: 40, site_admin: true });
+      state.job.confidential = true;
+      const action = await actionDefinition("application_assignment_change").preparePreview({
+        application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+      }, context(greenhouse));
+      assert.equal((action.preview as { effects: string[] }).effects.at(-1), warning);
+    }
+  });
+
+  test("assignment access removed after preview fails before mutation", async () => {
+    const localClock = new TestClock();
+    const { greenhouse, state } = assignmentGreenhouse();
+    const service = new GreenhouseActionService({
+      session: testSession(), store: new MemoryActionStore(localClock), greenhouse,
+      signingSecret: TEST_SECRET, visibility: allowAllVisibility(), writesEnabled: true,
+      production: false, clock: localClock,
+    });
+    const preview = await service.preview("application_assignment_change", {
+      application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+    });
+    state.permittedUserIds.delete(40);
+    const result = await service.apply("application_assignment_change", {
+      intent: preview.intent, approval: preview.approval,
+    });
+    assert.equal(result.state, "failed");
+    assert.equal(result.error_code, "STATE_CHANGED");
+    assert.equal(greenhouse.mutationCalls.length, 0);
+  });
+
   test("coordinator assignment patches and observes only the selected assignment field", async () => {
     const { greenhouse, state } = assignmentGreenhouse();
     const definition = actionDefinition("application_assignment_change");

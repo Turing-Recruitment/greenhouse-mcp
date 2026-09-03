@@ -24,7 +24,10 @@ const WIRE_CASES: ReadonlyArray<{
 }> = [
   {
     kind: "application_assignment_change",
-    binding: { application_id: 100, assignment_role: "recruiter", previous_user_id: 20, proposed_user_id: 40 },
+    binding: {
+      application_id: 100, assignment_role: "recruiter", previous_user_id: 20,
+      proposed_user_id: 40, assignee_access: "explicit_permission",
+    },
     approval: { application_id: 100, job_id: 200, assignment_role: "recruiter", current_user_id: 20, proposed_user_id: 40 },
     expected: { method: "PATCH", path: "/applications/100", body: { recruiter_id: 40 } },
   },
@@ -173,6 +176,28 @@ describe("action endpoint contracts", () => {
 });
 
 describe("action-specific reconciliation and normalization", () => {
+  test("job-owner adds honor confidential-job access for the selected user", async () => {
+    const prepare = async (siteAdmin: boolean, confidential: boolean, explicit: boolean) => {
+      const greenhouse = authorizedRoutes()
+        .onList("/users", (params) => params.ids === "40"
+          ? [{ id: 40, name: "Owner", deactivated: false, site_admin: siteAdmin }]
+          : [{ id: 10, name: "Actor", deactivated: false, site_admin: false }])
+        .onList("/jobs", () => [{ id: 200, confidential }])
+        .onList("/user_job_permissions", (params) => params.user_ids === "10" || explicit
+          ? [{ id: 1, user_id: Number(params.user_ids), job_id: 200, role_id: 1, automated: false }]
+          : [])
+        .onList("/job_owners", () => []);
+      return actionDefinition("job_owner_change").preparePreview({
+        verb: "add", job_id: 200, user_id: 40, owner_type: "sourcer",
+      }, { actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock });
+    };
+
+    await assert.rejects(prepare(true, true, false), (error: unknown) =>
+      error instanceof Error && "code" in error && error.code === "USER_JOB_PERMISSION_DENIED");
+    assert.equal((await prepare(true, false, false)).changeRequired, true);
+    assert.equal((await prepare(false, true, true)).changeRequired, true);
+  });
+
   test("unreject resolves the prior stage against the LIVE tenant stage shape", async () => {
     // Measured read-only against the real tenant 2026-07-27, 40 rejected applications, 40/40:
     //   - rejection does NOT clear the stage — exactly one row keeps `current: true`
@@ -470,7 +495,7 @@ describe("action-specific reconciliation and normalization", () => {
       additional_identical_note_count: 50,
     });
     assert.doesNotThrow(() => issueActionIntent({
-      session: testSession(), identityId: IDENTITY_ID, actorUserId: 10,
+      session: testSession(), identityId: IDENTITY_ID, actorUserId: 10, attributionMode: "service_user",
       applyTool: "apply_candidate_note_create", prepared: candidate, nowMs: clock.now(),
     }, TEST_SECRET));
 
@@ -487,7 +512,7 @@ describe("action-specific reconciliation and normalization", () => {
     }, { actorUserId: 10, greenhouse: jobGreenhouse, signingSecret: TEST_SECRET, clock });
     assert.equal((job.binding as { baseline_count: number }).baseline_count, 250);
     assert.doesNotThrow(() => issueActionIntent({
-      session: testSession(), identityId: IDENTITY_ID, actorUserId: 10,
+      session: testSession(), identityId: IDENTITY_ID, actorUserId: 10, attributionMode: "service_user",
       applyTool: "apply_job_note_change", prepared: job, nowMs: clock.now(),
     }, TEST_SECRET));
   });

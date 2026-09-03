@@ -6,6 +6,7 @@ import type {
   ActionIntent,
   ActionKind,
   ActionSession,
+  AttributionMode,
   PreparedAction,
 } from "./types.js";
 
@@ -85,6 +86,7 @@ export function issueActionIntent(input: {
   session: ActionSession;
   identityId: string;
   actorUserId: number;
+  attributionMode: AttributionMode;
   applyTool: string;
   prepared: PreparedAction;
   nowMs: number;
@@ -97,6 +99,7 @@ export function issueActionIntent(input: {
     subject: input.session.subject,
     identityId: input.identityId,
     actorUserId: input.actorUserId,
+    attributionMode: input.attributionMode,
     sessionTokenId: input.session.tokenId,
     client: input.session.client,
     applyTool: input.applyTool,
@@ -147,11 +150,13 @@ export function parseActionBinding(kind: ActionKind, value: unknown): ActionBind
   if (!isRecord(value)) return null;
   switch (kind) {
     case "application_assignment_change":
-      return exact(value, ["application_id", "assignment_role", "previous_user_id", "proposed_user_id"])
+      return exact(value, ["application_id", "assignment_role", "previous_user_id", "proposed_user_id", "assignee_access"])
         && positive(value.application_id)
         && (value.assignment_role === "recruiter" || value.assignment_role === "coordinator")
         && nullablePositive(value.previous_user_id)
         && positive(value.proposed_user_id)
+        && (value.assignee_access === "explicit_permission"
+          || value.assignee_access === "site_admin_non_confidential" || value.assignee_access === "none")
         ? value as unknown as ActionBinding : null;
     case "job_owner_change":
       return exact(value, ["job_id", "user_id", "owner_type", "verb", "owner_row_id"])
@@ -226,7 +231,7 @@ function isExactSession(value: Record<string, unknown>): boolean {
 function isExactIntent(value: Record<string, unknown>): boolean {
   const kind = isActionKind(value.actionKind) ? value.actionKind : null;
   return exact(value, [
-    "version", "kind", "actionId", "actionKind", "subject", "identityId", "actorUserId",
+    "version", "kind", "actionId", "actionKind", "subject", "identityId", "actorUserId", "attributionMode",
     "sessionTokenId", "client", "applyTool", "lockKey", "scopeJobId", "binding",
     "currentFingerprint", "desiredFingerprint", "approvalFingerprint", "highImpact",
     "reconciliationGraceMs", "issuedAtMs", "expiresAtMs",
@@ -236,6 +241,7 @@ function isExactIntent(value: Record<string, unknown>): boolean {
     && kind !== null && isTrimmed(value.subject)
     && typeof value.identityId === "string" && UUID_PATTERN.test(value.identityId)
     && positive(value.actorUserId)
+    && (value.attributionMode === "service_user" || value.attributionMode === "per_human")
     && typeof value.sessionTokenId === "string" && TOKEN_ID_PATTERN.test(value.sessionTokenId)
     && isClient(value.client)
     && typeof value.applyTool === "string" && TOOL_PATTERN.test(value.applyTool)

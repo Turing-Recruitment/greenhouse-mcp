@@ -78,6 +78,7 @@ describe("action signing domains", () => {
       session: testSession(),
       identityId: IDENTITY_ID,
       actorUserId: 10,
+      attributionMode: "service_user",
       applyTool: "apply_candidate_note_create",
       prepared,
       nowMs: 1_700_000_100_000,
@@ -118,7 +119,7 @@ describe("action signing domains", () => {
       preview: {},
     };
     const issued = issueActionIntent({
-      session: testSession(), identityId: IDENTITY_ID, actorUserId: 10,
+      session: testSession(), identityId: IDENTITY_ID, actorUserId: 10, attributionMode: "service_user",
       applyTool: "apply_offer_create", prepared, nowMs: 1_700_000_100_000,
     }, TEST_SECRET);
     assert.ok(issued.token.length > 65_536);
