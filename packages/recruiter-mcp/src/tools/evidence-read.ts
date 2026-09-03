@@ -154,8 +154,10 @@ export async function runEvidenceListRead(
       if (bridgeSpec) {
         // A bridgeable read with NO confirmed scope is disclosed honestly with a pointer to narrow —
         // never a silent all-permitted result. The note is accurate to what actually bounds the read:
-        // a raw target-id filter narrows it; otherwise it spans all permitted jobs.
-        scopeEnvelope = unscopedBridgeableNote(safeParams, bridgeSpec);
+        // a raw target-id filter narrows it; otherwise it spans all permitted jobs. CLO-274: the
+        // permitted set is NAMED alongside the note (source permission_scope), so the envelope
+        // states the scope rather than only how to narrow it.
+        scopeEnvelope = buildUnscopedScopeEnvelope(unscopedBridgeableNote(safeParams, bridgeSpec), rows.permissionScope);
       }
     }
 
@@ -446,6 +448,7 @@ export function getScopeBridgeSpec(adapter: EvidenceEndpointAdapter | undefined)
         rawRowsRead: 0,
         returnedRowsRead: 0,
         permissionExcluded: 0,
+        privacyWithheld: 0,
         unresolvedRows: 0,
         pagesRead: 0,
         rateLimitRetries: 0,
@@ -554,6 +557,7 @@ async function deriveJoinBackedFilterIds(
   let rawRowsRead = 0;
   let returnedRowsRead = 0;
   let permissionExcluded = 0;
+  let privacyWithheld = 0;
   let unresolvedRows = 0;
   let pagesRead = 0;
   let rateLimitRetries = 0;
@@ -570,6 +574,7 @@ async function deriveJoinBackedFilterIds(
     rawRowsRead += hop.rawRowsRead;
     returnedRowsRead += hop.returnedRowsRead;
     permissionExcluded += hop.permissionExcluded;
+    privacyWithheld += hop.privacyWithheld;
     unresolvedRows += hop.unresolvedRows;
     pagesRead += hop.pagesRead;
     rateLimitRetries += hop.rateLimitRetries;
@@ -622,6 +627,7 @@ async function deriveJoinBackedFilterIds(
     rawRowsRead,
     returnedRowsRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     pagesRead,
     rateLimitRetries,
@@ -662,6 +668,7 @@ async function deriveIdsFromRegisteredEndpoint(
       rawRowsRead: 0,
       returnedRowsRead: 0,
       permissionExcluded: 0,
+      privacyWithheld: 0,
       unresolvedRows: 0,
       pagesRead: 0,
       rateLimitRetries: 0,
@@ -687,6 +694,7 @@ async function deriveIdsFromRegisteredEndpoint(
   let rawRowsRead = 0;
   let returnedRowsRead = 0;
   let permissionExcluded = 0;
+  let privacyWithheld = 0;
   let unresolvedRows = 0;
   let pagesRead = 0;
   let rateLimitRetries = 0;
@@ -720,6 +728,7 @@ async function deriveIdsFromRegisteredEndpoint(
     rawRowsRead += read.rawRowsRead;
     returnedRowsRead += read.rowsReturnedRead ?? read.rows.length;
     permissionExcluded += read.permissionExcluded;
+    privacyWithheld += read.privacyWithheld;
     unresolvedRows += read.unresolvedRows;
     pagesRead += read.pagesRead;
     rateLimitRetries += read.rateLimitRetries;
@@ -739,6 +748,7 @@ async function deriveIdsFromRegisteredEndpoint(
     rawRowsRead,
     returnedRowsRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     pagesRead,
     rateLimitRetries,
@@ -856,16 +866,64 @@ function buildBridgeEnvelope(spec: ScopeBridgeSpec, scopedCount: number, derive:
   };
 }
 
-function buildScopeEnvelope(scope: { jobIds: number[] | null; header: ScopeHeader | null }): EvidenceScopeEnvelope {
-  const header = scope.header;
+// The scope-disclosure fields, shared by the applied (confirmed-scope) and unscoped
+// (permitted-set) envelopes. Written once so the source allowlist below has one home.
+type ScopeDisclosureHeader = {
+  source: EvidenceScopeEnvelope["source"];
+  scope_label?: string | null;
+  scope_hash?: string;
+  job_count?: number;
+  warnings?: string[];
+};
+
+function scopeDisclosureFields(
+  header: ScopeHeader | ScopeDisclosureHeader | null,
+  jobIds: number[] | null
+): Omit<EvidenceScopeEnvelope, "applied" | "note"> {
+  const jobCount = header?.job_count ?? jobIds?.length;
   return {
-    applied: true,
-    ...(header?.source === "scope_handle" || header?.source === "exact_ids" ? { source: header.source } : {}),
-    job_count: header?.job_count ?? scope.jobIds?.length ?? 0,
+    // CLO-274: permission_scope joins the allowlist so an org-wide/permitted-set disclosure is
+    // carried into the evidence envelope rather than silently dropped (an unlisted source vanishes).
+    ...(header?.source === "scope_handle" || header?.source === "exact_ids" || header?.source === "permission_scope"
+      ? { source: header.source }
+      : {}),
+    ...(jobCount !== undefined ? { job_count: jobCount } : {}),
     ...(header?.scope_label !== undefined ? { scope_label: header.scope_label } : {}),
     ...(header?.scope_hash !== undefined ? { scope_hash: header.scope_hash } : {}),
     ...(header?.warnings && header.warnings.length > 0 ? { warnings: header.warnings } : {}),
   };
+}
+
+function buildScopeEnvelope(scope: { jobIds: number[] | null; header: ScopeHeader | null }): EvidenceScopeEnvelope {
+  return { applied: true, job_count: 0, ...scopeDisclosureFields(scope.header, scope.jobIds) };
+}
+
+/**
+ * CLO-274, item 15: an UNSCOPED bridgeable read spans the actor's permitted jobs, and now NAMES
+ * that set instead of only gesturing at it — the same disclosure the analysis header carries.
+ * The permitted set is read off the scoped read's own permissionScope (which the reader already
+ * returns); loading the job inventory here would add a full paginated list_jobs to every evidence
+ * call for a label, which is a real cost with no disclosure benefit.
+ */
+function permissionScopeDisclosure(scope: RecruiterPermissionScope | undefined): ScopeDisclosureHeader | null {
+  if (!scope) return null;
+  if (scope.kind === "jobs") {
+    return {
+      source: "permission_scope",
+      scope_label: `all ${scope.permittedJobCount} reqs you can see in Greenhouse`,
+      job_count: scope.permittedJobCount,
+    };
+  }
+  // operator/all: the reader reports no permitted-job count for an org-wide actor, so none is
+  // invented — the label says org-wide and the count is simply absent.
+  return { source: "permission_scope", scope_label: "all jobs you can see in Greenhouse (org-wide)" };
+}
+
+function buildUnscopedScopeEnvelope(
+  note: EvidenceScopeEnvelope,
+  permissionScope: RecruiterPermissionScope | undefined
+): EvidenceScopeEnvelope {
+  return { ...note, ...scopeDisclosureFields(permissionScopeDisclosure(permissionScope), null) };
 }
 
 // Disclose an UNSCOPED bridgeable read (no confirmed scope -> spans all permitted jobs), never silently.
@@ -904,6 +962,9 @@ export function buildReadEnvelope(readAll: RowsResult): EvidenceReadEnvelope {
     rows_returned: readAll.rowsReturnedRead ?? readAll.rows.length,
     raw_rows_read: readAll.rawRowsRead,
     permission_excluded: readAll.permissionExcluded,
+    // Omitted when zero: an absent field is honestly silent, and a zero on every call is one more
+    // number for the model to read past before it reaches the one that matters.
+    ...(readAll.privacyWithheld > 0 ? { privacy_withheld: readAll.privacyWithheld } : {}),
     unresolved_scope_rows: readAll.unresolvedRows,
     pages_read: readAll.pagesRead,
     per_page: readAll.perPage,
@@ -923,6 +984,7 @@ function emptyRows(): RowsResult {
     rawRowsRead: 0,
     rowsReturnedRead: 0,
     permissionExcluded: 0,
+    privacyWithheld: 0,
     unresolvedRows: 0,
     pagesRead: 0,
     status: "complete",
@@ -944,6 +1006,10 @@ function applyBridgeAccounting(
   aggregate.rawRowsRead += bridge.rawRowsRead;
   aggregate.rowsReturnedRead = (aggregate.rowsReturnedRead ?? 0) + bridge.returnedRowsRead;
   aggregate.permissionExcluded += bridge.permissionExcluded;
+  // The derive hops are scoped reads like any other, so rows the privacy gate withheld from THEM
+  // are rows missing from the ids the endpoint read is then bounded to. Dropping the count here
+  // hid the shortfall at the point it was largest.
+  aggregate.privacyWithheld += bridge.privacyWithheld;
   aggregate.unresolvedRows += bridge.unresolvedRows;
   aggregate.pagesRead += bridge.pagesRead;
   aggregate.rateLimitRetries += bridge.rateLimitRetries;
@@ -961,6 +1027,7 @@ function mergeRows(aggregate: RowsResult, read: RowsResult): void {
   aggregate.rawRowsRead += read.rawRowsRead;
   aggregate.rowsReturnedRead = (aggregate.rowsReturnedRead ?? 0) + (read.rowsReturnedRead ?? read.rows.length);
   aggregate.permissionExcluded += read.permissionExcluded;
+  aggregate.privacyWithheld += read.privacyWithheld;
   aggregate.unresolvedRows += read.unresolvedRows;
   aggregate.pagesRead += read.pagesRead;
   aggregate.rateLimitRetries += read.rateLimitRetries;

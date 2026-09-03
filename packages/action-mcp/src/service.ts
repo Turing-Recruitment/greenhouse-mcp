@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { actionDefinition } from "./actions/index.js";
 import type { ActionContext, ActionDefinition } from "./actions/index.js";
+import { resolveActorName } from "./actions/shared.js";
 import {
   fingerprintSession,
   fingerprintSubject,
@@ -57,6 +58,16 @@ export class GreenhouseActionService {
     if (config.production && config.session.client === "test") {
       throw new ActionDeniedError("TEST_CLIENT_FORBIDDEN", "Test action sessions are forbidden in production.");
     }
+    // Every preview states, in words, whose name the write will carry. A gateway that does not
+    // declare its mode cannot be described truthfully, and the failure is silent: the disclosure
+    // would say "service account" while the writes went out under the human's own token, or the
+    // reverse. So it fails at construction, where a force-cast fake has to state a mode too.
+    if (config.greenhouse.attributionMode !== "service_user" && config.greenhouse.attributionMode !== "per_human") {
+      throw new ActionDeniedError(
+        "ATTRIBUTION_MODE_UNDECLARED",
+        "Greenhouse gateway did not declare a supported attribution mode.",
+      );
+    }
   }
 
   async preview(kind: ActionKind, input: unknown): Promise<Record<string, unknown>> {
@@ -74,12 +85,14 @@ export class GreenhouseActionService {
     // has been returned to the caller yet, so fencing here prevents every disclosure, including the
     // no-change echo of current state.
     await this.assertTargetsVisible(prepared.fenceTargets);
+    const attribution = await this.attribution(identity.greenhouseUserId, prepared.changeRequired);
     if (!prepared.changeRequired) {
       return {
         status: "no_change",
         change_required: false,
         high_impact: prepared.highImpact,
         actor: { greenhouse_user_id: identity.greenhouseUserId },
+        attribution,
         ...prepared.preview,
         approval: prepared.approval,
         intent: null,
@@ -90,6 +103,7 @@ export class GreenhouseActionService {
       session: this.config.session,
       identityId: identity.identityId,
       actorUserId: identity.greenhouseUserId,
+      attributionMode: this.config.greenhouse.attributionMode,
       applyTool: definition.applyTool,
       prepared,
       nowMs: this.clock.now(),
@@ -99,6 +113,7 @@ export class GreenhouseActionService {
       change_required: true,
       high_impact: prepared.highImpact,
       actor: { greenhouse_user_id: identity.greenhouseUserId },
+      attribution,
       ...prepared.preview,
       approval: prepared.approval,
       intent: issued.token,
@@ -154,6 +169,12 @@ export class GreenhouseActionService {
 
     let freshPrepared: PreparedAction;
     try {
+      if (intent.attributionMode !== this.config.greenhouse.attributionMode) {
+        throw new ActionDeniedError(
+          "ATTRIBUTION_MODE_CHANGED",
+          "Greenhouse attribution mode changed; create a new preview.",
+        );
+      }
       freshPrepared = await definition.prepareApply(approval, this.context(identity.greenhouseUserId));
       this.assertPreparedMatches(intent, freshPrepared);
       // The apply fence — §4.3. Fresh targets from the fresh preparation; a valid signed intent
@@ -246,9 +267,28 @@ export class GreenhouseActionService {
   private context(actorUserId: number): ActionContext {
     return {
       actorUserId,
+      attributionMode: this.config.greenhouse.attributionMode,
       greenhouse: this.config.greenhouse,
       signingSecret: this.config.signingSecret,
       clock: this.clock,
+    };
+  }
+
+  private async attribution(actorUserId: number, changeRequired: boolean): Promise<Record<string, unknown>> {
+    // Fail-soft, and read through the shared helper so the fence inventory covers it: attribution
+    // labels are disclosure only, and authorization already ran in action preparation.
+    const actorName = await resolveActorName(this.context(actorUserId));
+    const mode = this.config.greenhouse.attributionMode;
+    return {
+      mode,
+      recorded_as: mode === "per_human" ? "actor" : "service_account",
+      actor_greenhouse_user_id: actorUserId,
+      actor_name: actorName,
+      sentence: !changeRequired
+        ? "No write will occur, so nothing will be recorded in Greenhouse."
+        : mode === "per_human"
+          ? `This change will be recorded in Greenhouse under ${actorName ?? "(name unavailable)"} (you).`
+          : "This change will be recorded in Greenhouse under the integration's service account, not your name.",
     };
   }
 
@@ -435,6 +475,7 @@ async function reconcileUnknown(
   const definition = actionDefinition(record.actionKind);
   const observation = await observeWithDelays(definition, record, {
     actorUserId: record.actorUserId,
+    attributionMode: greenhouse.attributionMode,
     greenhouse,
     signingSecret,
     clock,

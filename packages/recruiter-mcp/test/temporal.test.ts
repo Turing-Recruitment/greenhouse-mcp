@@ -84,6 +84,9 @@ describe("temporal-now view (Axis 1)", () => {
       for (let i = 0; i < 7 - w; i += 1) records.push(rec(new Date(weekMondayMs + DAY).toISOString()));
     }
     const view = buildTemporalView(records, { nowMs: NOW });
+    // velocity is nullable only in WINDOWED mode (a comparison week outside the stated window); an
+    // unwindowed, now-anchored view like this one must still report it.
+    assert.ok(view.velocity, "an unwindowed view always reports velocity");
     assert.ok(view.velocity.complete_weeks_observed >= 4);
     assert.equal(view.velocity.trend, "rising");
     assert.ok(view.velocity.recent_4w_mean_weekly_inflow > view.velocity.mean_weekly_inflow);

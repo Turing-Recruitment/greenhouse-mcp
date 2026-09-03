@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { actionDefinition } from "../src/actions/index.js";
+import type { ActionContext } from "../src/actions/index.js";
 import { buildCompleteCandidateCustomFields, validateCustomFields } from "../src/custom-fields.js";
 import { fingerprintValue, issueActionIntent } from "../src/crypto.js";
 import type {
@@ -14,7 +15,7 @@ import { IDENTITY_ID, RouteGreenhouse, TEST_SECRET, TestClock, testSession } fro
 
 const clock = new TestClock();
 const emptyGreenhouse = new RouteGreenhouse();
-const context = { actorUserId: 10, greenhouse: emptyGreenhouse, signingSecret: TEST_SECRET, clock };
+const context: ActionContext = { actorUserId: 10, attributionMode: "service_user", greenhouse: emptyGreenhouse, signingSecret: TEST_SECRET, clock };
 
 const WIRE_CASES: ReadonlyArray<{
   kind: ActionKind;
@@ -173,6 +174,28 @@ describe("action endpoint contracts", () => {
 });
 
 describe("action-specific reconciliation and normalization", () => {
+  test("job-owner adds honor confidential-job access for the selected user", async () => {
+    const prepare = async (siteAdmin: boolean, confidential: boolean, explicit: boolean) => {
+      const greenhouse = authorizedRoutes()
+        .onList("/users", (params) => params.ids === "40"
+          ? [{ id: 40, name: "Owner", deactivated: false, site_admin: siteAdmin }]
+          : [{ id: 10, name: "Actor", deactivated: false, site_admin: false }])
+        .onList("/jobs", () => [{ id: 200, confidential }])
+        .onList("/user_job_permissions", (params) => params.user_ids === "10" || explicit
+          ? [{ id: 1, user_id: Number(params.user_ids), job_id: 200, role_id: 1, automated: false }]
+          : [])
+        .onList("/job_owners", () => []);
+      return actionDefinition("job_owner_change").preparePreview({
+        verb: "add", job_id: 200, user_id: 40, owner_type: "sourcer",
+      }, { actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock });
+    };
+
+    await assert.rejects(prepare(true, true, false), (error: unknown) =>
+      error instanceof Error && "code" in error && error.code === "USER_JOB_PERMISSION_DENIED");
+    assert.equal((await prepare(true, false, false)).changeRequired, true);
+    assert.equal((await prepare(false, true, true)).changeRequired, true);
+  });
+
   test("unreject resolves the prior stage against the LIVE tenant stage shape", async () => {
     // Measured read-only against the real tenant 2026-07-27, 40 rejected applications, 40/40:
     //   - rejection does NOT clear the stage — exactly one row keeps `current: true`
@@ -205,7 +228,7 @@ describe("action-specific reconciliation and normalization", () => {
       ]);
 
     const action = await actionDefinition("application_unreject").preparePreview({ application_id: 100 }, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     });
 
     assert.deepEqual(
@@ -231,7 +254,7 @@ describe("action-specific reconciliation and normalization", () => {
       }]);
 
     const action = await actionDefinition("application_unreject").preparePreview({ application_id: 100 }, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     });
 
     assert.deepEqual(action.binding, { application_id: 100, previous_interview_stage_id: 601 });
@@ -244,7 +267,7 @@ describe("action-specific reconciliation and normalization", () => {
       currentFingerprint: action.currentFingerprint,
     };
     assert.equal(await actionDefinition("application_unreject").observe(original, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     }), "not_observed");
   });
 
@@ -260,7 +283,7 @@ describe("action-specific reconciliation and normalization", () => {
     };
     assert.equal(await actionDefinition("application_rejection").observe(
       actionRecord("application_rejection", rejectionBinding, "A".repeat(43)),
-      { actorUserId: 10, greenhouse: rejectedWithoutDetails, signingSecret: TEST_SECRET, clock },
+      { actorUserId: 10, attributionMode: "service_user", greenhouse: rejectedWithoutDetails, signingSecret: TEST_SECRET, clock },
     ), "unavailable");
 
     const inProcessWithDetails = new RouteGreenhouse()
@@ -274,7 +297,7 @@ describe("action-specific reconciliation and normalization", () => {
     const unrejectBinding: ActionBinding = { application_id: 100, previous_interview_stage_id: 601 };
     assert.equal(await actionDefinition("application_unreject").observe(
       actionRecord("application_unreject", unrejectBinding, "A".repeat(43)),
-      { actorUserId: 10, greenhouse: inProcessWithDetails, signingSecret: TEST_SECRET, clock },
+      { actorUserId: 10, attributionMode: "service_user", greenhouse: inProcessWithDetails, signingSecret: TEST_SECRET, clock },
     ), "unavailable");
 
     const rejectedBeforeLinkedNote = new RouteGreenhouse()
@@ -290,7 +313,7 @@ describe("action-specific reconciliation and normalization", () => {
     };
     assert.equal(await actionDefinition("application_rejection").observe(
       actionRecord("application_rejection", rejectionWithNote, "A".repeat(43)),
-      { actorUserId: 10, greenhouse: rejectedBeforeLinkedNote, signingSecret: TEST_SECRET, clock },
+      { actorUserId: 10, attributionMode: "service_user", greenhouse: rejectedBeforeLinkedNote, signingSecret: TEST_SECRET, clock },
     ), "unavailable");
 
     const mismatchedStageEndpoints = new RouteGreenhouse()
@@ -313,11 +336,11 @@ describe("action-specific reconciliation and normalization", () => {
     }, TEST_SECRET);
     assert.equal(await actionDefinition("application_stage_move").observe(
       actionRecord("application_stage_move", stageBinding, stageDesired),
-      { actorUserId: 10, greenhouse: mismatchedStageEndpoints, signingSecret: TEST_SECRET, clock },
+      { actorUserId: 10, attributionMode: "service_user", greenhouse: mismatchedStageEndpoints, signingSecret: TEST_SECRET, clock },
     ), "unavailable");
     assert.equal(await actionDefinition("application_unreject").observe(
       actionRecord("application_unreject", { application_id: 100, previous_interview_stage_id: 602 }, "A".repeat(43)),
-      { actorUserId: 10, greenhouse: mismatchedStageEndpoints, signingSecret: TEST_SECRET, clock },
+      { actorUserId: 10, attributionMode: "service_user", greenhouse: mismatchedStageEndpoints, signingSecret: TEST_SECRET, clock },
     ), "unavailable");
   });
 
@@ -333,13 +356,13 @@ describe("action-specific reconciliation and normalization", () => {
       }]);
     const definition = actionDefinition("application_attribution_change");
     const action = await definition.preparePreview({ application_id: 100, source_id: 601 }, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     });
     assert.deepEqual((action.approval as { before: unknown; after: unknown }).before, { source_id: 600 });
     assert.deepEqual((action.approval as { before: unknown; after: unknown }).after, { source_id: 601 });
     application = { ...application, referrer_id: 701 };
     const fresh = await definition.prepareApply(action.approval, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     });
     assert.equal(fresh.currentFingerprint, action.currentFingerprint);
     assert.equal(fresh.desiredFingerprint, action.desiredFingerprint);
@@ -350,7 +373,7 @@ describe("action-specific reconciliation and normalization", () => {
       currentFingerprint: action.currentFingerprint,
     };
     assert.equal(await definition.observe(record, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     }), "desired_observed");
   });
 
@@ -367,7 +390,7 @@ describe("action-specific reconciliation and normalization", () => {
       .onList("/job_owners", () => owners);
     const definition = actionDefinition("job_owner_change");
     const action = await definition.preparePreview({ verb: "add", job_id: 200, user_id: 40, owner_type: "sourcer" }, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     });
     assert.equal((action.preview as { target: { user_name: string } }).target.user_name, "Owner");
     assert.equal(Object.hasOwn((action.approval as { target: object }).target, "user_name"), false);
@@ -381,7 +404,7 @@ describe("action-specific reconciliation and normalization", () => {
       currentFingerprint: action.currentFingerprint,
     };
     assert.equal(await definition.observe(record, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     }), "desired_observed");
 
     const responsible = authorizedRoutes().onList("/job_owners", () => [{
@@ -389,7 +412,7 @@ describe("action-specific reconciliation and normalization", () => {
     }]);
     await assert.rejects(definition.preparePreview({
       verb: "remove", job_id: 200, user_id: 40, owner_type: "recruiter",
-    }, { actorUserId: 10, greenhouse: responsible, signingSecret: TEST_SECRET, clock }), /Candidate-responsible/);
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse: responsible, signingSecret: TEST_SECRET, clock }), /Candidate-responsible/);
 
     let sourcerOwners = [{ id: 904, job_id: 200, user_id: 40, type: "sourcer" }];
     const sourcer = authorizedRoutes()
@@ -399,7 +422,7 @@ describe("action-specific reconciliation and normalization", () => {
       .onList("/job_owners", () => sourcerOwners);
     const removal = await definition.preparePreview({
       verb: "remove", job_id: 200, user_id: 40, owner_type: "sourcer",
-    }, { actorUserId: 10, greenhouse: sourcer, signingSecret: TEST_SECRET, clock });
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse: sourcer, signingSecret: TEST_SECRET, clock });
     assert.equal(removal.changeRequired, true);
     sourcerOwners = [{ id: 905, job_id: 200, user_id: 40, type: "sourcer" }];
     const replaced = {
@@ -407,7 +430,7 @@ describe("action-specific reconciliation and normalization", () => {
       currentFingerprint: removal.currentFingerprint,
     };
     assert.equal(await definition.observe(replaced, {
-      actorUserId: 10, greenhouse: sourcer, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse: sourcer, signingSecret: TEST_SECRET, clock,
     }), "conflict");
   });
 
@@ -419,7 +442,7 @@ describe("action-specific reconciliation and normalization", () => {
     };
     assert.equal(await actionDefinition("job_note_change").observe(
       actionRecord("job_note_change", jobNoteBinding, "A".repeat(43)),
-      { actorUserId: 10, greenhouse: missingJobNote, signingSecret: TEST_SECRET, clock },
+      { actorUserId: 10, attributionMode: "service_user", greenhouse: missingJobNote, signingSecret: TEST_SECRET, clock },
     ), "conflict");
 
     const missingOffer = new RouteGreenhouse().onList("/offers", () => []);
@@ -428,7 +451,7 @@ describe("action-specific reconciliation and normalization", () => {
     };
     assert.equal(await actionDefinition("offer_update").observe(
       actionRecord("offer_update", offerBinding, "A".repeat(43)),
-      { actorUserId: 10, greenhouse: missingOffer, signingSecret: TEST_SECRET, clock },
+      { actorUserId: 10, attributionMode: "service_user", greenhouse: missingOffer, signingSecret: TEST_SECRET, clock },
     ), "unavailable");
   });
 
@@ -444,7 +467,7 @@ describe("action-specific reconciliation and normalization", () => {
     const record = actionRecord("candidate_note_create", binding,
       fingerprintValue("candidate-note-create-desired", desired, TEST_SECRET));
     assert.equal(await actionDefinition("candidate_note_create").observe(record, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     }), "desired_observed");
   });
 
@@ -461,7 +484,7 @@ describe("action-specific reconciliation and normalization", () => {
     const candidateGreenhouse = authorizedRoutes().onList("/notes", () => candidateNotes);
     const candidate = await actionDefinition("candidate_note_create").preparePreview({
       application_id: 100, body: "Same", visibility: "private", note_type: "NOTE",
-    }, { actorUserId: 10, greenhouse: candidateGreenhouse, signingSecret: TEST_SECRET, clock });
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse: candidateGreenhouse, signingSecret: TEST_SECRET, clock });
     assert.equal((candidate.binding as { baseline_count: number }).baseline_count, 250);
     assert.deepEqual((candidate.approval as {
       before: { identical_note_ids: number[]; additional_identical_note_count: number };
@@ -470,7 +493,7 @@ describe("action-specific reconciliation and normalization", () => {
       additional_identical_note_count: 50,
     });
     assert.doesNotThrow(() => issueActionIntent({
-      session: testSession(), identityId: IDENTITY_ID, actorUserId: 10,
+      session: testSession(), identityId: IDENTITY_ID, actorUserId: 10, attributionMode: "service_user",
       applyTool: "apply_candidate_note_create", prepared: candidate, nowMs: clock.now(),
     }, TEST_SECRET));
 
@@ -484,10 +507,10 @@ describe("action-specific reconciliation and normalization", () => {
     const jobGreenhouse = authorizedRoutes().onList("/job_notes", () => jobNotes);
     const job = await actionDefinition("job_note_change").preparePreview({
       verb: "create", job_id: 200, body: "New", visibility: "privately_visible",
-    }, { actorUserId: 10, greenhouse: jobGreenhouse, signingSecret: TEST_SECRET, clock });
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse: jobGreenhouse, signingSecret: TEST_SECRET, clock });
     assert.equal((job.binding as { baseline_count: number }).baseline_count, 250);
     assert.doesNotThrow(() => issueActionIntent({
-      session: testSession(), identityId: IDENTITY_ID, actorUserId: 10,
+      session: testSession(), identityId: IDENTITY_ID, actorUserId: 10, attributionMode: "service_user",
       applyTool: "apply_job_note_change", prepared: job, nowMs: clock.now(),
     }, TEST_SECRET));
   });
@@ -506,7 +529,7 @@ describe("action-specific reconciliation and normalization", () => {
       upstreamResourceId: 902,
     };
     assert.equal(await actionDefinition("candidate_note_create").observe(candidateRecord, {
-      actorUserId: 10, greenhouse: candidateNote, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse: candidateNote, signingSecret: TEST_SECRET, clock,
     }), "conflict");
 
     const jobNote = new RouteGreenhouse().onList("/job_notes", () => [{
@@ -521,7 +544,7 @@ describe("action-specific reconciliation and normalization", () => {
       upstreamResourceId: 903,
     };
     assert.equal(await actionDefinition("job_note_change").observe(jobRecord, {
-      actorUserId: 10, greenhouse: jobNote, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse: jobNote, signingSecret: TEST_SECRET, clock,
     }), "conflict");
   });
 
@@ -536,7 +559,7 @@ describe("action-specific reconciliation and normalization", () => {
     };
     assert.equal(await actionDefinition("candidate_note_create").observe(
       actionRecord("candidate_note_create", candidateBinding, "A".repeat(43)),
-      { actorUserId: 10, greenhouse: candidateNote, signingSecret: TEST_SECRET, clock },
+      { actorUserId: 10, attributionMode: "service_user", greenhouse: candidateNote, signingSecret: TEST_SECRET, clock },
     ), "conflict");
 
     const jobNote = new RouteGreenhouse().onList("/job_notes", () => [{
@@ -548,7 +571,7 @@ describe("action-specific reconciliation and normalization", () => {
     };
     assert.equal(await actionDefinition("job_note_change").observe(
       actionRecord("job_note_change", jobBinding, "A".repeat(43)),
-      { actorUserId: 10, greenhouse: jobNote, signingSecret: TEST_SECRET, clock },
+      { actorUserId: 10, attributionMode: "service_user", greenhouse: jobNote, signingSecret: TEST_SECRET, clock },
     ), "conflict");
   });
 
@@ -563,7 +586,7 @@ describe("action-specific reconciliation and normalization", () => {
     const desired = { status: "Created", starts_on: "2026-09-01" };
     const record = actionRecord("offer_update", binding, fingerprintValue("offer-update-desired", desired, TEST_SECRET));
     assert.equal(await actionDefinition("offer_update").observe(record, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     }), "desired_observed");
 
     const oldValuesOnNewVersion = new RouteGreenhouse().onList("/offers", () => [{
@@ -576,7 +599,7 @@ describe("action-specific reconciliation and normalization", () => {
       currentFingerprint: fingerprintValue("offer-update-current", original, TEST_SECRET),
     };
     assert.equal(await actionDefinition("offer_update").observe(thirdState, {
-      actorUserId: 10, greenhouse: oldValuesOnNewVersion, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse: oldValuesOnNewVersion, signingSecret: TEST_SECRET, clock,
     }), "conflict");
   });
 
@@ -600,7 +623,7 @@ describe("action-specific reconciliation and normalization", () => {
         tags: { add: ["new"] },
         custom_fields: [{ name_key: "changed_field", value: "new" }],
       },
-    }, { actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock });
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock });
     assert.equal(preparedAction.reconciliationGraceMs, 30 * 60_000);
     const approval = preparedAction.approval as {
       after: { tags: string[]; custom_fields: Array<{ name_key: string; value: unknown }> };
@@ -611,7 +634,7 @@ describe("action-specific reconciliation and normalization", () => {
       { name_key: "retained_field", value: "keep" },
     ]);
     const mutation = await definition.mutation(preparedAction.approval, preparedAction, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     });
     assert.deepEqual(mutation.body, {
       tags: ["existing", "new"],
@@ -636,7 +659,7 @@ describe("action-specific reconciliation and normalization", () => {
         email_addresses: { add: [{ value: "person+recruiting@internal", type: "other" }] },
         website_addresses: { add: [{ value: "portfolio.example", type: "portfolio" }] },
       },
-    }, { actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock });
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock });
 
     assert.deepEqual((action.approval as { after: { website_addresses: unknown[] } }).after.website_addresses, [
       { value: "portfolio.example", type: "portfolio" },
@@ -663,7 +686,7 @@ describe("action-specific reconciliation and normalization", () => {
       currentFingerprint: action.currentFingerprint,
     };
     assert.equal(await definition.observe(record, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     }), "desired_observed");
   });
 
@@ -693,14 +716,14 @@ describe("action-specific reconciliation and normalization", () => {
     const action = await definition.preparePreview({
       context_application_id: 100,
       changes: { preferred_name: "", title: "" },
-    }, { actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock });
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock });
 
     assert.deepEqual((action.approval as { after: unknown }).after, {
       preferred_name: null,
       title: null,
     });
     assert.deepEqual((await definition.mutation(action.approval, action, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     })).body, { preferred_name: "", title: "" });
 
     candidate = { id: 300, preferred_name: null, title: null };
@@ -709,7 +732,7 @@ describe("action-specific reconciliation and normalization", () => {
       currentFingerprint: action.currentFingerprint,
     };
     assert.equal(await definition.observe(record, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     }), "desired_observed");
   });
 
@@ -744,7 +767,7 @@ describe("action-specific reconciliation and normalization", () => {
         { name_key: "summary", value: "new" },
         { name_key: "skills", value: [22, 21] },
       ] },
-    }, { actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock });
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock });
     const approval = preparedAction.approval as {
       after: { custom_fields: Array<{ name_key: string; value: unknown }> };
     };
@@ -761,7 +784,7 @@ describe("action-specific reconciliation and normalization", () => {
       { name_key: "summary", value: "new" },
     ]);
     assert.deepEqual((await definition.mutation(preparedAction.approval, preparedAction, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     })).body, { custom_fields: approval.after.custom_fields });
 
     candidate = {
@@ -778,7 +801,7 @@ describe("action-specific reconciliation and normalization", () => {
       preparedAction.desiredFingerprint,
     );
     assert.equal(await definition.observe(record, {
-      actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
     }), "desired_observed");
   });
 
@@ -796,14 +819,14 @@ describe("action-specific reconciliation and normalization", () => {
     await assert.rejects(actionDefinition("candidate_record_update").preparePreview({
       context_application_id: 100,
       changes: { custom_fields: [{ name_key: "salary", value: true }] },
-    }, { actorUserId: 10, greenhouse: wrongType, signingSecret: TEST_SECRET, clock }), /does not match currency/);
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse: wrongType, signingSecret: TEST_SECRET, clock }), /does not match currency/);
     await assert.rejects(actionDefinition("candidate_record_update").preparePreview({
       context_application_id: 100,
       changes: { custom_fields: [{
         name_key: "salary",
         value: { amount: 250_000, currency_code: "USD", rationale: "Offer only" },
       }] },
-    }, { actorUserId: 10, greenhouse: wrongType, signingSecret: TEST_SECRET, clock }), /does not match currency/);
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse: wrongType, signingSecret: TEST_SECRET, clock }), /does not match currency/);
 
     const maskedExisting = authorizedRoutes()
       .onList("/candidates", () => [{
@@ -820,14 +843,14 @@ describe("action-specific reconciliation and normalization", () => {
     await assert.rejects(actionDefinition("candidate_record_update").preparePreview({
       context_application_id: 100,
       changes: { custom_fields: [{ name_key: "summary", value: "new" }] },
-    }, { actorUserId: 10, greenhouse: maskedExisting, signingSecret: TEST_SECRET, clock }), /cannot be written losslessly/);
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse: maskedExisting, signingSecret: TEST_SECRET, clock }), /cannot be written losslessly/);
   });
 
   test("offer creation refuses an existing chain and flags currency as high impact", async () => {
     {
       const greenhouse = authorizedRoutes().onList("/offers", () => [{ id: 950, application_id: 100 }]);
       await assert.rejects(actionDefinition("offer_create").preparePreview({ application_id: 100, starts_on: "2026-08-01" }, {
-        actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+        actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
       }), /already has an offer chain/);
     }
     {
@@ -839,7 +862,7 @@ describe("action-specific reconciliation and normalization", () => {
       const result = await actionDefinition("offer_create").preparePreview({
         application_id: 100,
         custom_fields: [{ name_key: "salary", value: { amount: 250_000, currency_code: "USD" } }],
-      }, { actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock });
+      }, { actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock });
       assert.equal(result.highImpact, true);
       assert.equal(result.reconciliationGraceMs, 10 * 60_000);
     }
@@ -861,9 +884,9 @@ describe("action-specific reconciliation and normalization", () => {
     const createAction = await createDefinition.preparePreview({
       application_id: 100,
       starts_on: "2026-08-01",
-    }, { actorUserId: 10, greenhouse: createGreenhouse, signingSecret: TEST_SECRET, clock });
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse: createGreenhouse, signingSecret: TEST_SECRET, clock });
     await createDefinition.prepareApply(createAction.approval, {
-      actorUserId: 10, greenhouse: createGreenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse: createGreenhouse, signingSecret: TEST_SECRET, clock,
     });
     assert.equal(createGreenhouse.listCalls.some(({ path }) => path.startsWith("/custom_field")), false);
 
@@ -879,9 +902,9 @@ describe("action-specific reconciliation and normalization", () => {
       application_id: 100,
       offer_id: 950,
       starts_on: "2026-09-01",
-    }, { actorUserId: 10, greenhouse: updateGreenhouse, signingSecret: TEST_SECRET, clock });
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse: updateGreenhouse, signingSecret: TEST_SECRET, clock });
     await updateDefinition.prepareApply(updateAction.approval, {
-      actorUserId: 10, greenhouse: updateGreenhouse, signingSecret: TEST_SECRET, clock,
+      actorUserId: 10, attributionMode: "service_user", greenhouse: updateGreenhouse, signingSecret: TEST_SECRET, clock,
     });
     assert.equal(updateGreenhouse.listCalls.some(({ path }) => path.startsWith("/custom_field")), false);
   });
@@ -908,7 +931,7 @@ describe("action-specific reconciliation and normalization", () => {
     await actionDefinition("offer_create").preparePreview({
       application_id: 100,
       custom_fields: [{ name_key: "department", value: 31 }],
-    }, { actorUserId: 10, greenhouse: createGreenhouse, signingSecret: TEST_SECRET, clock });
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse: createGreenhouse, signingSecret: TEST_SECRET, clock });
     assert.equal(createGreenhouse.listCalls.filter(({ path }) => path === "/custom_fields").length, 1);
 
     const updateGreenhouse = configureMetadata(authorizedRoutes().onList("/offers", () => [{
@@ -920,7 +943,7 @@ describe("action-specific reconciliation and normalization", () => {
       application_id: 100,
       offer_id: 950,
       custom_fields: [{ name_key: "department", value: 31 }],
-    }, { actorUserId: 10, greenhouse: updateGreenhouse, signingSecret: TEST_SECRET, clock });
+    }, { actorUserId: 10, attributionMode: "service_user", greenhouse: updateGreenhouse, signingSecret: TEST_SECRET, clock });
     assert.equal(updateGreenhouse.listCalls.filter(({ path }) => path === "/custom_fields").length, 1);
   });
 
@@ -941,13 +964,13 @@ describe("action-specific reconciliation and normalization", () => {
       const action = await definition.preparePreview({
         application_id: 100,
         custom_fields: [{ name_key: "department", value: 31 }],
-      }, { actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock });
+      }, { actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock });
       assert.deepEqual((action.approval as { after: { custom_fields: unknown[] } }).after.custom_fields,
         [{ name_key: "department", value: 31 }]);
       assert.deepEqual((action.preview as { after: { custom_fields: unknown[] } }).after.custom_fields,
         [{ name_key: "department", value: "Engineering" }]);
       assert.deepEqual((await definition.mutation(action.approval, action, {
-        actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+        actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
       })).body?.custom_fields, [{ name_key: "department", value: 31 }]);
     }
     {
@@ -964,13 +987,13 @@ describe("action-specific reconciliation and normalization", () => {
         application_id: 100,
         offer_id: 950,
         custom_fields: [{ name_key: "department", value: 31 }],
-      }, { actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock });
+      }, { actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock });
       assert.deepEqual((action.approval as { after: { values: { custom_fields: unknown[] } } }).after.values.custom_fields,
         [{ name_key: "department", value: 31 }]);
       assert.deepEqual((action.preview as { after: { values: { custom_fields: unknown[] } } }).after.values.custom_fields,
         [{ name_key: "department", value: "Engineering" }]);
       assert.deepEqual((await definition.mutation(action.approval, action, {
-        actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock,
+        actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock,
       })).body?.custom_fields, [{ name_key: "department", value: 31 }]);
     }
   });

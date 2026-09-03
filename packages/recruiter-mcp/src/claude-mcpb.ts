@@ -88,7 +88,7 @@ export async function buildClaudeMcpb(options: BuildClaudeMcpbOptions): Promise<
       name: safeMcpbName(serverName),
       display_name: "Greenhouse Recruiting Assistant",
       version: "1.0.0",
-      description: "Read-only, recruiter-scoped Greenhouse evidence and analysis.",
+      description: "Recruiter-scoped Greenhouse evidence and analysis; write actions appear only for entitled sessions.",
       long_description: "Private pilot extension connecting Claude Desktop to the hosted recruiter-scoped Greenhouse MCP.",
       author: { name: "Talent Operations" },
       server: {
@@ -107,7 +107,7 @@ export async function buildClaudeMcpb(options: BuildClaudeMcpbOptions): Promise<
         },
       },
       tools_generated: true,
-      keywords: ["greenhouse", "recruiting", "read-only"],
+      keywords: ["greenhouse", "recruiting", "ats"],
       compatibility: { claude_desktop: ">=1.0.0", platforms: ["darwin"], runtimes: { node: ">=18.0.0" } },
     };
     await writeSecureJson(join(stage, "manifest.json"), extensionManifest);
@@ -121,7 +121,11 @@ export async function buildClaudeMcpb(options: BuildClaudeMcpbOptions): Promise<
       artifactContainsToken: true,
       metadataContainsToken: false,
     });
-    await writeSecure(join(stage, "README.md"), "# Greenhouse Recruiting Assistant\n\nPrivate read-only Claude Desktop bridge for the recruiter-scoped Greenhouse MCP.\n");
+    await writeSecure(
+      join(stage, "README.md"),
+      "# Greenhouse Recruiting Assistant\n\nPrivate Claude Desktop bridge for the recruiter-scoped Greenhouse MCP. " +
+        "Evidence and analysis are read-only; write actions appear only for entitled sessions.\n"
+    );
     await writeSecure(join(stage, "THIRD_PARTY_NOTICES.txt"), await buildThirdPartyNotices(metaPath));
     await rm(metaPath, { force: true });
 

@@ -44,7 +44,7 @@ function exactMatches(values: Awaited<ReturnType<typeof rows>>, target: {
 }
 
 async function prepare(input: Input, context: ActionContext) {
-  await assertJobAccess(input.job_id, context);
+  const { job } = await assertJobAccess(input.job_id, context);
   const existing = await rows(input.job_id, context);
   const matches = exactMatches(existing, input);
   if (matches.length > 1) throw new Error("The exact job-owner tuple exists more than once.");
@@ -60,7 +60,7 @@ async function prepare(input: Input, context: ActionContext) {
     }
   }
   const selectedUser = input.verb === "add"
-    ? await assertUserMayOwnJob(input.user_id, input.job_id, context)
+    ? await assertUserMayOwnJob(input.user_id, input.job_id, job, context)
     : uniqueById(await context.greenhouse.list("/users", {
       ids: String(input.user_id), fields: "id,name,deactivated,site_admin", show_service_accounts: "true",
     }, context.actorUserId), input.user_id, "Greenhouse user");

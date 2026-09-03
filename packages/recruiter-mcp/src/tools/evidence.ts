@@ -86,13 +86,13 @@ export const EVIDENCE_TOOL_DEFINITIONS: RecruiterToolDefinition[] = [
   { name: "search_my_scorecards", kind: "evidence", description: "Search scorecards scoped to applications on the recruiter's permitted jobs. Domain class: application_backed. Pass scope_handle or job_ids to narrow to a requisition (auto-bridged to that scope's application_ids); without one it spans all your permitted jobs. Returns the complete scoped set in one call." },
   { name: "search_my_rejection_details", kind: "evidence", description: "Search projected rejection-detail rows bounded through scoped applications. Domain class: application_backed. Pass scope_handle or job_ids to narrow to a requisition (auto-bridged to that scope's application_ids); without one it spans all your permitted jobs. Returns the complete scoped set in one call." },
   { name: "search_my_rejection_reasons", kind: "evidence", description: "Search projected rejection-reason reference data. Domain class: global_reference; not job-filtered and never treated as fake scoped data." },
-  { name: "search_my_users", kind: "evidence", description: "Search projected Greenhouse user reference metadata. Domain class: global_reference; not job-filtered and excludes email/contact fields." },
-  { name: "get_my_user", kind: "evidence", description: "Get one projected Greenhouse user reference row by id. Domain class: global_reference; excludes email/contact fields." },
+  { name: "search_my_users", kind: "evidence", description: "Search projected Greenhouse user reference metadata (id, name, employee id, role flags). Domain class: global_reference; not job-filtered. Colleague email addresses are returned to site admins and operators only — they administer the staff directory; a job-scoped line recruiter gets names and ids." },
+  { name: "get_my_user", kind: "evidence", description: "Get one projected Greenhouse user reference row by id. Domain class: global_reference. Colleague email addresses are returned to site admins and operators only; a job-scoped line recruiter gets names and ids." },
   { name: "search_my_sources", kind: "evidence", description: "Search projected application-source reference data (id, name, and source type). Domain class: global_reference; not job-filtered. Resolves source ids returned by analyses into human-readable source names." },
-  { name: "search_my_referrers", kind: "evidence", description: "Search projected referrer reference data (id and name). Domain class: global_reference; not job-filtered, and the linking user_id is excluded. Resolves referrer ids returned by analyses into referrer names." },
+  { name: "search_my_referrers", kind: "evidence", description: "Search projected referrer reference data (id, name, and the linking user_id). Domain class: global_reference; not job-filtered. The user_id is the Greenhouse user who made the referral — an id, not contact data — so employee-referral yield can be attributed. Resolves referrer ids returned by analyses into referrer names." },
   { name: "search_my_notes", kind: "evidence", description: "Search public notes scoped to applications/candidates on permitted jobs. Domain class: application_backed. Pass scope_handle or job_ids to narrow to a requisition (auto-bridged to that scope's application_ids; application-keyed notes only — candidate-level notes with no application_id are not part of a req-scoped read); without one it spans all your permitted jobs. Returns the complete scoped set in one call." },
   { name: "search_my_tracking_links", kind: "evidence", description: "Search projected tracking-link metadata for permitted jobs. Domain class: job_scoped; token/url fields are not exposed." },
-  { name: "search_my_offers", kind: "evidence", description: "Search projected offer metadata for permitted jobs. Domain class: job_scoped; rows carry a permitted job_id; compensation and custom fields are not exposed on the default profile." },
+  { name: "search_my_offers", kind: "evidence", description: "Search projected offer metadata for permitted jobs. Domain class: job_scoped; rows carry a permitted job_id. Compensation custom fields pass through unless the field definition is flagged private in Greenhouse; if the definitions cannot be read at all, every custom field is withheld for that read rather than guessed at." },
   { name: "search_my_departments", kind: "evidence", description: "Search projected department reference data (id, name, parent_id, external_id). Domain class: global_reference; not job-filtered. Resolves department ids returned by analyses into department names and supports department rollups." },
   { name: "search_my_offices", kind: "evidence", description: "Search projected office reference data (id, name, location, parent_id). Domain class: global_reference; not job-filtered. Resolves office ids into office names/locations and supports office rollups." },
   { name: "search_my_close_reasons", kind: "evidence", description: "Search projected opening close-reason reference data (id, name). Domain class: global_reference; not job-filtered. Resolves the close_reason_id on a closed opening into a human-readable reason." },
@@ -184,7 +184,12 @@ export async function runEvidenceTool(
 
 function zodSchemaForParameter(parameter: ParameterSpec): z.ZodTypeAny {
   if (parameter.name === "cursor") {
-    return z.string().optional().describe("Cursor returned from a prior paginated response.");
+    return z
+      .string()
+      .optional()
+      .describe(
+        "Resume a truncated read: pass read.next_cursor from a prior incomplete response. Not needed on a complete read — one search call returns the complete scoped set."
+      );
   }
   if (parameter.name === "per_page") {
     return z

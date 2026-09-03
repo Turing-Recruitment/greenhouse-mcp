@@ -42,6 +42,38 @@ describe("readAllScopedRows", () => {
     ]);
   });
 
+  it("B11: aggregates privacyWithheld across every page", async () => {
+    // The org-wide unattested branch reports its withheld count per page. A read-all that dropped
+    // it would hand an analysis a short answer with no sign that it was short.
+    const scopedReader = fakeScopedReader((toolName, params) => {
+      if (params?.cursor === "cursor-1") {
+        return scopedSuccess(toolName, [{ id: 3 }], null, {
+          rowCounts: { raw: 3, returned: 1, permissionExcluded: 2, unresolved: 0, status: "complete", privacyWithheld: 2 },
+        });
+      }
+      return scopedSuccess(toolName, [{ id: 1 }, { id: 2 }], "cursor-1", {
+        rowCounts: { raw: 5, returned: 2, permissionExcluded: 3, unresolved: 0, status: "complete", privacyWithheld: 3 },
+      });
+    });
+    const { runtime } = testRuntime(scopedReader);
+
+    const result = await readAllScopedRows(runtime, "analysis_tool", "list_candidates", {});
+
+    assert.equal(result.kind, "rows");
+    if (result.kind !== "rows") return;
+    assert.equal(result.privacyWithheld, 5);
+    assert.equal(result.permissionExcluded, 5);
+    assert.equal(result.rawRowsRead, 8);
+    assert.equal(result.status, "complete");
+  });
+
+  it("B11: reports zero privacyWithheld when no page withheld anything", async () => {
+    const scopedReader = fakeScopedReader((toolName) => scopedSuccess(toolName, [{ id: 1 }]));
+    const { runtime } = testRuntime(scopedReader);
+    const result = await readAllScopedRows(runtime, "analysis_tool", "list_candidates", {});
+    assert.equal(result.kind === "rows" && result.privacyWithheld, 0);
+  });
+
   it("marks a cursor read incomplete when the deadline elapses after a page", async () => {
     const startedAt = Date.parse("2026-06-23T12:00:00.000Z");
     let now = startedAt;

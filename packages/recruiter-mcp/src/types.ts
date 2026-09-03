@@ -99,6 +99,13 @@ export interface EvidenceReadEnvelope {
   rows_returned: number;
   raw_rows_read: number;
   permission_excluded: number;
+  /**
+   * Of `permission_excluded`, how many rows the private-candidate gate withheld (CLO-273). Present
+   * only when non-zero: an org-wide actor whose Greenhouse private-candidate permission nobody has
+   * attested reads a deliberately short set, and an analysis that cannot see this number reads a
+   * short answer as a complete one.
+   */
+  privacy_withheld?: number;
   unresolved_scope_rows: number;
   pages_read: number;
   per_page: number;
@@ -114,7 +121,9 @@ export interface EvidenceReadEnvelope {
 
 export interface EvidenceScopeEnvelope {
   applied: boolean;
-  source?: "scope_handle" | "exact_ids";
+  // "permission_scope" (CLO-274): the read covered everything this actor's Greenhouse permissions
+  // return, disclosed rather than dropped. Kept in step with AnalysisContextHeader["source"].
+  source?: "scope_handle" | "exact_ids" | "permission_scope";
   job_count?: number;
   scope_label?: string | null;
   scope_hash?: string;

@@ -66,6 +66,7 @@ export { createGreenhouseActionMcpServer } from "./server.js";
 export { unavailableVisibilityProbe } from "./env.js";
 export type {
   ActionBinding,
+  AttributionMode,
   FenceTarget,
   TargetKind,
   TargetVisibilityProbe,

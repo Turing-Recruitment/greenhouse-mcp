@@ -103,6 +103,275 @@ describe("all action kinds share exactly-once apply behavior", () => {
     assert.deepEqual([...SCENARIOS.map(({ kind }) => kind)].sort(), [...ACTION_KINDS].sort());
   });
 
+  /**
+   * The approval as it stood BEFORE attribution existed, pinned per kind.
+   *
+   * The mode-to-mode comparison alone proved nothing: appending a sentence to a copy of the effects
+   * under BOTH modes kept it green. A frozen baseline is what makes "the approval did not move" an
+   * assertion rather than a tautology, and it is why any future change to what a human approves has
+   * to be made here, on purpose, in a diff someone reads.
+   */
+  const APPROVAL_BASELINE: Readonly<Record<string, Record<string, unknown>>> = {
+  application_assignment_change: {
+    "application_id": 100,
+    "job_id": 200,
+    "assignment_role": "recruiter",
+    "current_user_id": 20,
+    "proposed_user_id": 40
+  },
+  job_owner_change: {
+    "target": {
+      "job_id": 200,
+      "user_id": 40,
+      "owner_type": "sourcer",
+      "verb": "add"
+    },
+    "before": {
+      "present": false,
+      "owner_row_id": null
+    },
+    "after": {
+      "present": true
+    },
+    "effects": [
+      "Adds this hiring-team role without reassigning candidate responsibility."
+    ]
+  },
+  application_stage_move: {
+    "target": {
+      "application_id": 100,
+      "job_id": 200
+    },
+    "before": {
+      "application_stage_id": 501,
+      "interview_stage_id": 601
+    },
+    "after": {
+      "interview_stage_id": 602,
+      "stage_name": "Onsite"
+    },
+    "effects": [
+      "Greenhouse may run configured stage-transition rules, including candidate email."
+    ]
+  },
+  application_rejection: {
+    "target": {
+      "application_id": 100,
+      "job_id": 200
+    },
+    "before": {
+      "status": "in_process",
+      "interview_stage_id": 601
+    },
+    "after": {
+      "status": "rejected",
+      "rejection_reason_id": 701,
+      "reason_name": "Position closed"
+    },
+    "effects": [
+      "Rejects the application without sending a candidate email."
+    ]
+  },
+  application_unreject: {
+    "target": {
+      "application_id": 100,
+      "job_id": 200
+    },
+    "before": {
+      "status": "rejected",
+      "rejection_reason_id": 701,
+      "rejection_note_id": null
+    },
+    "after": {
+      "status": "in_process",
+      "interview_stage_id": 601,
+      "rejection_reason_id": null,
+      "rejection_note_id": null
+    },
+    "effects": [
+      "Restores the application to its most recent pre-rejection interview stage.",
+      "Clears the active rejection reason and linked rejection-note reference."
+    ]
+  },
+  candidate_note_create: {
+    "target": {
+      "application_id": 100,
+      "candidate_id": 300,
+      "job_id": 200,
+      "author_user_id": 10
+    },
+    "before": {
+      "identical_note_ids": [],
+      "additional_identical_note_count": 0
+    },
+    "after": {
+      "body": "Follow up",
+      "visibility": "private",
+      "note_type": "NOTE"
+    },
+    "effects": [
+      "Creates an immutable Greenhouse candidate/application note; a normal identical note is still a new note."
+    ]
+  },
+  job_note_change: {
+    "target": {
+      "job_id": 200,
+      "note_id": null,
+      "verb": "create"
+    },
+    "before": {
+      "exists": false,
+      "body": null,
+      "visibility": null,
+      "author_user_id": null
+    },
+    "after": {
+      "exists": true,
+      "body": "Hiring note",
+      "visibility": "privately_visible"
+    },
+    "effects": [
+      "Creates a job note attributed to the signed-in Greenhouse user."
+    ]
+  },
+  application_attribution_change: {
+    "target": {
+      "application_id": 100,
+      "job_id": 200
+    },
+    "before": {
+      "source_id": 600
+    },
+    "after": {
+      "source_id": 601
+    },
+    "changed_fields": [
+      "source_id"
+    ],
+    "effects": [
+      "Changes recruiting-source/referrer attribution used in funnel analytics; no other application field is patched."
+    ]
+  },
+  candidate_record_update: {
+    "target": {
+      "context_application_id": 100,
+      "candidate_id": 300,
+      "job_id": 200
+    },
+    "changed_fields": [
+      "first_name"
+    ],
+    "before": {
+      "first_name": "Before"
+    },
+    "after": {
+      "first_name": "After"
+    },
+    "effects": [
+      "Touched collections are patched as the complete displayed arrays; omitted candidate fields are not sent."
+    ]
+  },
+  offer_create: {
+    "target": {
+      "application_id": 100,
+      "job_id": 200
+    },
+    "before": {
+      "offer_ids": []
+    },
+    "after": {
+      "starts_on": "2026-08-01",
+      "custom_fields": []
+    },
+    "included_fields": [
+      "starts_on"
+    ],
+    "effects": [
+      "Creates version 1 of a new offer chain; configured approval flows attach automatically."
+    ]
+  },
+  offer_update: {
+    "target": {
+      "application_id": 100,
+      "job_id": 200,
+      "offer_id": 950
+    },
+    "before": {
+      "offer_id": 950,
+      "version": 1,
+      "status": "Created",
+      "values": {
+        "starts_on": "2026-08-01"
+      }
+    },
+    "after": {
+      "values": {
+        "starts_on": "2026-09-01"
+      }
+    },
+    "changed_fields": [
+      "starts_on"
+    ],
+    "effects": [
+      "A start-date or version-triggering custom-field change may create a new current offer ID/version and deprecate this row."
+    ]
+  },
+  };
+
+  test("every action kind discloses attribution outside an approval that has not moved", async () => {
+    for (const scenario of SCENARIOS) {
+      const previews = [];
+      for (const mode of ["service_user", "per_human"] as const) {
+        const clock = new TestClock();
+        const store = new MemoryActionStore(clock);
+        const greenhouse = greenhouseFor(scenario.kind, mode);
+        const preview = await serviceFor(store, greenhouse, clock).preview(scenario.kind, scenario.preview);
+        assert.deepEqual(preview.attribution, {
+          mode,
+          recorded_as: mode === "per_human" ? "actor" : "service_account",
+          actor_greenhouse_user_id: 10,
+          actor_name: "Actor",
+          sentence: mode === "per_human"
+            ? "This change will be recorded in Greenhouse under Actor (you)."
+            : "This change will be recorded in Greenhouse under the integration's service account, not your name.",
+        }, `${scenario.kind}:${mode}`);
+
+        const approval = preview.approval as Record<string, unknown>;
+        assert.equal(Object.hasOwn(approval, "attribution"), false, scenario.kind);
+        assert.deepEqual(approval, APPROVAL_BASELINE[scenario.kind],
+          `${scenario.kind}: the approval a human signs is unchanged by attribution`);
+
+        // For every kind whose approval carries effects, the preview shows the SAME array object.
+        // Deep equality alone would survive a copy being appended to; reference identity would not.
+        if (Object.hasOwn(approval, "effects")) {
+          assert.deepEqual(preview.effects, approval.effects, `${scenario.kind}: effects agree`);
+          assert.ok(Object.is(preview.effects, approval.effects),
+            `${scenario.kind}: the preview's effects must BE the approval's effects, not a copy of them`);
+        } else {
+          assert.equal(scenario.kind, "application_assignment_change",
+            "only the assignment kind separates its preview from its approval; a new one must be decided on");
+          assert.ok(Array.isArray(preview.effects), "the assignment preview still carries its own effects");
+        }
+        previews.push(preview);
+      }
+      assert.deepEqual(previews[0]!.approval, previews[1]!.approval, `${scenario.kind}: approval is mode-independent`);
+    }
+
+    const clock = new TestClock();
+    const store = new MemoryActionStore(clock);
+    const greenhouse = greenhouseFor("application_assignment_change", "per_human");
+    const noChange = await serviceFor(store, greenhouse, clock).preview("application_assignment_change", {
+      application_id: 100, assignment_role: "recruiter", proposed_user_id: 20,
+    });
+    assert.deepEqual(noChange.attribution, {
+      mode: "per_human",
+      recorded_as: "actor",
+      actor_greenhouse_user_id: 10,
+      actor_name: "Actor",
+      sentence: "No write will occur, so nothing will be recorded in Greenhouse.",
+    });
+  });
+
   for (const scenario of SCENARIOS) {
     test(`${scenario.kind}: concurrent double-click and replay send one exact mutation`, async () => {
       const { service, greenhouse, store } = fixture(scenario.kind);
@@ -436,7 +705,7 @@ function serviceFor(
   });
 }
 
-function greenhouseFor(kind: ActionKind): RouteGreenhouse {
+function greenhouseFor(kind: ActionKind, attributionMode: "service_user" | "per_human" = "service_user"): RouteGreenhouse {
   const unreject = kind === "application_unreject";
   const application: GreenhouseRow = {
     id: 100,
@@ -505,7 +774,7 @@ function greenhouseFor(kind: ActionKind): RouteGreenhouse {
     custom_fields: {},
   }] : [];
 
-  const greenhouse = new RouteGreenhouse()
+  const greenhouse = new RouteGreenhouse(attributionMode)
     .onList("/applications", (params) => includesId(params.ids, 100) ? [application] : [])
     .onList("/users", (params) => users.filter((row) => includesId(params.ids, Number(row.id))))
     .onList("/jobs", (params) => includesId(params.ids, 200) ? [{ id: 200, confidential: false }] : [])

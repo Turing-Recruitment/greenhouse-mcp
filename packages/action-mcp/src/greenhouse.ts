@@ -1,4 +1,5 @@
-import type { GreenhouseGateway, GreenhouseRow, MutationResponse } from "./types.js";
+import type { AttributionMode, GreenhouseGateway, GreenhouseRow, MutationResponse } from "./types.js";
+export type { AttributionMode } from "./types.js";
 
 const TOKEN_URL = "https://auth.greenhouse.io/token";
 const API_ORIGIN = "https://harvest.greenhouse.io";
@@ -21,7 +22,6 @@ const MUTATION_PATHS: ReadonlyArray<[MutationResponseMethod, RegExp]> = [
 ];
 
 type MutationResponseMethod = "POST" | "PATCH" | "DELETE";
-export type AttributionMode = "service_user" | "per_human";
 
 export class GreenhouseError extends Error {
   readonly status: number | null;
@@ -114,7 +114,7 @@ export function createGreenhouseGateway(config: GreenhouseGatewayConfig): Greenh
     let url: URL | null = first;
     for (let page = 0; url && page < MAX_LIST_PAGES; page += 1) {
       const pageResult = await withAuthRefresh(
-        config.attributionMode === "per_human" ? actorUserId : undefined,
+        undefined,
         (token) => fetchWithDeadline(fetchImpl, url!.toString(), {
           method: "GET",
           redirect: "error",
@@ -143,6 +143,7 @@ export function createGreenhouseGateway(config: GreenhouseGatewayConfig): Greenh
   }
 
   return {
+    attributionMode: config.attributionMode,
     async probe(): Promise<void> {
       await tokenFor();
     },

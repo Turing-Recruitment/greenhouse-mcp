@@ -215,26 +215,64 @@ describe("Greenhouse v3 gateway", () => {
     await assert.rejects(hostile.list("/users", {}, 10), /left the Harvest API origin/);
   });
 
-  test("per-human mode reuses the actor-sub token for reads and writes", async () => {
+  test("per-human mode keeps reads on the ISU token and writes on the actor token", async () => {
     const tokenBodies: string[] = [];
-    const apiAuth: string[] = [];
+    const readAuth: string[] = [];
+    const writeAuth: string[] = [];
+    let unauthorizeNextRead = false;
     const gateway = createGreenhouseGateway({
       clientId: "client", clientSecret: "secret", attributionMode: "per_human",
       fetchImpl: async (input, init = {}) => {
         const url = String(input);
         if (url.includes("auth.greenhouse.io")) {
           tokenBodies.push(String(init.body));
-          return tokenResponse(10);
+          const sub = new URLSearchParams(String(init.body)).get("sub");
+          return Response.json({
+            access_token: `token-${tokenBodies.length}-${sub ?? "isu"}`,
+            expires_at: "2099-01-01T00:00:00.000Z",
+          });
         }
-        apiAuth.push(new Headers(init.headers).get("authorization") ?? "");
-        return init.method === "GET" ? Response.json([{ id: 100 }]) : Response.json({ id: 100 });
+        const authorization = new Headers(init.headers).get("authorization") ?? "";
+        if (init.method === "GET") {
+          readAuth.push(authorization);
+          if (unauthorizeNextRead) {
+            unauthorizeNextRead = false;
+            return new Response(null, { status: 401 });
+          }
+          return Response.json([{ id: 100 }]);
+        }
+        writeAuth.push(authorization);
+        return Response.json({ id: 100 });
       },
     });
+    // Both token keys are minted and CACHED before the 401 fires. Without that, a refresh that
+    // cleared the whole cache would still pass, because there would be nothing else in it: the
+    // actor token has to already exist for "refreshes only its own key" to mean anything.
     await gateway.list("/applications", { ids: "100" }, 10);
     await gateway.mutate({ method: "PATCH", path: "/applications/100", body: { recruiter_id: 40 }, actorUserId: 10 });
-    assert.deepEqual(tokenBodies, ["grant_type=client_credentials&sub=10"]);
-    assert.equal(new Set(apiAuth).size, 1);
-    assert.match(apiAuth[0]!, /^Bearer /);
+    assert.deepEqual(tokenBodies, [
+      "grant_type=client_credentials",
+      "grant_type=client_credentials&sub=10",
+    ], "one ISU mint for the read, one actor mint for the write");
+
+    unauthorizeNextRead = true;
+    await gateway.list("/applications", { ids: "100" }, 10);
+    await gateway.mutate({ method: "PATCH", path: "/applications/100", body: { recruiter_id: 40 }, actorUserId: 10 });
+
+    assert.deepEqual(tokenBodies, [
+      "grant_type=client_credentials",
+      "grant_type=client_credentials&sub=10",
+      "grant_type=client_credentials",
+    ], "the read's 401 re-mints the ISU token ONLY; the cached actor token is untouched");
+    assert.deepEqual(readAuth, [
+      "Bearer token-1-isu",
+      "Bearer token-1-isu",
+      "Bearer token-3-isu",
+    ], "reads never carry an actor-sub token: the cached ISU token, its 401, then its replacement");
+    assert.deepEqual(writeAuth, [
+      "Bearer token-2-10",
+      "Bearer token-2-10",
+    ], "the write reuses the SAME actor token across the read's refresh");
   });
 
   test("per-human environment mode is closed until the live token probe is attested", () => {

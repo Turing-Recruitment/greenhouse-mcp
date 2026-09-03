@@ -45,6 +45,7 @@ const intent: ActionIntent = {
   subject: "private-google-subject",
   identityId: row.identity_id,
   actorUserId: 10,
+  attributionMode: "service_user",
   sessionTokenId: "action:private-session",
   client: "claude_code",
   applyTool: "apply_application_assignment_change",

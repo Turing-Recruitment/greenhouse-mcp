@@ -13,6 +13,7 @@ export const ACTION_KINDS = [
 ] as const;
 
 export type ActionKind = typeof ACTION_KINDS[number];
+export type AttributionMode = "service_user" | "per_human";
 export type ActionClient = "codex" | "claude_code" | "claude_desktop_chat" | "test";
 export type AssignmentRole = "recruiter" | "coordinator";
 export type OwnerType = "sourcer" | "recruiter" | "coordinator";
@@ -144,6 +145,7 @@ export interface ActionIntent {
   subject: string;
   identityId: string;
   actorUserId: number;
+  attributionMode: AttributionMode;
   sessionTokenId: string;
   client: ActionClient;
   applyTool: string;
@@ -248,6 +250,7 @@ export interface MutationResponse {
 }
 
 export interface GreenhouseGateway {
+  readonly attributionMode: AttributionMode;
   probe(): Promise<void>;
   list(path: string, params: Record<string, string>, actorUserId: number): Promise<GreenhouseRow[]>;
   mutate(input: {

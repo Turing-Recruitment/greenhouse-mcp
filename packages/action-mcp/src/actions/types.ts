@@ -1,6 +1,7 @@
 import type { z } from "zod";
 import type {
   ActionKind,
+  AttributionMode,
   ActionRecord,
   Clock,
   GreenhouseGateway,
@@ -12,6 +13,12 @@ import type {
 
 export interface ActionContext {
   actorUserId: number;
+  /**
+   * REQUIRED. Whose Greenhouse account the write will be recorded under. Optional here once meant a
+   * context that silently reported `undefined` while the service disclosed a mode anyway; a
+   * required field makes every construction site — fakes included — state one.
+   */
+  readonly attributionMode: AttributionMode;
   greenhouse: GreenhouseGateway;
   signingSecret: string;
   clock: Clock;

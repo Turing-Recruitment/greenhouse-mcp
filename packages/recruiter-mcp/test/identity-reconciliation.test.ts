@@ -171,7 +171,14 @@ describe("identity directory reconciliation (Slice G #23)", () => {
       fetched = true;
       const url = new URL(String(input));
       assert.equal(url.searchParams.get("status"), "eq.resolved");
-      assert.equal(url.searchParams.get("select"), "greenhouse_user_id,primary_email,status,last_verified_at");
+      // The three attestation columns ride along so the deprovision PATCH can record the
+      // attestation it clears (CLO-273); they are dropped and the read retried if the table has not
+      // had migration 0008 applied.
+      assert.equal(
+        url.searchParams.get("select"),
+        "greenhouse_user_id,primary_email,status,last_verified_at," +
+          "private_candidates_attested,private_candidates_attested_at,private_candidates_attested_by"
+      );
       return {
         ok: true,
         status: 200,

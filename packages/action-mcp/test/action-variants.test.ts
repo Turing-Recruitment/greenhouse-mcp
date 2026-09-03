@@ -1,12 +1,173 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { actionDefinition } from "../src/actions/index.js";
+import type { ActionContext } from "../src/actions/index.js";
+import { GreenhouseActionService } from "../src/service.js";
 import type { ActionRecord, GreenhouseRow, MutationPlan, PreparedAction } from "../src/types.js";
-import { assignmentGreenhouse, RouteGreenhouse, TEST_SECRET, TestClock } from "./helpers.js";
+import {
+  MemoryActionStore,
+  assignmentGreenhouse,
+  RouteGreenhouse,
+  TEST_SECRET,
+  TestClock,
+  allowAllVisibility,
+  testSession,
+} from "./helpers.js";
 
 const clock = new TestClock();
 
 describe("action-specific variants", () => {
+  /**
+   * The assignee-access disclosure — C1/C1b/C2/C2b/C2c/C4, one named test each.
+   *
+   * They run through `GreenhouseActionService.preview`, not `preparePreview`, on purpose: the
+   * service is the layer that could drop `effects` on the floor between the prepare and the caller,
+   * and a test that calls the prepare directly would never notice.
+   */
+  const SIBLING_EFFECT = "Changes only the selected assignment field; the sibling recruiter/coordinator field is not patched.";
+  const ACCESS_WARNING = "Proposed has no permission row on req 200 and may not be able to open this application in Greenhouse; grant them Job Admin access on this req in Greenhouse first.";
+
+  test("C1: an assignee with no permission row previews READY, with the warning appended last", async () => {
+    const { service, state } = assignmentService();
+    state.permittedUserIds.delete(40);
+    const preview = await service.preview("application_assignment_change", {
+      application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+    });
+    assert.equal(preview.status, "ready", "a missing permission row is disclosed, never denied");
+    assert.deepEqual(preview.effects, [SIBLING_EFFECT, ACCESS_WARNING]);
+  });
+
+  test("C1b: an agency assignee previews READY, with the agency disclosed after the access effect", async () => {
+    const { service, greenhouse, state } = assignmentService();
+    state.users.set(40, { ...state.users.get(40), id: 40, agency_id: 77 });
+    const preview = await service.preview("application_assignment_change", {
+      application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+    });
+    assert.equal(preview.status, "ready", "an agency account is disclosed, not denied: no vendored page makes it a rule");
+    assert.deepEqual(preview.effects, [
+      SIBLING_EFFECT,
+      "Proposed can open this job (explicit permission)",
+      "Proposed is an external agency account (agency 77)",
+    ]);
+    // The disclosure only exists because the read ASKS for the field. Harvest returns exactly the
+    // `fields` requested, so dropping `agency_id` from the projection would silently blind this.
+    const proposedRead = greenhouse.listCalls.find((call) => call.path === "/users" && call.params.ids === "40");
+    assert.equal(proposedRead?.params.fields, "id,name,deactivated,site_admin,agency_id");
+  });
+
+  test("C2: an explicit permission row is disclosed as access", async () => {
+    const { service } = assignmentService();
+    const preview = await service.preview("application_assignment_change", {
+      application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+    });
+    assert.deepEqual(preview.effects, [SIBLING_EFFECT, "Proposed can open this job (explicit permission)"]);
+  });
+
+  test("C2b: a site admin on a non-confidential job is disclosed as access", async () => {
+    const { service, state } = assignmentService();
+    state.permittedUserIds.delete(40);
+    state.users.set(40, { ...state.users.get(40), id: 40, site_admin: true });
+    const preview = await service.preview("application_assignment_change", {
+      application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+    });
+    assert.deepEqual(preview.effects, [SIBLING_EFFECT, "Proposed can open this job (site admin, non-confidential job)"]);
+  });
+
+  test("C2c: a site admin on a CONFIDENTIAL job gets the warning, not access", async () => {
+    // 0166:7 — implicit site-admin access covers non-confidential jobs only.
+    const { service, state } = assignmentService();
+    state.permittedUserIds.delete(40);
+    state.users.set(40, { ...state.users.get(40), id: 40, site_admin: true });
+    state.job.confidential = true;
+    const preview = await service.preview("application_assignment_change", {
+      application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+    });
+    assert.deepEqual(preview.effects, [SIBLING_EFFECT, ACCESS_WARNING]);
+  });
+
+  test("C1c: a no-change assignment still discloses the incumbent's access, and says no write will occur", async () => {
+    const { service, state } = assignmentService();
+    const preview = await service.preview("application_assignment_change", {
+      application_id: 100, assignment_role: "recruiter", proposed_user_id: 20,
+    });
+    assert.equal(preview.status, "no_change");
+    assert.equal(preview.intent, null);
+    // User 20 holds no permission row in the fixture, so the incumbent draws the same warning. The
+    // no-change path runs the identical prepare, which is the point: it cannot quietly say less.
+    assert.deepEqual(preview.effects, [
+      SIBLING_EFFECT,
+      "Current Recruiter has no permission row on req 200 and may not be able to open this application in Greenhouse; grant them Job Admin access on this req in Greenhouse first.",
+    ]);
+    assert.equal((preview.attribution as { sentence: string }).sentence,
+      "No write will occur, so nothing will be recorded in Greenhouse.");
+    assert.equal(state.application.recruiter_id, 20);
+  });
+
+  test("C4: granting the assignee access between preview and apply is the REPAIR, not a state change", async () => {
+    // The path the warning exists to produce: the operator reads "grant them Job Admin access",
+    // does it, and applies. If the classification rode in the signed binding, this would come back
+    // STATE_CHANGED and the instruction would be a trap.
+    const { service, greenhouse, state } = assignmentService();
+    state.permittedUserIds.delete(40);
+    const preview = await service.preview("application_assignment_change", {
+      application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+    });
+    assert.deepEqual(preview.effects, [SIBLING_EFFECT, ACCESS_WARNING]);
+
+    state.permittedUserIds.add(40);
+    const result = await service.apply("application_assignment_change", {
+      intent: preview.intent, approval: preview.approval,
+    });
+    assert.equal(result.state, "succeeded");
+    assert.equal(result.error_code, null);
+    assert.equal(greenhouse.mutationCalls.length, 1);
+    assert.equal(state.application.recruiter_id, 40);
+  });
+
+  test("C4b: access REVOKED between preview and apply still applies — the assignment is not gated on it", async () => {
+    // Deliberate, and the inverse of C4. `0016-patch_v3-applications-id.md:486-491` documents no
+    // permission semantics for this PATCH, so there is no vendor rule to cite for stopping here, and
+    // the apply carries no preview-time classification to compare against: `assignee_access` is a
+    // disclosure in `preview.effects`, never a signed field. A stop would have to be invented.
+    const { service, greenhouse, state } = assignmentService();
+    const preview = await service.preview("application_assignment_change", {
+      application_id: 100, assignment_role: "recruiter", proposed_user_id: 40,
+    });
+    assert.deepEqual(preview.effects, [SIBLING_EFFECT, "Proposed can open this job (explicit permission)"]);
+
+    state.permittedUserIds.delete(40);
+    const result = await service.apply("application_assignment_change", {
+      intent: preview.intent, approval: preview.approval,
+    });
+    assert.equal(result.state, "succeeded");
+    assert.equal(greenhouse.mutationCalls.length, 1);
+  });
+
+  test("a linked user whose /users row omits site_admin is still an acceptable link", async () => {
+    // `assertActiveUser` also validates the users a candidate record links to, which has nothing to
+    // do with site-admin state. Refusing there on a missing `site_admin` would narrow an unrelated
+    // capability with no rule to cite; the two callers that CLASSIFY on the field read a non-boolean
+    // as "not a site admin" instead, which is the honest reading of an absent flag.
+    const candidateRow: GreenhouseRow = {
+      id: 300, first_name: "Priya", last_name: "Raman", preferred_name: null, company: null,
+      title: "Engineer", time_zone: "UTC", phone_numbers: [], addresses: [], email_addresses: [],
+      website_addresses: [], social_media_addresses: [], tags: [], linked_user_ids: [], custom_fields: {},
+    };
+    const greenhouse = authorizedRoutes()
+      .onList("/candidates", () => [candidateRow])
+      .onList("/users", (params) => String(params.ids).split(",").map((raw) => Number(raw)).map((id) =>
+        id === 40
+          ? { id: 40, name: "Linked", deactivated: false }
+          : { id, name: "Actor", deactivated: false, site_admin: false }));
+    const definition = actionDefinition("candidate_record_update");
+    const preview = await definition.preparePreview({
+      context_application_id: 100, changes: { linked_user_ids: { add: [40] } },
+    }, context(greenhouse));
+    const applied = await definition.prepareApply(preview.approval, context(greenhouse));
+    assert.equal(applied.changeRequired, true);
+    assert.deepEqual((applied.approval as { after: { linked_user_ids: number[] } }).after.linked_user_ids, [40]);
+  });
+
   test("coordinator assignment patches and observes only the selected assignment field", async () => {
     const { greenhouse, state } = assignmentGreenhouse();
     const definition = actionDefinition("application_assignment_change");
@@ -473,8 +634,19 @@ describe("action-specific variants", () => {
   });
 });
 
-function context(greenhouse: RouteGreenhouse) {
-  return { actorUserId: 10, greenhouse, signingSecret: TEST_SECRET, clock };
+function assignmentService() {
+  const clock = new TestClock();
+  const { greenhouse, state } = assignmentGreenhouse();
+  const service = new GreenhouseActionService({
+    session: testSession(), store: new MemoryActionStore(clock), greenhouse,
+    signingSecret: TEST_SECRET, visibility: allowAllVisibility(), writesEnabled: true,
+    production: false, clock,
+  });
+  return { service, greenhouse, state };
+}
+
+function context(greenhouse: RouteGreenhouse): ActionContext {
+  return { actorUserId: 10, attributionMode: "service_user", greenhouse, signingSecret: TEST_SECRET, clock };
 }
 
 function baseApplication(): GreenhouseRow {

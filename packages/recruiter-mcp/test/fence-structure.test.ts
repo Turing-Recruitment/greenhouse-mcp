@@ -49,6 +49,17 @@ const EXPECTED_READS: Readonly<Record<string, readonly string[]>> = {
 };
 
 /**
+ * The same inventory for the two src files outside `actions/` that a write path reads through.
+ * `service.ts` reads NOTHING: the attribution disclosure's actor-name lookup lives in
+ * `actions/shared.ts` with every other read, so this entry is an empty list on purpose — a read
+ * added to the service fails here until someone moves it or classifies it.
+ */
+const EXPECTED_SRC_READS: Readonly<Record<string, readonly string[]>> = {
+  "custom-fields.ts": ["/custom_field_options", "/custom_fields"],
+  "service.ts": [],
+};
+
+/**
  * Every path above is either COVERED by a fence-target kind whose probe governs it, or EXEMPT with
  * the written reason. An entry here is a decision; a path missing from both is a defect.
  */
@@ -90,9 +101,16 @@ describe("fence structure (Phase 2c Slice 5)", () => {
       }
     }
 
-    // custom-fields.ts sits outside actions/ but is read by four prepares; same rule.
-    for (const path of listPaths(join(ACTION_SRC, "custom-fields.ts"))) {
-      assert.ok(PATH_DISPOSITION[path], `custom-fields.ts reads ${path} with no disposition`);
+    // custom-fields.ts and service.ts sit outside actions/ but are on the write path; same rule,
+    // and the same EXACT inventory rather than a disposition-only check that a new read would pass.
+    for (const [file, expected] of Object.entries(EXPECTED_SRC_READS)) {
+      const discovered = listPaths(join(ACTION_SRC, file));
+      assert.deepEqual(discovered, [...expected].sort(),
+        `${file} reads a different set of Greenhouse resources than recorded — classify the change ` +
+        `in PATH_DISPOSITION before going green`);
+      for (const path of discovered) {
+        assert.ok(PATH_DISPOSITION[path], `${file} reads ${path} with no disposition`);
+      }
     }
   });
 

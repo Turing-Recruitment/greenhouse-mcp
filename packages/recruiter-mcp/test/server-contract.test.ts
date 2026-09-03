@@ -160,7 +160,7 @@ describe("recruiter MCP server contract", () => {
     assert.equal("match_mode" in resolveSchema, false);
   });
 
-  it("marks every recruiter MCP tool as read-only and non-destructive", () => {
+  it("marks every recruiter MCP tool as read-only and non-destructive, and titles it", () => {
     const scopedReader = fakeScopedReader((toolName) => scopedSuccess(toolName, []));
     const { runtime } = testRuntime(scopedReader);
     const annotations = new Map<string, Record<string, unknown>>();
@@ -174,7 +174,30 @@ describe("recruiter MCP server contract", () => {
 
     assert.equal(registered.length, RECRUITER_TOOL_DEFINITIONS.length);
     for (const name of registered) {
-      assert.deepStrictEqual(annotations.get(name), RECRUITER_READ_ONLY_TOOL_ANNOTATIONS);
+      const emitted = annotations.get(name);
+      assert.ok(emitted, `${name} registered without annotations`);
+      // The SAFETY TRIPLE is the contract the container self-check and the distribution validator
+      // read; it must still be exactly the read-only one. A deep-equal against the shared constant
+      // can no longer express that, because each registration now carries its own `title` — a
+      // per-tool value that cannot live on a shared frozen object.
+      // The LITERAL values, not equality with the constant: comparing each field to the constant
+      // passes just as happily after the constant itself is flipped, which is the mutation this is
+      // supposed to catch.
+      assert.equal(emitted!.readOnlyHint, true, name);
+      assert.equal(emitted!.destructiveHint, false, name);
+      assert.equal(emitted!.idempotentHint, true, name);
+      assert.equal(emitted!.openWorldHint, true, name);
+      assert.equal(typeof emitted!.title, "string", `${name} must carry a human-readable title`);
+      assert.ok(String(emitted!.title).length > 0, `${name} must carry a non-empty title`);
+      // EXACTLY the shared keys plus `title`: an annotation the registrar smuggles in — a
+      // client-facing hint nobody reviewed — would otherwise ride along invisibly.
+      assert.deepStrictEqual(
+        Object.keys(emitted!).sort(),
+        [...Object.keys(RECRUITER_READ_ONLY_TOOL_ANNOTATIONS), "title"].sort(),
+        `${name} carries an annotation key outside the reviewed set`
+      );
+      // And the shared constant itself must never have been mutated into carrying one.
+      assert.equal((RECRUITER_READ_ONLY_TOOL_ANNOTATIONS as { title?: unknown }).title, undefined);
     }
   });
 

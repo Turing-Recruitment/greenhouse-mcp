@@ -3,7 +3,12 @@ import assert from "node:assert/strict";
 import { copyFile, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { observeLiveReadyz, runRolloutGate as runRolloutGateWithClock, runRolloutGateFromEnv } from "../src/rollout-gate.js";
+import {
+  observeLiveReadyz,
+  runRolloutGate as runRolloutGateWithClock,
+  runRolloutGateFromEnv,
+  validateLiveProbeCheckScopes,
+} from "../src/rollout-gate.js";
 import { RECRUITER_MCP_READINESS_CHECK_NAMES } from "../src/readiness.js";
 import { PILOT_TOOL_NAMES } from "../src/tools/register.js";
 import { buildClaudeMcpb } from "../src/claude-mcpb.js";
@@ -2933,3 +2938,53 @@ async function updateJson(path: string, mutate: (value: Record<string, unknown>)
 async function writeJson(path: string, value: unknown): Promise<void> {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
 }
+
+describe("live-probe scope consistency (CLO-273 fold: the attestation changed what `scoped` means)", () => {
+  const scopeBoundCheck = (name: string, details: Record<string, unknown>) => ({
+    name,
+    status: "pass" as const,
+    summary: name,
+    details,
+  });
+
+  it("accepts an all-access probe whose reads are unscoped, because the probe's own sample says so", () => {
+    // An ATTESTED org-wide actor reads raw and unfiltered, exactly as on main, so every check
+    // reports scoped:false. The gate used to DERIVE the expectation ("operator ? false : true")
+    // rather than read it, so with the three production attestations written it would have failed
+    // scoped_flag_mismatch on every scope-bound check of every all-access probe.
+    const details = { permissionScopeKind: "all", permittedJobCount: null, scoped: false };
+    const problems = validateLiveProbeCheckScopes("all_jobs_or_operator", [
+      scopeBoundCheck("scoped_jobs_sample", details),
+      scopeBoundCheck("scoped_applications_sample", details),
+      scopeBoundCheck("candidate_shape_sample", details),
+    ], scopeBoundCheck("scoped_jobs_sample", details));
+    assert.deepStrictEqual(problems, []);
+  });
+
+  it("still fails when one check disagrees with the sample", () => {
+    const details = { permissionScopeKind: "all", permittedJobCount: null, scoped: false };
+    const problems = validateLiveProbeCheckScopes("all_jobs_or_operator", [
+      scopeBoundCheck("scoped_jobs_sample", details),
+      scopeBoundCheck("scoped_applications_sample", { ...details, scoped: true }),
+    ], scopeBoundCheck("scoped_jobs_sample", details));
+    assert.deepStrictEqual(problems, ["scoped_applications_sample:scoped_flag_mismatch"]);
+  });
+
+  it("refuses a sample that carries no usable scoped flag at all", () => {
+    const problems = validateLiveProbeCheckScopes(
+      "all_jobs_or_operator",
+      [scopeBoundCheck("scoped_jobs_sample", { permissionScopeKind: "all", permittedJobCount: null })],
+      scopeBoundCheck("scoped_jobs_sample", { permissionScopeKind: "all", permittedJobCount: null })
+    );
+    assert.deepStrictEqual(problems, ["scoped_jobs_sample:scoped_flag_missing"]);
+  });
+
+  it("keeps a job-scoped probe on the scoped side", () => {
+    const details = { permissionScopeKind: "jobs", permittedJobCount: 3, scoped: true };
+    const problems = validateLiveProbeCheckScopes("small_req_set", [
+      scopeBoundCheck("scoped_jobs_sample", details),
+      scopeBoundCheck("scoped_applications_sample", { ...details, scoped: false }),
+    ], scopeBoundCheck("scoped_jobs_sample", details));
+    assert.deepStrictEqual(problems, ["scoped_applications_sample:scoped_flag_mismatch"]);
+  });
+});

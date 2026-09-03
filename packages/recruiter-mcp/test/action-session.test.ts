@@ -93,6 +93,9 @@ class RevocationTrackingStore implements ActionStore {
 
 function gateway(): GreenhouseGateway {
   return {
+    // Stated, not force-cast away: GreenhouseActionService refuses to construct on a gateway that
+    // has not decided whose Greenhouse account its writes are recorded under.
+    attributionMode: "service_user",
     async list() {
       return [];
     },

@@ -1,8 +1,24 @@
 /**
- * Read-only capability catalogue for the recruiter MCP. It advertises the
- * approved scoped analysis recipes, the user modes, and the scope-resolution
- * contract. It never advertises write/admin tools or raw unscoped data paths.
+ * The capability catalogue for the recruiter MCP: the approved scoped analysis recipes, the user
+ * modes, and the scope-resolution contract.
+ *
+ * It used to say "read-only" unconditionally and list "No write/admin tools" under `excluded`. That
+ * became false the day the write plane shipped: an entitled session's catalog carries 22 preview and
+ * apply tools, and this document told the model they did not exist. The catalogue is now told which
+ * write actions THIS session actually holds, and says so.
+ *
+ * Two things stay withheld, on Sam's 2026-09-02 rulings, and neither is a hedge:
+ *   1. Teammate (colleague) email addresses on /v3/users, for job-scoped line recruiters. Site admins
+ *      and allowlisted operators DO receive them — they administer the staff directory — which is the
+ *      org's own Greenhouse permission boundary, not a caution of ours.
+ *   2. Private note bodies, scorecard private_notes, and custom-field VALUES flagged private in
+ *      Greenhouse, for everyone on this surface. These are gated by Greenhouse's own "see private
+ *      notes" / "View Private" permissions; granting them here would be a side-door around the system
+ *      of record.
+ * Everything else this file once called unavailable is available, and now says so.
  */
+
+import { PIPELINE_QUALITY_CLOCK, SCORECARD_WINDOW_CLOCK } from "../../tools/analysis-window-copy.js";
 
 export interface RecruitingCapabilityRecipe {
   id: string;
@@ -30,7 +46,8 @@ export interface RecruitingCapabilityRecipe {
 
 export interface RecruitingCapabilities {
   surface: "greenhouse-recruiter-mcp";
-  read_only: true;
+  /** False when this session holds write-action grants. It is a fact about the session, not a promise. */
+  read_only: boolean;
   model_visible_tools?: string[];
   scope_resolution: {
     required_before_analysis: boolean;
@@ -48,6 +65,32 @@ export interface RecruitingCapabilities {
   browsing_tools: Array<{ tool: string; purpose: string }>;
   excluded: string[];
   limitations: string[];
+}
+
+/**
+ * Names the write plane this session holds. Pairs are counted by the shared suffix behind the
+ * preview_/apply_ prefix, so a half-grant (preview without apply, or the reverse) is reported as the
+ * pair it belongs to AND by its actual tool count — the two numbers disagreeing is itself the signal.
+ */
+/**
+ * Only a COMPLETE pair is a usable write action: an apply is gated on a fresh preview and its signed
+ * intent, so `apply_x` without `preview_x` cannot be carried out. Counting one granted half as a pair
+ * promised the model a capability the session does not have; the half-grants are still named, as what
+ * they are, rather than hidden.
+ */
+function writeActionsSentence(grantedNames: string[]): string {
+  const granted = new Set(grantedNames);
+  const bases = [...new Set(grantedNames.map((name) => name.replace(/^(preview|apply)_/, "")))].sort();
+  const complete = bases.filter((base) => granted.has(`preview_${base}`) && granted.has(`apply_${base}`));
+  const halfGranted = bases.filter((base) => !complete.includes(base));
+  const head =
+    `Write actions are available to this session as ${complete.length} preview/apply pair${complete.length === 1 ? "" : "s"} ` +
+    `(${grantedNames.length} tool${grantedNames.length === 1 ? "" : "s"}): ${grantedNames.join(", ")}. `;
+  if (halfGranted.length === 0) return `${head}Every apply is gated on a fresh preview and its signed intent.`;
+  return (
+    `${head}Every apply is gated on a fresh preview and its signed intent, so ${halfGranted.length} ` +
+    `half-granted action${halfGranted.length === 1 ? "" : "s"} (${halfGranted.join(", ")}) cannot be completed on this session.`
+  );
 }
 
 const RECIPES: RecruitingCapabilityRecipe[] = [
@@ -77,7 +120,7 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
       "Broad operators must use a confirmed scope_handle or exact job_ids before analysis.",
     ],
     availability: "available",
-    description: "Rank scorecard accountability (unsubmitted rate, severity, affected jobs) across scoped jobs.",
+    description: `Rank scorecard accountability (unsubmitted rate, severity, affected jobs) across scoped jobs. ${SCORECARD_WINDOW_CLOCK}`,
     summary: "Ranks unsubmitted scorecard debt and affected jobs using scoped scorecard/application metadata.",
     example_question: "Who is sitting on unsubmitted scorecards across my reqs?",
     example_questions: ["Who is sitting on unsubmitted scorecards across my reqs?"],
@@ -106,7 +149,7 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
       "Broad operators must use a confirmed scope_handle or exact job_ids before analysis.",
     ],
     availability: "available",
-    description: "Surface late/overdue interview feedback against an SLA across scoped jobs.",
+    description: `Surface late/overdue interview feedback against an SLA across scoped jobs. ${SCORECARD_WINDOW_CLOCK}`,
     summary: "Ranks delayed or missing feedback by interviewer/submitter over scoped scorecard metadata.",
     example_question: "Where is interview feedback dragging past two days?",
     example_questions: ["Where is interview feedback dragging past two days?"],
@@ -165,7 +208,7 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
       "Broad operators must use a confirmed scope_handle or exact job_ids before analysis.",
     ],
     availability: "available",
-    description: "Summarize pipeline health, status mix, conversion, and stale active pipeline across scoped jobs.",
+    description: `Summarize pipeline health, status mix, conversion, and stale active pipeline across scoped jobs. ${PIPELINE_QUALITY_CLOCK}`,
     summary: "Summarizes scoped pipeline health, status mix, stale active rows, and job/stage concentration.",
     example_question: "How healthy is the pipeline for these jobs?",
     example_questions: ["How healthy is the pipeline for these jobs?"],
@@ -217,8 +260,8 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
       "Owner attribution is omitted or marked unavailable in this limited recipe.",
     ],
     safety_notes: [
-      "Uses public note metadata only; private note bodies are unavailable.",
-      "This silent-req recipe does not read candidate contact, resume or attachment content, or raw note bodies.",
+      "search_my_notes returns the BODIES of publicly_visible and admin_only_visible notes (what a Job Admin sees); privately_visible bodies are withheld on Greenhouse's \"see private notes\" permission.",
+      "This silent-req recipe reads no candidate contact and no resume or attachment content; it does read public note bodies through search_my_notes.",
     ],
     availability: "planned",
     description: "Find open reqs with little scoped application or public-note activity, without owner attribution.",
@@ -245,8 +288,8 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
       "User rows are reference metadata and must not be represented as job-filtered.",
     ],
     safety_notes: [
-      "Reports debt counts, stale timing, owner ids/names, and evidence ids; no candidate contact or raw feedback.",
-      "Private scorecards and private notes remain unavailable.",
+      "Reports debt counts, stale timing, owner ids/names, and evidence ids. search_my_scorecards returns scorecard feedback text (notes / public notes) — there is no row-level private-scorecard flag in v3; only the private_notes field and privately_visible note bodies are withheld, on Greenhouse's own permission.",
+      "search_my_users returns colleague email addresses to site admins and operators; a job-scoped line recruiter gets names and ids only.",
     ],
     availability: "limited",
     description: "Identify interviews that appear to need scorecard follow-up, with scoped owner attribution. NOTE: model-composed from required_tools (no single executor); the planner may route similar phrasings to an adjacent available recipe - for THIS analysis, read the required_tools and compose.",
@@ -265,15 +308,15 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
     required_data_domains: ["scorecards", "applications", "candidates_projected"],
     verification: [
       "Scorecard ratings and application stage metadata are scoped through application/job joins.",
-      "Candidate reads are projected to ids and scoped application references only.",
+      "Candidate reads through search_my_candidates carry the candidate's name, email addresses and phone numbers (what a Job Admin sees in Greenhouse), plus scoped application references; home addresses and raw profiles are withheld.",
     ],
     completeness_requirements: [
       "Scheduled interview data is unavailable until a scoped interview domain is added.",
       "Use the result as a stalled-signal preview, not a definitive no-next-step finding.",
     ],
     safety_notes: [
-      "This limited recipe does not read candidate contact, resume or attachment content, or raw profiles.",
-      "Scorecard free-text answers are not used by this limited recipe.",
+      "This recipe's required_tools include search_my_candidates, which DOES return candidate contact (name, email addresses, phone numbers); resume and attachment content are not read (use read_my_resume for that), and home addresses and raw profiles are withheld.",
+      "Scorecard free-text answers are not used by this limited recipe, though search_my_scorecard_question_answers can read them.",
     ],
     availability: "limited",
     description: "Surface strong scored applications with stage latency using projected candidate/application metadata. NOTE: model-composed from required_tools (no single executor); the planner may route similar phrasings to an adjacent available recipe - for THIS analysis, read the required_tools and compose.",
@@ -301,7 +344,7 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
     ],
     safety_notes: [
       "Reports reason ids/labels and aggregate concentration only; no per-candidate decision review.",
-      "Candidate contact, raw profiles, private notes, and write disposition tools remain unavailable.",
+      "This recipe reads no candidate contact and no note bodies. On the surface as a whole, candidate contact is available through search_my_candidates and disposition WRITES are available to a session holding the matching grant; private note bodies and private custom-field values stay withheld on Greenhouse's own permissions.",
     ],
     availability: "available",
     description: "Detect concentration or drift in structured rejection reasons across scoped reqs.",
@@ -325,10 +368,10 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
     ],
     completeness_requirements: [
       "Openings, applications, stage, and rejection-detail pagination must be complete for a complete verdict.",
-      "Offer/compensation signals remain unavailable on the recruiter surface.",
+      "Offer signals ARE available: search_my_offers returns offer metadata for permitted jobs including compensation custom fields, except any field definition flagged private in Greenhouse (and all custom fields when the definitions cannot be read). Add it to the composition when offer stall is the question.",
     ],
     safety_notes: [
-      "No offer compensation, candidate contact, private notes, or admin/write endpoints are exposed.",
+      "The tools listed above read no candidate contact and no note bodies. Offer compensation is reachable through search_my_offers, candidate contact through search_my_candidates, and write endpoints through the preview/apply pairs a granted session holds; private note bodies and private custom-field values stay withheld.",
       "Reason classes are diagnostic hints and must include omitted-domain metadata.",
     ],
     availability: "limited",
@@ -356,7 +399,7 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
     ],
     safety_notes: [
       "Flags deep active applications with no recorded scoped scorecard metadata; does not assert misconduct.",
-      "No candidate contact, raw feedback, private notes, or write/admin operations are exposed.",
+      "The tools listed above read no candidate contact. search_my_scorecards does return scorecard feedback text; only private_notes and privately_visible note bodies are withheld. Write/admin operations are available to a session holding the matching grant — see get_recruiting_capabilities.excluded for this session's.",
     ],
     availability: "limited",
     description: "Flag deep active applications with no recorded scorecard signal using scoped stage and scorecard metadata. NOTE: model-composed from required_tools (no single executor); the planner may route similar phrasings to an adjacent available recipe - for THIS analysis, read the required_tools and compose.",
@@ -366,8 +409,17 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
   },
 ];
 
-export function getRecruitingCapabilities(modelVisibleTools?: ReadonlySet<string>): RecruitingCapabilities {
+/**
+ * `grantedActionTools` is the write plane THIS session actually mounts. It defaults to empty, so a
+ * no-argument call (and any caller that predates the write plane) still reports a read-only surface —
+ * this never fails open into claiming a write capability the session does not hold.
+ */
+export function getRecruitingCapabilities(
+  modelVisibleTools?: ReadonlySet<string>,
+  grantedActionTools: ReadonlySet<string> = new Set()
+): RecruitingCapabilities {
   const visible = (name: string) => !modelVisibleTools || modelVisibleTools.has(name);
+  const grantedNames = [...grantedActionTools].sort();
   const recipes = modelVisibleTools
     ? RECIPES
         .filter((recipe) => recipe.tool !== undefined && modelVisibleTools.has(recipe.tool))
@@ -375,16 +427,19 @@ export function getRecruitingCapabilities(modelVisibleTools?: ReadonlySet<string
     : RECIPES;
   return {
     surface: "greenhouse-recruiter-mcp",
-    read_only: true,
-    ...(modelVisibleTools ? { model_visible_tools: [...modelVisibleTools].sort() } : {}),
+    read_only: grantedNames.length === 0,
+    ...(modelVisibleTools
+      ? { model_visible_tools: [...new Set([...modelVisibleTools, ...grantedNames])].sort() }
+      : {}),
     scope_resolution: {
-      required_before_analysis: true,
-      flow: ["resolve_job_scope", "confirm_job_scope (when required)", "scope_handle", "analyze_* / answer_my_recruiting_question"],
+      required_before_analysis: false,
+      flow: ["ask the question", "resolve_job_scope (to narrow, or when several reqs match)", "confirm_job_scope (when required)", "scope_handle", "analyze_*"],
       tools: ["resolve_job_scope", "confirm_job_scope", "get_job_scope"].filter(visible),
       notes: [
-        "Resolve natural-language or requisition references with resolve_job_scope before analysis when job intent is fuzzy.",
-        "Analysis tools accept a scope_handle or exact greenhouse job_ids only; they reject free-text job_query/role/alias inputs.",
-        "answer_my_recruiting_question resolves scope internally and will return a confirmation-required response instead of silently broad-running.",
+        "answer_my_recruiting_question answers without a pre-resolved scope: a req or role the question NAMES becomes the scope, and a question that names none is answered across every job the caller can see, with that scope stated on the answer.",
+        "Resolve first with resolve_job_scope when you want to pin a scope explicitly, reuse one across calls, or the question matched several requisitions.",
+        "Analysis tools accept a scope_handle or exact greenhouse job_ids only; they reject free-text job_query/role/alias inputs. Called with neither, they analyze everything the caller can see and disclose that scope in the response header.",
+        "A scope the question NAMED but that resolved to nothing is never widened: \"my reqs\" with no recruiter/sourcer assignment, or \"all open reqs\" where none are open, answers an explicit empty scope rather than substituting a different population.",
       ],
     },
     user_modes: [
@@ -395,16 +450,19 @@ export function getRecruitingCapabilities(modelVisibleTools?: ReadonlySet<string
         guardrails: [
           "Auto-confirms only unique, high-confidence, active-job matches over a complete inventory.",
           "Ambiguous role-family or multi-job matches require confirmation.",
+          "A question that names no req is answered across the recruiter's permitted book, and the answer's scope header names that set.",
+          "A req or requisition id named inside the QUESTION narrows the answer to it when it matches one job at high confidence; a weaker or ambiguous match keeps the permitted-book default rather than asking.",
         ],
       },
       {
         mode: "operator_site_admin",
         description: "Broad-visibility operator/site admin.",
-        auto_confirm_allowed: false,
+        auto_confirm_allowed: true,
         guardrails: [
-          "Fuzzy, multi-job, broad, or all-org scopes always require confirmation.",
-          "Partial/truncated inventory blocks analysis.",
-          "Every answer carries a scope header.",
+          "A question that names no req is answered org-wide by default; every answer's scope header states the scope it ran over and warns that no req was named.",
+          "Naming a req, role, or requisition id narrows the answer to it.",
+          "Confirmation is still required for genuine ambiguity: several requisitions matched at a real band, a collision alias, or one requisition id mapping to two jobs.",
+          "A truncated job index is disclosed on the answer, not treated as a blocker — the analysis reads do not depend on the index.",
         ],
       },
     ],
@@ -414,7 +472,9 @@ export function getRecruitingCapabilities(modelVisibleTools?: ReadonlySet<string
       { tool: "get_my_job", purpose: "Inspect one visible job." },
     ].filter((entry) => visible(entry.tool)),
     excluded: [
-      "No write/admin tools (no reject, move-stage, offer, assignment, or patch operations).",
+      grantedNames.length === 0
+        ? "No write/admin tools (no reject, move-stage, offer, assignment, or patch operations)."
+        : writeActionsSentence(grantedNames),
       "No raw unscoped Greenhouse read surface.",
       "No candidate home addresses, raw profiles, or private note payloads (candidate names, email addresses and phone numbers are available on the candidate tools).",
       "Attachment listings are metadata-only and never expose signed download URLs.",
@@ -422,7 +482,7 @@ export function getRecruitingCapabilities(modelVisibleTools?: ReadonlySet<string
     ],
     limitations: [
       "Resolver matching is deterministic lexical/alias matching over a permission-scoped job index; it does not use embeddings in v1.",
-      "Operator inventories can exceed the pagination cap and return inventory_complete=false, which blocks analysis until the scope is narrowed.",
+      "Operator inventories can exceed the pagination cap and return inventory_complete=false. Analysis still runs (the reads do not depend on the index), but a job COUNT in a scope label is then a floor rather than a total, and a named requisition cannot be confirmed against the index.",
       "Scope handles are signed, session-bound, and short-lived; they are not persisted or shareable.",
     ],
   };

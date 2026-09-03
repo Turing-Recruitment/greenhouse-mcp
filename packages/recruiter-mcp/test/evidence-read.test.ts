@@ -288,6 +288,30 @@ describe("application-backed evidence reads auto-bridge a confirmed scope (L1)",
     assert.equal(result.ok && result.scope?.applied, false);
     assert.ok(result.ok && typeof result.scope?.note === "string" && result.scope.note.includes("scope_handle"));
     assert.equal(reader.calls.filter((call) => call.toolName === "list_applications").length, 0, "an unscoped read issues no bridge");
+    // Item 15 (CLO-274): the permission_scope allowlist entry was unreachable — the unscoped path
+    // carried a note and nothing else, so the evidence envelope never NAMED the set it spanned.
+    // The disclosure now matches the analysis header: the scope is stated, not merely gestured at.
+    assert.equal(result.ok && result.scope?.source, "permission_scope");
+    assert.equal(result.ok && result.scope?.job_count, 2, "the permitted job count the scoped read itself reported");
+    assert.match(String(result.ok ? result.scope?.scope_label : ""), /reqs you can see in Greenhouse/);
+  });
+
+  it("item 15: an ORG-WIDE actor's unscoped evidence read names the org-wide scope and mints no count it does not have", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_application_stages") {
+        return scopedSuccess(toolName, STAGE_UNIVERSE, null, { permissionScope: { kind: "operator", permittedJobCount: null } });
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = scopedRuntime(reader);
+
+    const result = await runEvidenceTool(runtime, "search_my_application_stages", {});
+
+    assert.equal(result.ok, true);
+    assert.equal(result.ok && result.scope?.applied, false);
+    assert.equal(result.ok && result.scope?.source, "permission_scope");
+    assert.match(String(result.ok ? result.scope?.scope_label : ""), /org-wide/);
+    assert.equal(result.ok && result.scope?.job_count, undefined, "an org-wide read has no permitted-job count to state");
   });
 
   it("never widens past the scope: intersects a caller application_ids (incl. an id OUTSIDE the scope) and drops a candidate_ids filter", async () => {
@@ -892,6 +916,48 @@ describe("date-window fallback when upstream rejects the filter (422)", () => {
 });
 
 describe("join-backed scope bridge accounting", () => {
+  it("B11b: folds privacyWithheld from every derive hop and every endpoint batch into the envelope", async () => {
+    // Every fold on the way to `read` rebuilds a RowsResult field by field —
+    // `deriveIdsFromJobScope`, `applyBridgeAccounting`, `mergeRows`, `buildReadEnvelope`. A field
+    // one of them forgets is a field the model never sees, however faithfully readAllScopedRows
+    // aggregated it a page earlier: the analysis reads a deliberately short answer as a complete
+    // one.
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_approval_flows") {
+        return scopedSuccess(toolName, [{ id: 81, job_id: 9001006 }], null, {
+          rowCounts: { raw: 3, returned: 1, permissionExcluded: 2, unresolved: 0, status: "complete", privacyWithheld: 2 },
+        });
+      }
+      if (toolName === "list_approver_groups") {
+        return scopedSuccess(toolName, [{ id: 91, approval_flow_id: 81 }], null, {
+          rowCounts: { raw: 2, returned: 1, permissionExcluded: 1, unresolved: 0, status: "complete", privacyWithheld: 1 },
+        });
+      }
+      if (toolName === "list_approvers") {
+        return scopedSuccess(toolName, [{ id: 101, approver_group_id: 91 }], null, {
+          rowCounts: { raw: 5, returned: 1, permissionExcluded: 4, unresolved: 0, status: "complete", privacyWithheld: 4 },
+        });
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = scopedRuntime(reader);
+
+    const result = await runEvidenceTool(runtime, "search_my_approvers", { job_ids: "9001006" });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.ok && result.read?.privacy_withheld, 7,
+      "2 from the flow derive + 1 from the group derive + 4 from the endpoint read");
+  });
+
+  it("B11b: omits privacy_withheld entirely when nothing was withheld", async () => {
+    const reader = fakeScopedReader((toolName) => scopedSuccess(toolName, [{ id: 81, job_id: 9001006 }]));
+    const { runtime } = scopedRuntime(reader);
+    const result = await runEvidenceTool(runtime, "search_my_approval_flows", { job_ids: "9001006" });
+    assert.equal(result.ok, true);
+    assert.ok(result.ok && result.read && !("privacy_withheld" in result.read),
+      "an absent field is honestly silent; a zero would be one more number to read past on every call");
+  });
+
   it("folds derivation and endpoint accounting without losing incomplete scope resolution", async () => {
     const meta = (rateLimitRetries: number, cacheHits: number) => ({
       retry: {
