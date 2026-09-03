@@ -89,6 +89,8 @@ export interface JobScopeIdBridge {
   rawRowsRead: number;
   returnedRowsRead: number;
   permissionExcluded: number;
+  /** Of `permissionExcluded`, how many the private-candidate gate withheld across the derive reads. */
+  privacyWithheld: number;
   unresolvedRows: number;
   pagesRead: number;
   rateLimitRetries: number;
@@ -183,6 +185,7 @@ export async function loadScorecardIdsForJobScope(
   let rawRowsRead = apps.rawRowsRead;
   let returnedRowsRead = apps.returnedRowsRead;
   let permissionExcluded = apps.permissionExcluded;
+  let privacyWithheld = apps.privacyWithheld;
   let unresolvedRows = apps.unresolvedRows;
   let cacheHits = apps.cacheHits;
   let pagesRead = apps.pagesRead;
@@ -228,6 +231,7 @@ export async function loadScorecardIdsForJobScope(
     rawRowsRead += read.rawRowsRead;
     returnedRowsRead += read.rowsReturnedRead ?? read.rows.length;
     permissionExcluded += read.permissionExcluded;
+    privacyWithheld += read.privacyWithheld;
     unresolvedRows += read.unresolvedRows;
     cacheHits += read.cacheHits;
     pagesRead += read.pagesRead;
@@ -249,6 +253,7 @@ export async function loadScorecardIdsForJobScope(
     rawRowsRead,
     returnedRowsRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     cacheHits,
     pagesRead,
@@ -292,6 +297,9 @@ export async function readApplicationBackedRowsForJobScope<T extends Record<stri
   let rawRowsRead = apps.rawRowsRead;
   let rowsReturnedRead = apps.returnedRowsRead;
   let permissionExcluded = apps.permissionExcluded;
+  // The bridge read that produced `apps` reports no privacy count of its own (its result shape is
+  // the id bridge, not a row read), so this starts at zero and folds in the row reads below.
+  let privacyWithheld = 0;
   let unresolvedRows = apps.unresolvedRows;
   let cacheHits = apps.cacheHits;
   let pagesRead = apps.pagesRead;
@@ -331,6 +339,7 @@ export async function readApplicationBackedRowsForJobScope<T extends Record<stri
     rawRowsRead += read.rawRowsRead;
     rowsReturnedRead += read.rowsReturnedRead ?? read.rows.length;
     permissionExcluded += read.permissionExcluded;
+    privacyWithheld += read.privacyWithheld;
     unresolvedRows += read.unresolvedRows;
     cacheHits += read.cacheHits;
     pagesRead += read.pagesRead;
@@ -351,6 +360,7 @@ export async function readApplicationBackedRowsForJobScope<T extends Record<stri
     rawRowsRead,
     rowsReturnedRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     pagesRead,
     status,
@@ -405,6 +415,7 @@ async function deriveIdsFromJobScope(
       rawRowsRead: 0,
       returnedRowsRead: 0,
       permissionExcluded: 0,
+      privacyWithheld: 0,
       unresolvedRows: 0,
       pagesRead: 0,
       rateLimitRetries: 0,
@@ -420,6 +431,7 @@ async function deriveIdsFromJobScope(
   let rawRowsRead = 0;
   let returnedRowsRead = 0;
   let permissionExcluded = 0;
+  let privacyWithheld = 0;
   let unresolvedRows = 0;
   let cacheHits = 0;
   let pagesRead = 0;
@@ -467,6 +479,7 @@ async function deriveIdsFromJobScope(
     rawRowsRead += read.rawRowsRead;
     returnedRowsRead += read.rowsReturnedRead ?? read.rows.length;
     permissionExcluded += read.permissionExcluded;
+    privacyWithheld += read.privacyWithheld;
     unresolvedRows += read.unresolvedRows;
     cacheHits += read.cacheHits;
     pagesRead += read.pagesRead;
@@ -488,6 +501,7 @@ async function deriveIdsFromJobScope(
     rawRowsRead,
     returnedRowsRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     cacheHits,
     pagesRead,

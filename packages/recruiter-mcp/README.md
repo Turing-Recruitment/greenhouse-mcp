@@ -30,6 +30,14 @@ issue time. They do not carry Greenhouse roles, job ids, or permission claims.
 The runtime resolves current ATS access for each scoped read and denies unknown
 permission shapes.
 
+Private candidates are the one access Greenhouse decides on an input the API does
+not return. An org-wide or operator session sees them only when the identity
+directory carries an attestation for that Greenhouse user
+(`greenhouse-recruiter-attest-private-candidates --greenhouse-user-id <id> --by
+"<name> (attested YYYY-MM-DD)"`; `--clear` withdraws it). Unattested is the
+fail-closed default and is disclosed per read, and per session on `get_job_scope`
+and `confirm_job_scope` as `private_candidates_visible`.
+
 ## Model-facing catalog
 
 The canonical catalog is defined and ordered in

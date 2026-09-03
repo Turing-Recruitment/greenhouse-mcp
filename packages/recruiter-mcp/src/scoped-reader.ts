@@ -6,6 +6,11 @@ import {
 } from "../../scoped-core/src/index.js";
 import { apiGet, apiGetWithCursor, configure } from "../../control-plane/dist/client-readonly.js";
 import { createIdentityActorResolver, type IdentityDirectory } from "./identity.js";
+import {
+  createPrivateCandidateAttestationLookup,
+  createPrivateCandidateAttestationStamp,
+  type PrivateCandidateAttestationLookup,
+} from "./private-candidate-attestation.js";
 import { createSiteAdminAwarePermissionProvider } from "./site-admin-permission.js";
 import { createCachingRawReader, readReadCacheConfig } from "./read-cache.js";
 import { createTtlMemo } from "./ttl-memo.js";
@@ -34,6 +39,47 @@ type PermissionProviderLike = {
 };
 const sharedPermissionProviders = new Map<string, PermissionProviderLike>();
 
+// The attestation lookup keeps the "warn once per failure class" state, so it has to outlive the
+// per-request server the same way the permission providers do. Keyed on the directory coordinates
+// that change its behaviour; the KEY never carries the service-role key, only whether one is set.
+const sharedAttestationLookups = new Map<string, PrivateCandidateAttestationLookup>();
+
+/**
+ * Everything about the directory that changes what an attestation lookup ANSWERS, and nothing that
+ * is a secret.
+ *
+ * One function, used by both registries, because the two used to disagree: the lookup registry keyed
+ * on the id column, the status column and the resolved-status value; the provider registry keyed on
+ * the URL and the table only. A process that rebuilt a reader with a different id/status column
+ * therefore got a fresh lookup and the OLD memoized provider — whose cached answer still carried the
+ * previous configuration's attestation. Same inputs, same key, in both places.
+ *
+ * The API key is never part of the key — only whether one is set, which is what decides whether the
+ * lookup can run at all.
+ */
+export function privateCandidateAttestationFingerprint(env: NodeJS.ProcessEnv): string {
+  return [
+    env.GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_URL ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_TABLE ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_GREENHOUSE_USER_ID_COLUMN ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_STATUS_COLUMN ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_RESOLVED_STATUS ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_EMAIL_COLUMN ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_LOOKUP_TIMEOUT_MS ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_KEY ? "keyed" : "unkeyed",
+  ].join("|");
+}
+
+function getPrivateCandidateAttestationLookup(env: NodeJS.ProcessEnv): PrivateCandidateAttestationLookup {
+  const key = privateCandidateAttestationFingerprint(env);
+  let lookup = sharedAttestationLookups.get(key);
+  if (!lookup) {
+    lookup = createPrivateCandidateAttestationLookup(env);
+    sharedAttestationLookups.set(key, lookup);
+  }
+  return lookup;
+}
+
 // The TTL + single-flight + refcount + evict-on-failure machinery this used to spell out inline
 // now lives in ttl-memo.ts, unchanged, because the action-entitlement lookup needs the same
 // mechanism and a second hand-rolled copy is how two caches drift apart. What stays here is the
@@ -55,6 +101,27 @@ function memoizePermissionScope(provider: PermissionProviderLike, ttlMs: number)
   };
 }
 
+/**
+ * The attestation ages on the same clock as the permission scope it decides.
+ *
+ * The provider path already gets this for free — the stamp runs inside `memoizePermissionScope`.
+ * The direct-operator path does not: it reads before the provider chain runs, so without this every
+ * operator read would cost its own PostgREST lookup. TTL 0 (which production forces) passes the
+ * lookup straight through, exactly as the permission memo does.
+ */
+function memoizeAttestationLookup(
+  lookup: PrivateCandidateAttestationLookup,
+  ttlMs: number
+): PrivateCandidateAttestationLookup {
+  if (ttlMs <= 0) return lookup;
+  const memo = createTtlMemo<number, boolean>({
+    ttlMs,
+    load: (userId, signal) => lookup(userId, signal),
+    cancelledMessage: "Private-candidate attestation lookup was cancelled by the caller.",
+  });
+  return (userId, signal) => memo(userId, signal);
+}
+
 export function createProductionScopedReader(
   identityDirectory: IdentityDirectory,
   env: NodeJS.ProcessEnv = process.env
@@ -67,7 +134,17 @@ export function createProductionScopedReader(
   const cachedRawReader = createCachingRawReader(rawReader, readReadCacheConfig(env));
   const ttlMs = readPermissionTtlMs(env);
   const disableSiteAdmin = readBooleanEnvFlag(env, "GREENHOUSE_RECRUITER_DISABLE_SITE_ADMIN_ALL_ACCESS");
-  const providerKey = `ttl:${ttlMs}|siteadmin:${disableSiteAdmin ? "off" : "on"}`;
+  const attestationLookup = memoizeAttestationLookup(getPrivateCandidateAttestationLookup(env), ttlMs);
+  const providerKey = [
+    `ttl:${ttlMs}`,
+    `siteadmin:${disableSiteAdmin ? "off" : "on"}`,
+    // The stamp's answer is part of what the memo caches, so a differently-configured directory has
+    // to get its own provider or one process's attestation state would serve another's reads. The
+    // FULL fingerprint, not the URL and table: a rebuild that changed only the id or status column
+    // reused the provider memoized under the previous configuration — and with it the positive
+    // attestation that configuration had produced.
+    `attest:${privateCandidateAttestationFingerprint(env)}`,
+  ].join("|");
   let permissionProvider = sharedPermissionProviders.get(providerKey);
   if (!permissionProvider) {
     const basePermissionProvider = createHarvestPermissionProvider({ rawReader, ttlMs });
@@ -78,7 +155,17 @@ export function createProductionScopedReader(
     const chained = disableSiteAdmin
       ? basePermissionProvider
       : createSiteAdminAwarePermissionProvider({ base: basePermissionProvider, rawReader });
-    permissionProvider = memoizePermissionScope(chained, ttlMs);
+    // The private-candidate attestation is stamped onto every all-access answer HERE, inside the
+    // memo, so the flag ages on the same clock as the scope it belongs to: a CLI attestation is
+    // observed within readPermissionTtlMs (60s by default, and immediately in production, which
+    // sets GREENHOUSE_RECRUITER_FORCE_PERMISSION_TTL_ZERO). Stamping outside the memo would write
+    // one actor's attestation onto the shared cached object.
+    const stamped = createPrivateCandidateAttestationStamp({
+      chained,
+      base: basePermissionProvider,
+      isAttested: attestationLookup,
+    });
+    permissionProvider = memoizePermissionScope(stamped, ttlMs);
     sharedPermissionProviders.set(providerKey, permissionProvider);
   }
   return createScopedGreenhouseReader<AuthenticatedSession>({
@@ -88,6 +175,10 @@ export function createProductionScopedReader(
     // unaccounted staleness layer on top of the permission TTL for one authorization input.
     authorizationReader: rawReader,
     actorResolver: createIdentityActorResolver(identityDirectory),
+    // The direct-operator path returns raw data before the permission provider runs, so it cannot
+    // read the flag the provider stamps onto a scope. It gets the lookup itself; an operator whose
+    // attestation cannot be established is unattested, never assumed.
+    privateCandidateAttestation: attestationLookup,
     permissionProvider: permissionProvider as Parameters<typeof createScopedGreenhouseReader>[0]["permissionProvider"],
     scopePolicyRegistry: SCOPED_TOOL_SCOPE_POLICIES,
     operatorActorIds:

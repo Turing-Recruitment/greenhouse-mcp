@@ -1,7 +1,7 @@
 import { readAllScopedRows, readStatusMessage } from "../../read-all.js";
 import { type RecruiterToolRuntime, type ToolDeadline } from "../../runtime.js";
 import { classifyUpstreamError, isRateLimitError } from "../../upstream-error.js";
-import type { RecruiterDenialCode } from "../../types.js";
+import type { RecruiterDenialCode, RecruiterPermissionScope } from "../../types.js";
 import type { AliasEntry } from "./aliases.js";
 import { getJobInventoryProvider } from "./services.js";
 
@@ -55,6 +55,16 @@ export interface JobInventory {
    * to broaden access, and never surfaced to the model in resolver output.
    */
   confidentialExcludedIds: number[];
+  /**
+   * Can this session see private candidates across the tenant?
+   *
+   * `null` for a job-scoped recruiter, whose private access was never org-wide and is decided per
+   * req — reporting a single boolean there would be a claim the read plane does not make. For an
+   * org-wide or operator session it is the read plane's own answer, taken off the scoped read's
+   * `permissionScope`: false means an operator has not attested this actor's Greenhouse
+   * private-candidate permission, so their reads are deliberately short and the tool says so.
+   */
+  privateCandidatesVisible: boolean | null;
   complete: boolean;
   truncated: boolean;
   accessibleSeen: number;
@@ -145,6 +155,7 @@ export async function loadScopedReaderInventory(
   const truncated = readResult.paginationTruncated;
   const paginationError = readStatusMessage(readResult.status) ?? null;
   const canViewConfidential = scopeKind !== "jobs";
+  const privateCandidatesVisible = privateCandidateVisibilityOf(scopeKind, readResult.permissionScope);
   const { joins, enrichmentIncomplete } = await loadInventoryEnrichment(runtime, deadline);
   const normalized = rows.map((row) => normalizeLiveJobRow(row, joins));
   const unnormalizableRows = normalized.filter((record) => record === null).length;
@@ -164,6 +175,7 @@ export async function loadScopedReaderInventory(
       scopeKind,
       canViewConfidential,
       confidentialExcludedIds,
+      privateCandidatesVisible,
       complete,
       truncated,
       accessibleSeen: records.length,
@@ -317,6 +329,21 @@ export interface FixtureInventoryOptions {
  * confidential filtering are applied here exactly as the scoped core would
  * apply them in production, so the resolver policy is exercised faithfully.
  */
+/**
+ * Read the private-candidate disclosure off the applied scope.
+ *
+ * Absent `privateCandidatesWithheld` means nothing was withheld — the attested org-wide read, and
+ * every read that predates the gate. Only the explicit `true` reports false.
+ */
+function privateCandidateVisibilityOf(
+  scopeKind: InventoryScopeKind,
+  permissionScope: RecruiterPermissionScope | undefined
+): boolean | null {
+  if (scopeKind === "jobs") return null;
+  const withheld = (permissionScope as { privateCandidatesWithheld?: boolean } | undefined)?.privateCandidatesWithheld;
+  return withheld !== true;
+}
+
 export function buildFixtureInventory(
   fixture: JobScopeFixture,
   personaId: string,
@@ -352,6 +379,9 @@ export function buildFixtureInventory(
       scopeKind,
       canViewConfidential,
       confidentialExcludedIds,
+      // The fixture personas predate the attestation and carry no directory row, so an org-wide
+      // fixture persona reads as attested — which is what every fixture-driven test assumes.
+      privateCandidatesVisible: scopeKind === "jobs" ? null : true,
       complete,
       truncated: !complete,
       accessibleSeen: records.length,

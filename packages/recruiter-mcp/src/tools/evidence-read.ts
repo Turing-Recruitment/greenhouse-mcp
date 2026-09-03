@@ -448,6 +448,7 @@ export function getScopeBridgeSpec(adapter: EvidenceEndpointAdapter | undefined)
         rawRowsRead: 0,
         returnedRowsRead: 0,
         permissionExcluded: 0,
+        privacyWithheld: 0,
         unresolvedRows: 0,
         pagesRead: 0,
         rateLimitRetries: 0,
@@ -556,6 +557,7 @@ async function deriveJoinBackedFilterIds(
   let rawRowsRead = 0;
   let returnedRowsRead = 0;
   let permissionExcluded = 0;
+  let privacyWithheld = 0;
   let unresolvedRows = 0;
   let pagesRead = 0;
   let rateLimitRetries = 0;
@@ -572,6 +574,7 @@ async function deriveJoinBackedFilterIds(
     rawRowsRead += hop.rawRowsRead;
     returnedRowsRead += hop.returnedRowsRead;
     permissionExcluded += hop.permissionExcluded;
+    privacyWithheld += hop.privacyWithheld;
     unresolvedRows += hop.unresolvedRows;
     pagesRead += hop.pagesRead;
     rateLimitRetries += hop.rateLimitRetries;
@@ -624,6 +627,7 @@ async function deriveJoinBackedFilterIds(
     rawRowsRead,
     returnedRowsRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     pagesRead,
     rateLimitRetries,
@@ -664,6 +668,7 @@ async function deriveIdsFromRegisteredEndpoint(
       rawRowsRead: 0,
       returnedRowsRead: 0,
       permissionExcluded: 0,
+      privacyWithheld: 0,
       unresolvedRows: 0,
       pagesRead: 0,
       rateLimitRetries: 0,
@@ -689,6 +694,7 @@ async function deriveIdsFromRegisteredEndpoint(
   let rawRowsRead = 0;
   let returnedRowsRead = 0;
   let permissionExcluded = 0;
+  let privacyWithheld = 0;
   let unresolvedRows = 0;
   let pagesRead = 0;
   let rateLimitRetries = 0;
@@ -722,6 +728,7 @@ async function deriveIdsFromRegisteredEndpoint(
     rawRowsRead += read.rawRowsRead;
     returnedRowsRead += read.rowsReturnedRead ?? read.rows.length;
     permissionExcluded += read.permissionExcluded;
+    privacyWithheld += read.privacyWithheld;
     unresolvedRows += read.unresolvedRows;
     pagesRead += read.pagesRead;
     rateLimitRetries += read.rateLimitRetries;
@@ -741,6 +748,7 @@ async function deriveIdsFromRegisteredEndpoint(
     rawRowsRead,
     returnedRowsRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     pagesRead,
     rateLimitRetries,
@@ -954,6 +962,9 @@ export function buildReadEnvelope(readAll: RowsResult): EvidenceReadEnvelope {
     rows_returned: readAll.rowsReturnedRead ?? readAll.rows.length,
     raw_rows_read: readAll.rawRowsRead,
     permission_excluded: readAll.permissionExcluded,
+    // Omitted when zero: an absent field is honestly silent, and a zero on every call is one more
+    // number for the model to read past before it reaches the one that matters.
+    ...(readAll.privacyWithheld > 0 ? { privacy_withheld: readAll.privacyWithheld } : {}),
     unresolved_scope_rows: readAll.unresolvedRows,
     pages_read: readAll.pagesRead,
     per_page: readAll.perPage,
@@ -973,6 +984,7 @@ function emptyRows(): RowsResult {
     rawRowsRead: 0,
     rowsReturnedRead: 0,
     permissionExcluded: 0,
+    privacyWithheld: 0,
     unresolvedRows: 0,
     pagesRead: 0,
     status: "complete",
@@ -994,6 +1006,10 @@ function applyBridgeAccounting(
   aggregate.rawRowsRead += bridge.rawRowsRead;
   aggregate.rowsReturnedRead = (aggregate.rowsReturnedRead ?? 0) + bridge.returnedRowsRead;
   aggregate.permissionExcluded += bridge.permissionExcluded;
+  // The derive hops are scoped reads like any other, so rows the privacy gate withheld from THEM
+  // are rows missing from the ids the endpoint read is then bounded to. Dropping the count here
+  // hid the shortfall at the point it was largest.
+  aggregate.privacyWithheld += bridge.privacyWithheld;
   aggregate.unresolvedRows += bridge.unresolvedRows;
   aggregate.pagesRead += bridge.pagesRead;
   aggregate.rateLimitRetries += bridge.rateLimitRetries;
@@ -1011,6 +1027,7 @@ function mergeRows(aggregate: RowsResult, read: RowsResult): void {
   aggregate.rawRowsRead += read.rawRowsRead;
   aggregate.rowsReturnedRead = (aggregate.rowsReturnedRead ?? 0) + (read.rowsReturnedRead ?? read.rows.length);
   aggregate.permissionExcluded += read.permissionExcluded;
+  aggregate.privacyWithheld += read.privacyWithheld;
   aggregate.unresolvedRows += read.unresolvedRows;
   aggregate.pagesRead += read.pagesRead;
   aggregate.rateLimitRetries += read.rateLimitRetries;

@@ -916,6 +916,48 @@ describe("date-window fallback when upstream rejects the filter (422)", () => {
 });
 
 describe("join-backed scope bridge accounting", () => {
+  it("B11b: folds privacyWithheld from every derive hop and every endpoint batch into the envelope", async () => {
+    // Every fold on the way to `read` rebuilds a RowsResult field by field —
+    // `deriveIdsFromJobScope`, `applyBridgeAccounting`, `mergeRows`, `buildReadEnvelope`. A field
+    // one of them forgets is a field the model never sees, however faithfully readAllScopedRows
+    // aggregated it a page earlier: the analysis reads a deliberately short answer as a complete
+    // one.
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_approval_flows") {
+        return scopedSuccess(toolName, [{ id: 81, job_id: 9001006 }], null, {
+          rowCounts: { raw: 3, returned: 1, permissionExcluded: 2, unresolved: 0, status: "complete", privacyWithheld: 2 },
+        });
+      }
+      if (toolName === "list_approver_groups") {
+        return scopedSuccess(toolName, [{ id: 91, approval_flow_id: 81 }], null, {
+          rowCounts: { raw: 2, returned: 1, permissionExcluded: 1, unresolved: 0, status: "complete", privacyWithheld: 1 },
+        });
+      }
+      if (toolName === "list_approvers") {
+        return scopedSuccess(toolName, [{ id: 101, approver_group_id: 91 }], null, {
+          rowCounts: { raw: 5, returned: 1, permissionExcluded: 4, unresolved: 0, status: "complete", privacyWithheld: 4 },
+        });
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = scopedRuntime(reader);
+
+    const result = await runEvidenceTool(runtime, "search_my_approvers", { job_ids: "9001006" });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.ok && result.read?.privacy_withheld, 7,
+      "2 from the flow derive + 1 from the group derive + 4 from the endpoint read");
+  });
+
+  it("B11b: omits privacy_withheld entirely when nothing was withheld", async () => {
+    const reader = fakeScopedReader((toolName) => scopedSuccess(toolName, [{ id: 81, job_id: 9001006 }]));
+    const { runtime } = scopedRuntime(reader);
+    const result = await runEvidenceTool(runtime, "search_my_approval_flows", { job_ids: "9001006" });
+    assert.equal(result.ok, true);
+    assert.ok(result.ok && result.read && !("privacy_withheld" in result.read),
+      "an absent field is honestly silent; a zero would be one more number to read past on every call");
+  });
+
   it("folds derivation and endpoint accounting without losing incomplete scope resolution", async () => {
     const meta = (rateLimitRetries: number, cacheHits: number) => ({
       retry: {

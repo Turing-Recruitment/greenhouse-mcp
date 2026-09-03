@@ -35,6 +35,13 @@ export type ReadAllRowsResult<T extends Record<string, unknown>> =
       /** Rows returned by every upstream read folded into this result, including bridge reads. */
       rowsReturnedRead?: number;
       permissionExcluded: number;
+      /**
+       * Of `permissionExcluded`, how many the private-candidate gate withheld — summed across every
+       * page. Non-zero means the actor's org-wide private-candidate permission is unattested (or
+       * the rows sit on reqs their Greenhouse roles do not reach), so the analysis above it is
+       * working from a deliberately short set and should say so rather than read it as complete.
+       */
+      privacyWithheld: number;
       unresolvedRows: number;
       pagesRead: number;
       status: ReadAllStatus;
@@ -78,6 +85,7 @@ export async function readAllScopedRows<T extends Record<string, unknown>>(
   let rawRowsRead = 0;
   let rowsReturnedRead = 0;
   let permissionExcluded = 0;
+  let privacyWithheld = 0;
   let unresolvedRows = 0;
   let actorId: number | undefined;
   let effectiveActorId: number | undefined;
@@ -164,6 +172,7 @@ export async function readAllScopedRows<T extends Record<string, unknown>>(
     rawRowsRead += mapped.rowCounts?.raw ?? (Array.isArray(mapped.data) ? mapped.data.length : 0);
     rowsReturnedRead += mapped.rowCounts?.returned ?? (Array.isArray(mapped.data) ? mapped.data.length : 0);
     permissionExcluded += mapped.rowCounts?.permissionExcluded ?? 0;
+    privacyWithheld += mapped.rowCounts?.privacyWithheld ?? 0;
     unresolvedRows += mapped.rowCounts?.unresolved ?? 0;
     if (mapped.rowCounts?.status === "incomplete_scope_resolution") {
       status = "incomplete_scope_resolution";
@@ -221,6 +230,7 @@ export async function readAllScopedRows<T extends Record<string, unknown>>(
     rawRowsRead,
     rowsReturnedRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     pagesRead,
     status: complete ? "complete" : status,

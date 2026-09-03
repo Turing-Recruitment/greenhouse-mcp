@@ -43,6 +43,16 @@ or permission claims. On every scoped read, the runtime resolves the session
 identity and derives current access from Greenhouse. Permission changes therefore
 take effect without reissuing authority in the MCP token.
 
+One input is NOT derivable from Greenhouse: the per-user "Can create and view
+private candidates" permission, which Harvest v3 does not expose. Org-wide access
+here is inferred (`/v3/users.site_admin`, or an all-jobs role marker), and that
+inference says nothing about it — so an org-wide actor sees private candidates
+only once an operator has recorded an attestation with
+`greenhouse-recruiter-attest-private-candidates`. Until then they read everything
+else, plus the private candidates their own per-job Greenhouse roles grant, and the
+read discloses the withholding (`permissionScope.privateCandidatesWithheld`,
+`read.privacy_withheld`).
+
 All recruiter tools route raw reads through `src/scoped-reader.ts`. Static guards
 enforce two boundaries:
 

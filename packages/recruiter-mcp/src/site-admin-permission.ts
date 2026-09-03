@@ -95,6 +95,10 @@ export function createSiteAdminAwarePermissionProvider(
           return options.base.getPermittedJobIds(greenhouseUserId, signal);
         }
         if (confidentialJobIds.size === 0) {
+          // No base call: widening to `all` needs nothing from it, and a /user_job_permissions
+          // sweep here would be paid by every site admin on every permission refresh. The
+          // attestation stamp asks for the actor's private-capable grants only when it needs them
+          // (an UNATTESTED actor), which is the one case where that sweep buys something.
           return { kind: "all" };
         }
         // An admin explicitly on a confidential job's hiring team keeps it: those grants DO appear
@@ -102,13 +106,43 @@ export function createSiteAdminAwarePermissionProvider(
         const granted = await options.base.getPermittedJobIds(greenhouseUserId, signal);
         const grantedJobIds: ReadonlySet<number> | null =
           "kind" in granted ? (granted.kind === "jobs" ? granted.jobIds : null) : granted;
+        // The private-capable subset of those same grants rides along on the widened scope.
+        // Discarding it here is what made an UNATTESTED site admin lose the private candidates
+        // Greenhouse's own "Private" Job Admin role already gave them on their own reqs — and it
+        // made the attestation stamp re-read /user_job_permissions to recover what this call had
+        // just fetched and thrown away.
+        //
+        // Carried even when it is EMPTY, and that is the point: an absent field means "nobody
+        // resolved this", which sends the stamp back to the base provider for a second
+        // /user_job_permissions sweep it will answer identically. An empty SET means "resolved, and
+        // this actor holds no private-capable role" — an answer, not silence. Every tenant with a
+        // legacy confidential job and no Private roles was paying that second sweep on every
+        // permission refresh.
+        // A BARE SET is the base provider's own shorthand for a job scope with no private-capable
+        // grants (`clonePermissionLookupResult` drops the `{kind:"jobs"}` wrapper when the subset is
+        // empty), so it is an answer too — and it is the shape a tenant with no Private roles
+        // actually produces, which is exactly the case that was paying twice.
+        const privateCapableJobIds = !("kind" in granted)
+          ? new Set<number>()
+          : granted.kind === "jobs"
+            ? new Set(granted.privateCapableJobIds ?? [])
+            : undefined;
+        const carry = privateCapableJobIds ? { privateCapableJobIds } : {};
         // A base provider that itself answered "all" cannot narrow anything; nothing is excluded.
-        if (grantedJobIds === null) return { kind: "all" };
+        if (grantedJobIds === null) {
+          const inherited =
+            "kind" in granted && granted.kind === "all" && granted.privateCapableJobIds
+              ? { privateCapableJobIds: new Set(granted.privateCapableJobIds) }
+              : {};
+          return { kind: "all", ...inherited };
+        }
         const excludedJobIds = new Set<number>();
         for (const jobId of confidentialJobIds) {
           if (!grantedJobIds.has(jobId)) excludedJobIds.add(jobId);
         }
-        return excludedJobIds.size === 0 ? { kind: "all" } : { kind: "all", excludedJobIds };
+        return excludedJobIds.size === 0
+          ? { kind: "all", ...carry }
+          : { kind: "all", excludedJobIds, ...carry };
       }
       signal?.throwIfAborted();
       return options.base.getPermittedJobIds(greenhouseUserId, signal);
