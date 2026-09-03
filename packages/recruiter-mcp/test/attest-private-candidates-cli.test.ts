@@ -39,7 +39,7 @@ function fakeDirectory(responder: (call: RecordedCall) => unknown): {
 }
 
 const RESOLVED_ROW = {
-  greenhouse_user_id: 5085047004,
+  greenhouse_user_id: 7100000001,
   primary_email: "sam.vangelos@turing.com",
   status: "resolved",
   private_candidates_attested: false,
@@ -50,19 +50,19 @@ const RESOLVED_ROW = {
 describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
   it("parses the documented invocation and refuses an ambiguous or under-specified one", () => {
     assert.deepEqual(
-      parseAttestPrivateCandidatesArgs(["--greenhouse-user-id", "5085047004", "--by", "Sam Vangelos (attested 2026-09-02)"]),
-      { greenhouseUserId: 5085047004, by: "Sam Vangelos (attested 2026-09-02)", clear: false }
+      parseAttestPrivateCandidatesArgs(["--greenhouse-user-id", "7100000001", "--by", "Sam Vangelos (attested 2026-09-02)"]),
+      { greenhouseUserId: 7100000001, by: "Sam Vangelos (attested 2026-09-02)", clear: false }
     );
     assert.deepEqual(
-      parseAttestPrivateCandidatesArgs(["--greenhouse-user-id", "5085047004", "--clear"]),
-      { greenhouseUserId: 5085047004, clear: true }
+      parseAttestPrivateCandidatesArgs(["--greenhouse-user-id", "7100000001", "--clear"]),
+      { greenhouseUserId: 7100000001, clear: true }
     );
     assert.throws(() => parseAttestPrivateCandidatesArgs(["--by", "Sam"]), /greenhouse-user-id/);
     assert.throws(
       () => parseAttestPrivateCandidatesArgs(["--greenhouse-user-id", "1", "--email", "a@turing.com", "--by", "Sam"]),
       /exactly one/i
     );
-    assert.throws(() => parseAttestPrivateCandidatesArgs(["--greenhouse-user-id", "5085047004"]), /--by/);
+    assert.throws(() => parseAttestPrivateCandidatesArgs(["--greenhouse-user-id", "7100000001"]), /--by/);
     assert.throws(() => parseAttestPrivateCandidatesArgs(["--greenhouse-user-id", "0", "--by", "Sam"]), /positive/i);
   });
 
@@ -74,7 +74,7 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
     );
     const report = await attestPrivateCandidates(
       ENV,
-      ["--greenhouse-user-id", "5085047004", "--by", "Sam Vangelos"],
+      ["--greenhouse-user-id", "7100000001", "--by", "Sam Vangelos"],
       fetchImpl,
       () => new Date("2026-09-03T00:00:00.000Z")
     );
@@ -85,7 +85,7 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
 
     const patch = calls.find((call) => call.method === "PATCH");
     assert.ok(patch, "the CLI must PATCH the directory row");
-    assert.equal(patch.url.searchParams.get("greenhouse_user_id"), "eq.5085047004");
+    assert.equal(patch.url.searchParams.get("greenhouse_user_id"), "eq.7100000001");
     assert.equal(patch.url.searchParams.get("status"), "eq.resolved",
       "an unresolved or deactivated row must never gain an attestation");
     assert.match(patch.prefer ?? "", /return=representation/,
@@ -99,7 +99,7 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
 
   it("--clear resets the three columns to false / null / null", async () => {
     const { fetchImpl, calls } = fakeDirectory((call) => (call.method === "PATCH" ? [RESOLVED_ROW] : [RESOLVED_ROW]));
-    const report = await attestPrivateCandidates(ENV, ["--greenhouse-user-id", "5085047004", "--clear"], fetchImpl);
+    const report = await attestPrivateCandidates(ENV, ["--greenhouse-user-id", "7100000001", "--clear"], fetchImpl);
     assert.equal(report.status, "cleared");
     assert.deepEqual(calls.find((call) => call.method === "PATCH")?.body, {
       private_candidates_attested: false,
@@ -112,7 +112,7 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
     for (const [label, rows] of [["zero rows", []], ["two rows", [RESOLVED_ROW, RESOLVED_ROW]]] as const) {
       const { fetchImpl } = fakeDirectory((call) => (call.method === "PATCH" ? rows : [RESOLVED_ROW]));
       await assert.rejects(
-        attestPrivateCandidates(ENV, ["--greenhouse-user-id", "5085047004", "--by", "Sam"], fetchImpl),
+        attestPrivateCandidates(ENV, ["--greenhouse-user-id", "7100000001", "--by", "Sam"], fetchImpl),
         /exactly one/i,
         label
       );
@@ -128,7 +128,7 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
       ["--email", "Sam.Vangelos@Turing.com", "--by", "Sam"],
       fetchImpl
     );
-    assert.equal(report.greenhouseUserId, 5085047004);
+    assert.equal(report.greenhouseUserId, 7100000001);
     assert.equal(
       calls[0]!.url.searchParams.get("primary_email"),
       "eq.sam.vangelos@turing.com",
@@ -141,7 +141,7 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
         "or a deactivated duplicate makes a live address ambiguous"
     );
 
-    const ambiguous = fakeDirectory(() => [RESOLVED_ROW, { ...RESOLVED_ROW, greenhouse_user_id: 5182584004 }]);
+    const ambiguous = fakeDirectory(() => [RESOLVED_ROW, { ...RESOLVED_ROW, greenhouse_user_id: 7100000002 }]);
     await assert.rejects(
       attestPrivateCandidates(ENV, ["--email", "shared@turing.com", "--by", "Sam"], ambiguous.fetchImpl),
       /2 resolved rows/i
@@ -157,7 +157,7 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
     await assert.rejects(
       attestPrivateCandidates(
         { ...ENV, GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_URL: "https://ilkbfyubwvbpsevybsfe.supabase.co" },
-        ["--greenhouse-user-id", "5085047004", "--by", "Sam"],
+        ["--greenhouse-user-id", "7100000001", "--by", "Sam"],
         fetchImpl
       ),
       /canonical/i
@@ -168,7 +168,7 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
     const { fetchImpl } = fakeDirectory((call) =>
       call.method === "PATCH" ? [{ ...RESOLVED_ROW, private_candidates_attested: true }] : [RESOLVED_ROW]
     );
-    const report = await attestPrivateCandidates(ENV, ["--greenhouse-user-id", "5085047004", "--by", "Sam"], fetchImpl);
+    const report = await attestPrivateCandidates(ENV, ["--greenhouse-user-id", "7100000001", "--by", "Sam"], fetchImpl);
     const serialized = JSON.stringify(report);
     assert.ok(!serialized.includes("test-service-role-key"), "the key must never reach the printed report");
     assert.ok(!serialized.includes("supabase.co"), "nor the project URL");
@@ -190,7 +190,7 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
         GREENHOUSE_RECRUITER_IDENTITY_STATUS_COLUMN: "row_status",
         GREENHOUSE_RECRUITER_IDENTITY_RESOLVED_STATUS: "active",
       } as NodeJS.ProcessEnv,
-      ["--greenhouse-user-id", "5085047004", "--by", "Sam"],
+      ["--greenhouse-user-id", "7100000001", "--by", "Sam"],
       fetchImpl
     );
 
@@ -198,7 +198,7 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
     assert.ok(patch);
     assert.match(patch.url.pathname, /directory_v2$/,
       "the writer must reach the same table the reader resolves the attestation from");
-    assert.equal(patch.url.searchParams.get("gh_user_id"), "eq.5085047004");
+    assert.equal(patch.url.searchParams.get("gh_user_id"), "eq.7100000001");
     assert.equal(patch.url.searchParams.get("row_status"), "eq.active",
       "hard-coded `status=eq.resolved` writes nothing on a directory configured with an override, " +
         "and the CLI would report success for a row it never touched");
@@ -215,7 +215,7 @@ describe("fold 2: the CLI honours the directory's own column overrides, and coun
       GREENHOUSE_RECRUITER_IDENTITY_RESOLVED_STATUS: "active",
     } as NodeJS.ProcessEnv;
     const row = {
-      gh_user_id: 5085047004,
+      gh_user_id: 7100000001,
       work_email: "sam.vangelos@turing.com",
       lifecycle_state: "active",
       private_candidates_attested: false,
@@ -227,7 +227,7 @@ describe("fold 2: the CLI honours the directory's own column overrides, and coun
     );
     const report = await attestPrivateCandidates(env, ["--email", "sam.vangelos@turing.com", "--by", "Sam"], fetchImpl);
 
-    assert.equal(report.greenhouseUserId, 5085047004);
+    assert.equal(report.greenhouseUserId, 7100000001);
     assert.equal(calls[0]!.url.searchParams.get("work_email"), "eq.sam.vangelos@turing.com");
     assert.equal(calls[0]!.url.searchParams.get("lifecycle_state"), "eq.active");
     assert.equal(calls[0]!.url.searchParams.get("primary_email"), null,
@@ -243,7 +243,7 @@ describe("fold 2: the CLI honours the directory's own column overrides, and coun
       call.method === "PATCH" ? [{ ...RESOLVED_ROW, private_candidates_attested: true }, null] : [RESOLVED_ROW]
     );
     await assert.rejects(
-      attestPrivateCandidates(ENV, ["--greenhouse-user-id", "5085047004", "--by", "Sam"], fetchImpl),
+      attestPrivateCandidates(ENV, ["--greenhouse-user-id", "7100000001", "--by", "Sam"], fetchImpl),
       /exactly one/i
     );
   });
@@ -251,7 +251,7 @@ describe("fold 2: the CLI honours the directory's own column overrides, and coun
   it("refuses a PATCH response that is a single unusable element", async () => {
     const { fetchImpl } = fakeDirectory((call) => (call.method === "PATCH" ? [null] : [RESOLVED_ROW]));
     await assert.rejects(
-      attestPrivateCandidates(ENV, ["--greenhouse-user-id", "5085047004", "--by", "Sam"], fetchImpl),
+      attestPrivateCandidates(ENV, ["--greenhouse-user-id", "7100000001", "--by", "Sam"], fetchImpl),
       /exactly one/i
     );
   });

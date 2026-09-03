@@ -798,7 +798,7 @@ describe("first-sign-in enrollment at the callback (CLO-271)", () => {
     const directory: IdentityDirectory = {
       async resolve() {
         return enrolled
-          ? { status: "resolved", greenhouseUserId: 5182584004 }
+          ? { status: "resolved", greenhouseUserId: 7100000002 }
           : { status: "unresolved", reason: "Recruiter identity mapping is not resolved." };
       },
     };
@@ -835,7 +835,7 @@ describe("first-sign-in enrollment at the callback (CLO-271)", () => {
   }
 
   it("enrolls an unknown work email from the Greenhouse roster and completes the sign-in with a code grant", async () => {
-    const world = enrollingWorld({ status: "enrolled", greenhouseUserId: 5182584004, alreadyEnrolled: false });
+    const world = enrollingWorld({ status: "enrolled", greenhouseUserId: 7100000002, alreadyEnrolled: false });
     const { res, store, params } = await signIn(world, "newhire@example.com");
     assert.equal(res.statusCode, 302);
     assert.deepEqual(world.enrollCalls, ["newhire@example.com"]);
@@ -865,7 +865,7 @@ describe("first-sign-in enrollment at the callback (CLO-271)", () => {
   });
 
   it("enrollment does not vouch for itself: if the directory still cannot resolve the email afterwards, the sign-in is denied", async () => {
-    const world = enrollingWorld({ status: "enrolled", greenhouseUserId: 5182584004, alreadyEnrolled: false });
+    const world = enrollingWorld({ status: "enrolled", greenhouseUserId: 7100000002, alreadyEnrolled: false });
     // The directory never flips to resolved (a row the resolver cannot see), even though enrollment said "enrolled".
     world.directory.resolve = async () => ({ status: "unresolved", reason: "Recruiter identity mapping is not resolved." });
     const { store, params } = await signIn(world, "newhire@example.com");

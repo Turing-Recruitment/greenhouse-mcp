@@ -91,11 +91,11 @@ describe("B9: private-candidate attestation lookup", () => {
       requestedUrl = String(input);
       return jsonResponse([{ private_candidates_attested: true }]);
     });
-    assert.equal(await lookup(5085047004), true);
+    assert.equal(await lookup(7100000001), true);
     const url = new URL(requestedUrl);
     assert.equal(url.pathname, "/rest/v1/recruiter_identity_directory");
     assert.equal(url.searchParams.get("select"), "private_candidates_attested");
-    assert.equal(url.searchParams.get("greenhouse_user_id"), "eq.5085047004");
+    assert.equal(url.searchParams.get("greenhouse_user_id"), "eq.7100000001");
     assert.equal(url.searchParams.get("status"), "eq.resolved");
     assert.equal(url.searchParams.get("limit"), "2", "two rows are read so a duplicate is detectable, never assumed away");
   });
@@ -125,7 +125,7 @@ describe("B9: private-candidate attestation lookup", () => {
         impl as unknown as typeof fetch,
         (message) => warnings.push(message)
       );
-      assert.equal(await lookup(5085047004), false, label);
+      assert.equal(await lookup(7100000001), false, label);
       assert.ok(!warnings.some((warning) => warning.includes("test-service-role-key")), `${label}: warnings must never carry the key`);
     }
   });
@@ -142,7 +142,7 @@ describe("B9: private-candidate attestation lookup", () => {
   it("returns false without a request when the directory is not Supabase-backed, or the id is not a positive integer", async () => {
     let calls = 0;
     const unconfigured = createPrivateCandidateAttestationLookup({} as NodeJS.ProcessEnv, async () => { calls += 1; return jsonResponse([]); });
-    assert.equal(await unconfigured(5085047004), false);
+    assert.equal(await unconfigured(7100000001), false);
     const configured = createPrivateCandidateAttestationLookup(ENV, async () => { calls += 1; return jsonResponse([{ private_candidates_attested: true }]); });
     assert.equal(await configured(0), false);
     assert.equal(await configured(-1), false);
@@ -251,7 +251,7 @@ describe("B10: identity writers and the attestation columns", () => {
   it("bootstrap's upsert payload carries none of the three columns — an upsert must never clear a live attestation", () => {
     const plan = buildIdentityBootstrapPlan({
       rosterEmails: ["someone@turing.com"],
-      greenhouseUsers: [{ id: 5085047004, primary_email: "someone@turing.com" }],
+      greenhouseUsers: [{ id: 7100000001, primary_email: "someone@turing.com" }],
       allowedDomains: ["turing.com"],
       source: "operator_bootstrap",
       generatedAt: "2026-09-03T00:00:00.000Z",
@@ -273,13 +273,13 @@ describe("B10: identity writers and the attestation columns", () => {
       if ((init.method ?? "GET") === "POST" && url.pathname.includes("recruiter_identity_directory")) {
         const body = JSON.parse(String(init.body)) as unknown;
         for (const row of Array.isArray(body) ? body : [body]) posted.push(row as Record<string, unknown>);
-        return jsonResponse([{ greenhouse_user_id: 5085047004 }], 201);
+        return jsonResponse([{ greenhouse_user_id: 7100000001 }], 201);
       }
       return jsonResponse([]);
     }) as unknown as typeof fetch;
 
     const enrollment = createOauthEnrollment({
-      readUsersByPrimaryEmail: async () => [{ id: 5085047004, primary_email: "new@turing.com" }],
+      readUsersByPrimaryEmail: async () => [{ id: 7100000001, primary_email: "new@turing.com" }],
       readFullRoster: async () => ({ users: [], complete: true }),
       directory: {
         supabaseUrl: SUPABASE_URL,
@@ -303,8 +303,8 @@ describe("B10: identity writers and the attestation columns", () => {
   it("reconciliation's deprovision PATCH clears all three columns", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const plan = buildIdentityReconciliationPlan({
-      directoryRows: [{ greenhouseUserId: 5085047004, primaryEmail: "gone@turing.com", status: "resolved" }],
-      greenhouseUsers: [{ id: 5085047004, primary_email: "gone@turing.com", deactivated: true }],
+      directoryRows: [{ greenhouseUserId: 7100000001, primaryEmail: "gone@turing.com", status: "resolved" }],
+      greenhouseUsers: [{ id: 7100000001, primary_email: "gone@turing.com", deactivated: true }],
       rosterComplete: true,
       rosterAsOf: "2026-09-03T00:00:00.000Z",
     });
@@ -456,13 +456,13 @@ describe("B22: deprovisioning against a table migration 0008 has not reached", (
     return buildIdentityReconciliationPlan({
       directoryRows: [
         {
-          greenhouseUserId: 5085047004,
+          greenhouseUserId: 7100000001,
           primaryEmail: "gone@turing.com",
           status: "resolved",
           ...row,
         } as never,
       ],
-      greenhouseUsers: [{ id: 5085047004, primary_email: "gone@turing.com", deactivated: true }],
+      greenhouseUsers: [{ id: 7100000001, primary_email: "gone@turing.com", deactivated: true }],
       rosterComplete: true,
       rosterAsOf: "2026-09-03T00:00:00.000Z",
     });

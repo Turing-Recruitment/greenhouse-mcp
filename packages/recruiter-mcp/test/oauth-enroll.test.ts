@@ -29,7 +29,7 @@ function directoryFake(options: {
   return { fetchImpl, requests };
 }
 
-const ACTIVE_USER = { id: 5182584004, primary_email: EMAIL, emails: [EMAIL], deactivated: false };
+const ACTIVE_USER = { id: 7100000002, primary_email: EMAIL, emails: [EMAIL], deactivated: false };
 
 function deps(overrides: Partial<OauthEnrollmentDeps> & { fetchImpl?: typeof fetch } = {}): OauthEnrollmentDeps {
   const { fetchImpl, ...rest } = overrides;
@@ -48,12 +48,12 @@ describe("first-sign-in enrollment (CLO-271)", () => {
   it("enrolls a verified work email that matches exactly one active Greenhouse user, writing the bootstrap's row with source oauth_auto_enroll", async () => {
     const { fetchImpl, requests } = directoryFake();
     const result = await createOauthEnrollment(deps({ fetchImpl })).enroll("NewHire@Example.com");
-    assert.deepEqual(result, { status: "enrolled", greenhouseUserId: 5182584004, alreadyEnrolled: false });
+    assert.deepEqual(result, { status: "enrolled", greenhouseUserId: 7100000002, alreadyEnrolled: false });
     const insert = requests.find((r) => r.method === "POST")!;
     assert.ok(insert, "one directory insert");
     assert.equal(insert.url.pathname, "/rest/v1/recruiter_identity_directory");
     assert.equal(insert.url.searchParams.has("on_conflict"), false, "never an upsert — the unique constraint is the guard");
-    assert.equal(insert.body!["greenhouse_user_id"], 5182584004);
+    assert.equal(insert.body!["greenhouse_user_id"], 7100000002);
     assert.equal(insert.body!["primary_email"], EMAIL);
     assert.equal(insert.body!["status"], "resolved");
     assert.equal(insert.body!["source"], OAUTH_AUTO_ENROLL_SOURCE);
@@ -89,14 +89,14 @@ describe("first-sign-in enrollment (CLO-271)", () => {
   });
 
   it("treats an operator bootstrap that landed a moment earlier (same user, resolved) as already enrolled, not as a denial", async () => {
-    const { fetchImpl, requests } = directoryFake({ rowsByEmail: [{ id: "row-1", greenhouse_user_id: 5182584004, primary_email: EMAIL, status: "resolved" }] });
+    const { fetchImpl, requests } = directoryFake({ rowsByEmail: [{ id: "row-1", greenhouse_user_id: 7100000002, primary_email: EMAIL, status: "resolved" }] });
     const result = await createOauthEnrollment(deps({ fetchImpl })).enroll(EMAIL);
-    assert.deepEqual(result, { status: "enrolled", greenhouseUserId: 5182584004, alreadyEnrolled: true });
+    assert.deepEqual(result, { status: "enrolled", greenhouseUserId: 7100000002, alreadyEnrolled: true });
     assert.equal(requests.filter((r) => r.method === "POST").length, 0);
   });
 
   it("never overrides an existing directory row for the email, whatever its status", async () => {
-    const { fetchImpl, requests } = directoryFake({ rowsByEmail: [{ id: "row-1", greenhouse_user_id: 5182584004, primary_email: EMAIL, status: "deactivated" }] });
+    const { fetchImpl, requests } = directoryFake({ rowsByEmail: [{ id: "row-1", greenhouse_user_id: 7100000002, primary_email: EMAIL, status: "deactivated" }] });
     const result = await createOauthEnrollment(deps({ fetchImpl })).enroll(EMAIL);
     assert.equal(result.status, "denied");
     assert.equal((result as { code: string }).code, "directory_row_exists");
@@ -104,11 +104,11 @@ describe("first-sign-in enrollment (CLO-271)", () => {
   });
 
   it("diagnoses an insert conflict on the Greenhouse user: same email + resolved = concurrent enrollment; other email = email_mismatch; deactivated = row exists", async () => {
-    const concurrent = directoryFake({ insertStatus: 409, rowsByUser: [{ greenhouse_user_id: 5182584004, primary_email: EMAIL, status: "resolved" }] });
-    assert.deepEqual(await createOauthEnrollment(deps({ fetchImpl: concurrent.fetchImpl })).enroll(EMAIL), { status: "enrolled", greenhouseUserId: 5182584004, alreadyEnrolled: true });
-    const mismatch = directoryFake({ insertStatus: 409, rowsByUser: [{ greenhouse_user_id: 5182584004, primary_email: "old.address@example.com", status: "resolved" }] });
+    const concurrent = directoryFake({ insertStatus: 409, rowsByUser: [{ greenhouse_user_id: 7100000002, primary_email: EMAIL, status: "resolved" }] });
+    assert.deepEqual(await createOauthEnrollment(deps({ fetchImpl: concurrent.fetchImpl })).enroll(EMAIL), { status: "enrolled", greenhouseUserId: 7100000002, alreadyEnrolled: true });
+    const mismatch = directoryFake({ insertStatus: 409, rowsByUser: [{ greenhouse_user_id: 7100000002, primary_email: "old.address@example.com", status: "resolved" }] });
     assert.equal(((await createOauthEnrollment(deps({ fetchImpl: mismatch.fetchImpl })).enroll(EMAIL)) as { code: string }).code, "email_mismatch");
-    const parked = directoryFake({ insertStatus: 409, rowsByUser: [{ greenhouse_user_id: 5182584004, primary_email: "old.address@example.com", status: "deactivated" }] });
+    const parked = directoryFake({ insertStatus: 409, rowsByUser: [{ greenhouse_user_id: 7100000002, primary_email: "old.address@example.com", status: "deactivated" }] });
     assert.equal(((await createOauthEnrollment(deps({ fetchImpl: parked.fetchImpl })).enroll(EMAIL)) as { code: string }).code, "directory_row_exists");
   });
 

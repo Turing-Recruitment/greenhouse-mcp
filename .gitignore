@@ -6,3 +6,6 @@ dist/
 .env.*
 !*.env.example
 audit/
+
+# Internal working docs — never publish (public-origin repo; CLO-267 audit 2026-09-03)
+packages/recruiter-mcp/docs/research/
