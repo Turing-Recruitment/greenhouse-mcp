@@ -339,18 +339,27 @@ const ALL_ACCESS_FIXTURE = {
 
 const ORG_WIDE_PERSONAS = ["site_admin", "all_access_admin"] as const;
 
+// H0b: offer rows carry resolved_at because the planner windows on resolved_at rather than sent_on
+// (the clock every published hire report uses), and the offer path bridges the accepted set's
+// application_ids to /v3/applications for the reconciliation line's second count.
 function offerReader() {
-  return fakeScopedReader((toolName) => {
+  return fakeScopedReader((toolName, params) => {
     if (toolName === "list_offers") {
       return scopedSuccess(toolName, [
-        { id: 1, job_id: 9001001, application_id: 101, status: "Accepted", sent_on: "2026-06-01" },
-        { id: 2, job_id: 9001001, application_id: 102, status: "Rejected", sent_on: "2026-06-02" },
+        { id: 1, job_id: 9001001, application_id: 101, status: "Accepted", sent_on: "2026-06-01", resolved_at: "2026-06-01" },
+        { id: 2, job_id: 9001001, application_id: 102, status: "Rejected", sent_on: "2026-06-02", resolved_at: "2026-06-02" },
         // 9001007 is CLOSED: an "open reqs" question must not count it.
-        { id: 3, job_id: 9001007, application_id: 103, status: "Accepted", sent_on: "2026-06-03" },
+        { id: 3, job_id: 9001007, application_id: 103, status: "Accepted", sent_on: "2026-06-03", resolved_at: "2026-06-03" },
       ]);
     }
+    if (toolName === "list_applications") return bridgedHiredApplications(params);
     throw new Error(`unexpected ${toolName}`);
   });
+}
+
+function bridgedHiredApplications(params?: Record<string, unknown>) {
+  const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+  return scopedSuccess("list_applications", ids.map((id: number) => ({ id, job_id: 9001001, status: "hired" })));
 }
 
 describe("answer_my_recruiting_question — org-wide default (CLO-274)", () => {
@@ -722,10 +731,11 @@ describe("answer_my_recruiting_question — org-wide default (CLO-274)", () => {
         // proof that the OWNED scope was applied is the metric, not the read params.
         assert.equal(params?.job_ids, undefined);
         return scopedSuccess(toolName, [
-          { id: 1, job_id: 9001003, application_id: 101, status: "Accepted", sent_on: "2026-06-01" },
-          { id: 2, job_id: 9001001, application_id: 102, status: "Rejected", sent_on: "2026-06-02" },
+          { id: 1, job_id: 9001003, application_id: 101, status: "Accepted", sent_on: "2026-06-01", resolved_at: "2026-06-01" },
+          { id: 2, job_id: 9001001, application_id: 102, status: "Rejected", sent_on: "2026-06-02", resolved_at: "2026-06-02" },
         ]);
       }
+      if (toolName === "list_applications") return bridgedHiredApplications(params);
       throw new Error(`unexpected ${toolName}`);
     });
     const { runtime } = testRuntime(reader, {
@@ -808,7 +818,14 @@ describe("answer_my_recruiting_question — org-wide default (CLO-274)", () => {
     // Item 19: pinned ABSOLUTELY, not relative to a sibling run. Two runs that both silently
     // narrowed would still be deepStrictEqual to each other; only naming the expected read
     // catches a regression that changes BOTH.
-    const expectedReads = [{ toolName: "list_offers", job_ids: undefined }];
+    // H0b: the offer path now makes a SECOND read — the accepted set's application_ids bridged to
+    // /v3/applications for the reconciliation line's "how many of these does Greenhouse call hired"
+    // count. Still exactly two reads, still unscoped by job_ids, still pinned absolutely so a
+    // regression that silently narrows BOTH runs is caught.
+    const expectedReads = [
+      { toolName: "list_offers", job_ids: undefined },
+      { toolName: "list_applications", job_ids: undefined },
+    ];
     assert.deepStrictEqual(
       broadPhrase.calls.map((c) => ({ toolName: c.toolName, job_ids: c.params?.job_ids })),
       expectedReads,

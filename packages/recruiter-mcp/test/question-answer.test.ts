@@ -320,17 +320,22 @@ describe("recruiting question planner", () => {
   });
 
   it("executes 'offer acceptance rate' via the fact-backed planner (offer_resolution), not a wrong recipe (T3.2 + over-grab lock)", async () => {
-    const scopedReader = fakeScopedReader((toolName) => {
+    const scopedReader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_jobs") return scopedSuccess(toolName, []);
       if (toolName === "list_offers") {
         return scopedSuccess(toolName, [
-          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01" },
-          { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-06-02" },
+          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01", resolved_at: "2026-06-05T10:00:00.000Z" },
+          { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-06-02", resolved_at: "2026-06-06T10:00:00.000Z" },
           // Out of "this quarter" (test clock = 2026-06-23): must be window-filtered out.
-          { id: 3, job_id: 10, application_id: 103, status: "Accepted", sent_on: "2025-11-01" },
-          // Unresolved (tenant vocab): counted in groups, excluded from the rate.
+          { id: 3, job_id: 10, application_id: 103, status: "Accepted", sent_on: "2025-11-01", resolved_at: "2025-11-05T10:00:00.000Z" },
+          // Still out: a Created offer has no resolved_at by definition, so the window cannot place
+          // it. It is reported as outstanding rather than dropped.
           { id: 4, job_id: 10, application_id: 104, status: "Created", sent_on: "2026-06-05" },
         ]);
+      }
+      if (toolName === "list_applications") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id: number) => ({ id, job_id: 10, status: "hired" })));
       }
       throw new Error(`offer question must not run a recipe read (${toolName})`);
     });
@@ -350,9 +355,16 @@ describe("recruiting question planner", () => {
     assert.equal(data.answer.metric.denominator, 2);
     assert.equal(data.answer.metric.unit, "ratio");
     const groups = data.answer.metric.groups as Array<{ offer_status: string; offer_count: number }>;
+    // H0b: the window now runs on resolved_at (the clock every published hire report uses), so the
+    // still-Created offer cannot be placed in it. It is counted as outstanding — the old fixture
+    // had it inside the mix only because sent_on placed it there.
     assert.deepStrictEqual(
-      groups.sort((a, b) => a.offer_status.localeCompare(b.offer_status)),
-      [{ offer_status: "Accepted", offer_count: 1 }, { offer_status: "Created", offer_count: 1 }, { offer_status: "Rejected", offer_count: 1 }]
+      [...groups].sort((a, b) => (a.offer_status < b.offer_status ? -1 : 1)),
+      [
+        { offer_status: "Accepted", offer_count: 1 },
+        { offer_status: "Rejected", offer_count: 1 },
+        { offer_status: "outstanding_no_resolved_at", offer_count: 1 },
+      ]
     );
     assert.ok((data.answer.omissions as string[]).some((line) => line.includes("this quarter")), "the applied window is disclosed");
   });
@@ -617,18 +629,32 @@ function windowReader() {
   });
 }
 
+// H0b: every offer row now carries resolved_at, because the planner windows on resolved_at rather
+// than sent_on. The dates match the old sent_on values so each test's window arithmetic is
+// unchanged; only the field the window reads has moved.
 function offerWindowReader() {
-  return fakeScopedReader((toolName) => {
+  return fakeScopedReader((toolName, params) => {
     if (toolName === "list_jobs") return scopedSuccess(toolName, []);
     if (toolName === "list_offers") {
       return scopedSuccess(toolName, [
-        { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-05-10" },
-        { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-06-02" },
-        { id: 3, job_id: 10, application_id: 103, status: "Accepted", sent_on: "2026-06-10" },
+        { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-05-10", resolved_at: "2026-05-10" },
+        { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-06-02", resolved_at: "2026-06-02" },
+        { id: 3, job_id: 10, application_id: 103, status: "Accepted", sent_on: "2026-06-10", resolved_at: "2026-06-10" },
       ]);
     }
+    if (toolName === "list_applications") return bridgedHiredApplications(params);
     throw new Error(`unexpected scoped tool ${toolName}`);
   });
+}
+
+/**
+ * The planner's offer path opens its answer with the reconciliation line's two cheap counts, and
+ * the second of them costs one bridged /v3/applications read keyed by the accepted set's
+ * application_ids. Every offer fixture answers it.
+ */
+function bridgedHiredApplications(params?: Record<string, unknown>) {
+  const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+  return scopedSuccess("list_applications", ids.map((id: number) => ({ id, job_id: 10, status: "hired" })));
 }
 
 describe("recruiting question planner — the question's own time window", () => {
@@ -713,14 +739,15 @@ describe("recruiting question planner — the question's own time window", () =>
   });
 
   it("A14b: the planned-domain path discloses the phrase label, not 'explicit window params'", async () => {
-    const reader = fakeScopedReader((toolName) => {
+    const reader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_jobs") return scopedSuccess(toolName, []);
       if (toolName === "list_offers") {
         return scopedSuccess(toolName, [
-          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01" },
-          { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-06-02" },
+          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01", resolved_at: "2026-06-01" },
+          { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-06-02", resolved_at: "2026-06-02" },
         ]);
       }
+      if (toolName === "list_applications") return bridgedHiredApplications(params);
       throw new Error(`unexpected scoped tool ${toolName}`);
     });
     const { runtime } = testRuntime(reader);
@@ -802,16 +829,17 @@ describe("recruiting question planner — the question's own time window", () =>
   // recipe filters inclusively (<= window_end), so a midnight-on-the-first event — and every
   // date-only stamp, which parses to exactly midnight — landed in the wrong period.
   it("item 5: 'last month' excludes a date-only event stamped on the first of THIS month", async () => {
-    const reader = fakeScopedReader((toolName) => {
+    const reader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_jobs") return scopedSuccess(toolName, []);
       if (toolName === "list_offers") {
         return scopedSuccess(toolName, [
-          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-05-15" },
-          { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-05-20" },
+          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-05-15", resolved_at: "2026-05-15" },
+          { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-05-20", resolved_at: "2026-05-20" },
           // June 1 is THIS month; an inclusive <= against a window_end of 2026-06-01T00:00 kept it.
-          { id: 3, job_id: 10, application_id: 103, status: "Accepted", sent_on: "2026-06-01" },
+          { id: 3, job_id: 10, application_id: 103, status: "Accepted", sent_on: "2026-06-01", resolved_at: "2026-06-01" },
         ]);
       }
+      if (toolName === "list_applications") return bridgedHiredApplications(params);
       throw new Error(`unexpected scoped tool ${toolName}`);
     });
     const { runtime } = testRuntime(reader);
@@ -828,14 +856,15 @@ describe("recruiting question planner — the question's own time window", () =>
   });
 
   it("item 5: 'last quarter' ends at the final instant of the prior quarter", async () => {
-    const reader = fakeScopedReader((toolName) => {
+    const reader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_jobs") return scopedSuccess(toolName, []);
       if (toolName === "list_offers") {
         return scopedSuccess(toolName, [
-          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-02-15" },
-          { id: 2, job_id: 10, application_id: 102, status: "Accepted", sent_on: "2026-04-01" },
+          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-02-15", resolved_at: "2026-02-15" },
+          { id: 2, job_id: 10, application_id: 102, status: "Accepted", sent_on: "2026-04-01", resolved_at: "2026-04-01" },
         ]);
       }
+      if (toolName === "list_applications") return bridgedHiredApplications(params);
       throw new Error(`unexpected scoped tool ${toolName}`);
     });
     const { runtime } = testRuntime(reader);
@@ -1047,11 +1076,12 @@ describe("recruiting question planner — unknown questions get a labeled compos
   });
 
   it("item 8: a PLANNED-domain answer carries one too", async () => {
-    const reader = fakeScopedReader((toolName) => {
+    const reader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_jobs") return scopedSuccess(toolName, []);
       if (toolName === "list_offers") {
-        return scopedSuccess(toolName, [{ id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01" }]);
+        return scopedSuccess(toolName, [{ id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01", resolved_at: "2026-06-01" }]);
       }
+      if (toolName === "list_applications") return bridgedHiredApplications(params);
       throw new Error(`unexpected scoped tool ${toolName}`);
     });
     const { runtime } = testRuntime(reader);
@@ -1061,7 +1091,11 @@ describe("recruiting question planner — unknown questions get a labeled compos
     assert.equal(result.ok, true);
     const data = result.ok ? (result.data as any) : null;
     assert.equal(data.answer.mode, "planned_metric");
-    assert.match(String(data.answer.message), /^Answered over .+ — computed offer_resolution\./);
+    // H0b: the reconciliation sentence now LEADS an offer answer, so the composition contract's own
+    // sentence is the second one rather than the first. It is still there, unchanged, and still
+    // followed by the window.
+    assert.match(String(data.answer.message), /^1 accepted current offers; 1 of their applications is marked hired in Greenhouse\. /);
+    assert.match(String(data.answer.message), /Answered over .+ — computed offer_resolution\./);
     assert.match(String(data.answer.message), /Time window: this month/);
   });
 
@@ -1078,5 +1112,130 @@ describe("recruiting question planner — unknown questions get a labeled compos
     assert.equal(data.answer.mode, "approximate_composite");
     assert.equal(data.summary.selected_recipe_count, 2);
     assert.equal(data.summary.selected_recipes.length, 2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H0b: the planner's offer path.
+//
+// executePlannedDomain read list_offers with a hard-coded `{}` and filtered
+// everything in memory, so every superseded `Deprecated` version landed in its
+// total, and windowing on `sent_on` answered a different question from the one
+// every published hire report asks. It now reads `current_only=true`
+// server-side, keeps the read date-filter-free (the LIVE endpoint 422s every
+// date filter the contract advertises), and windows in memory on `resolved_at`.
+// That last change makes every still-`Created` offer missing-timestamp, so the
+// count of them is surfaced instead of quietly disappearing.
+// ---------------------------------------------------------------------------
+describe("H3 the planner's offer path", () => {
+  function offerPlannerReader() {
+    return fakeScopedReader((toolName, params) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") {
+        assert.equal(params?.current_only, true, "the version chain is collapsed server-side, not in memory");
+        for (const key of Object.keys(params ?? {})) {
+          assert.ok(!/\[(gte|lte|gt|lt)\]$/.test(key), `the offer read must stay date-filter-free (${key}); the live endpoint 422s them`);
+        }
+        // What Greenhouse returns for current_only=true: no Deprecated rows at all.
+        return scopedSuccess(toolName, [
+          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01", resolved_at: "2026-06-05T10:00:00.000Z" },
+          { id: 2, job_id: 10, application_id: 102, status: "Accepted", sent_on: "2026-06-02", resolved_at: "2026-06-06T10:00:00.000Z" },
+          { id: 3, job_id: 10, application_id: 103, status: "Rejected", sent_on: "2026-06-03", resolved_at: "2026-06-07T10:00:00.000Z" },
+          // Outstanding: sent, not yet resolved. No resolved_at, so the window cannot place them.
+          { id: 4, job_id: 10, application_id: 104, status: "Created", sent_on: "2026-06-10" },
+          { id: 5, job_id: 10, application_id: 105, status: "Created", sent_on: "2026-06-11" },
+          { id: 6, job_id: 10, application_id: 106, status: "Created", sent_on: "2026-06-12" },
+        ]);
+      }
+      if (toolName === "list_applications") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        // One of the two accepted offers never had the hire endpoint fired.
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: id === 101 ? "hired" : "in_process" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+  }
+
+  it("reads current_only=true with no date params, drops Deprecated from the total, and surfaces outstanding offers", async () => {
+    const reader = offerPlannerReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "planned_metric");
+    assert.deepStrictEqual(data.summary.planned_metrics_run, ["offer_resolution"]);
+
+    const groups = data.answer.metric.groups as Array<Record<string, unknown>>;
+    assert.ok(!groups.some((group) => group.offer_status === "Deprecated"), "no superseded version reaches the mix");
+    assert.equal(data.answer.metric.numerator, 2, "two accepted offers resolved inside the window");
+    assert.equal(data.answer.metric.denominator, 3, "accepted + rejected, resolved only");
+
+    const outstanding = groups.find((group) => group.offer_status === "outstanding_no_resolved_at");
+    assert.ok(outstanding, `the Created offers must be counted, got ${JSON.stringify(groups)}`);
+    assert.equal(outstanding!.offer_count, 3);
+    const omissions = data.answer.omissions as string[];
+    assert.ok(omissions.some((line) => line.includes("offers_outstanding: 3")), JSON.stringify(omissions));
+    assert.ok(
+      omissions.some((line) => /superseded versions were not read/i.test(line)),
+      "the chain was not read, so the re-extension denominator is not claimed"
+    );
+  });
+
+  it("opens the answer with the two cheap reconciliation counts and offers the openings count as a follow-up", async () => {
+    const reader = offerPlannerReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    const message = String(data.answer.message);
+    assert.match(
+      message,
+      /^2 accepted current offers; 1 of their applications is marked hired in Greenhouse\./,
+      `the reconciliation sentence leads the answer, got: ${message}`
+    );
+    assert.match(message, /Answered over .+ — computed offer_resolution\./);
+    const bridged = reader.calls.filter((call) => call.toolName === "list_applications");
+    assert.equal(bridged.length, 1, "the second count costs exactly one bridged applications read");
+    assert.deepStrictEqual(String(bridged[0]!.params?.ids ?? "").split(",").sort(), ["101", "102"]);
+    assert.ok(
+      (data.data?.next_steps ?? data.next_steps ?? []).some((step: string) => /openings closed by a hire/i.test(step)),
+      `the third count is offered as a follow-up rather than paid for unasked: ${JSON.stringify(data.next_steps)}`
+    );
+  });
+});
+
+describe("H3b the planner's offer path contains its own errors", () => {
+  it("turns a 422 on the planned-domain read into a denial with an audit record, not a throw", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") {
+        throw new Error("Greenhouse API error: 422 Unprocessable Entity (/offers) [correlation_id=test]");
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime, auditSink } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, false, "an upstream failure is a denial the caller can read, never an escaped throw");
+    assert.equal(result.ok === false && result.denial.code, "UPSTREAM_ERROR");
+    const events = auditSink.events;
+    assert.equal(events.length, 1, "the failed planner run is audited exactly like every other outcome");
+    assert.equal(events[0]!.tool, "answer_my_recruiting_question");
+    // auditOutcome (runtime.ts:815-819) classes UPSTREAM_ERROR as "failed" rather than "denied":
+    // the read broke, it was not refused. The point of the assertion is that the run is AUDITED and
+    // names its code, not that it is labelled a refusal.
+    assert.equal(events[0]!.outcome, "failed");
+    assert.equal(events[0]!.denialCode, "UPSTREAM_ERROR");
   });
 });

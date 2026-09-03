@@ -1,5 +1,14 @@
-import { HARD_MAX_ANALYSIS_DURATION_MS, HARD_MAX_TOOL_DURATION_MS, isToolEnabled, readPositiveInt } from "../limits.js";
-import { createToolDeadline, deny, emitRequiredToolAudit, enforceUsageBudget, isToolCancelledError, type RecruiterToolRuntime, type ToolDeadline } from "../runtime.js";
+import {
+  HARD_MAX_ANALYSIS_DURATION_MS,
+  HARD_MAX_TOOL_DURATION_MS,
+  HIRE_FACTS_ID_BRIDGE_READ_PARAM_NAMES,
+  HIRE_FACTS_OFFER_READ_PARAM_NAMES,
+  isToolEnabled,
+  readPositiveInt,
+  sanitizeReadParams,
+} from "../limits.js";
+import { createToolDeadline, deny, emitRequiredToolAudit, enforceUsageBudget, isToolCancelledError, isToolTimeoutError, type RecruiterToolRuntime, type ToolDeadline } from "../runtime.js";
+import { IdentityResolutionError } from "../identity.js";
 import { newCorrelationId } from "../audit.js";
 import type { RecruiterDenialCode, RecruiterPermissionScope, RecruiterToolDefinition, RecruiterToolResult } from "../types.js";
 import { INTERVIEW_FEEDBACK_DRAG_TOOL, runInterviewFeedbackDrag } from "./interview-feedback-drag.js";
@@ -17,6 +26,7 @@ import { resolveScopeSigner } from "../resolvers/job-scope/signer.js";
 import { resolveOwnerScope } from "./job-scope/tools.js";
 import { METRIC_REGISTRY_BY_ID, computeMetric, type MetricComputeContext, type MetricFactName } from "../metrics.js";
 import {
+  HIRE_ACCEPTED_OFFER_STATUS,
   buildApprovalFlowFacts,
   buildInterviewEventFacts,
   buildJobPostExposureFacts,
@@ -25,7 +35,9 @@ import {
   buildProspectStateFacts,
   type FactBuildResult,
 } from "../facts.js";
-import { readAllScopedRows } from "../read-all.js";
+import { classifyUpstreamError } from "../read-all.js";
+import { readIdChunks, uniquePositiveIds } from "./hire-facts.js";
+import { readAllWithDateFallback } from "./read-with-date-fallback.js";
 import type { RecruiterProjectionProfileName } from "../types.js";
 
 export const QUESTION_ANSWER_TOOL: RecruiterToolDefinition = {
@@ -312,8 +324,12 @@ export async function runRecruitingQuestionAnswer(
         runtime, question, appliedTimeWindow, missingDomain, scopeHeader, plannerScope.jobIds, plannerDeadline
       );
     } catch (error) {
-      if (!isToolCancelledError(error)) throw error;
-      const result = deny(toolName, "CANCELLED", "Scoped Greenhouse question planner was cancelled because the client request ended.");
+      // The planned-domain path used to rethrow everything that was not a cancellation, so an
+      // upstream 422 on /v3/offers — the endpoint's own documented live behaviour — escaped the
+      // planner as an unaudited exception and reached the transport as an opaque 500. Every recipe
+      // already maps its errors to a denial and audits it; this path now does the same, so a read
+      // failure is a result the caller can read and a record an operator can review.
+      const result = plannerErrorToDenial(toolName, error);
       const auditDenied = await emitPlannerAudit(runtime, startedAt, correlationId, result, null, null, actAsUser);
       return auditDenied ?? result;
     }
@@ -762,6 +778,30 @@ interface PlannedDomainBinding {
   // The fact's event timestamp for NL time windows ("this quarter"); null = point-in-time domain
   // where a window doesn't apply (disclosed rather than silently ignored).
   factWindowField: string | null;
+  /**
+   * SERVER-SIDE filters for this domain's read. The read used to be a hard-coded `{}` for every
+   * domain, so /v3/offers returned every superseded version and the planner's own total counted
+   * them. Deliberately NOT a date filter: the LIVE offers endpoint 422s every date range the
+   * vendored contract advertises, so the window stays in memory (plannedDomainBounds) and the read
+   * goes through readAllWithDateFallback either way.
+   */
+  readParams?: Record<string, unknown>;
+  /** The allowlist `readParams` is sanitized against; sanitizeReadParams drops unknowns silently. */
+  readParamNames?: ReadonlySet<string>;
+  /**
+   * A fact the window dropped for want of `factWindowField` that is OUTSTANDING rather than
+   * undated — an offer still `Created` has no `resolved_at` because it has not resolved yet. Facts
+   * matching this are counted and handed to the metric instead of vanishing into a
+   * missing-timestamp tally the answer never shows.
+   */
+  outstandingWithoutWindowField?: (fact: Record<string, unknown>) => boolean;
+  /**
+   * Open the answer with the hire reconciliation line's two cheap counts. Offers only: the accepted
+   * count and the "how many of those applications does Greenhouse actually call hired" count come
+   * from the read already in hand plus ONE bridged applications read. The third count (openings
+   * closed by a hire) is a whole further population and is offered as a follow-up step instead.
+   */
+  reconcileHires?: boolean;
 }
 
 const PLANNED_DOMAIN_BINDINGS: ReadonlyMap<string, PlannedDomainBinding> = new Map([
@@ -770,7 +810,24 @@ const PLANNED_DOMAIN_BINDINGS: ReadonlyMap<string, PlannedDomainBinding> = new M
   ["availability_to_scheduled_interview_hours", { scopedToolName: "list_interviews", factName: "interview_event_fact", buildFactsFromRows: (rows) => buildInterviewEventFacts(rows), factJobIdField: "job_id", factWindowField: "scheduled_at" }],
   ["job_post_exposure_by_post", { scopedToolName: "list_tracking_links", factName: "job_post_exposure_fact", buildFactsFromRows: (rows) => buildJobPostExposureFacts(rows), factJobIdField: "job_id", factWindowField: null }],
   ["opening_fill_status", { scopedToolName: "list_openings", factName: "opening_headcount_fact", buildFactsFromRows: (rows) => buildOpeningHeadcountFacts(rows), factJobIdField: "job_id", factWindowField: null }],
-  ["offer_resolution", { scopedToolName: "list_offers", factName: "offer_fact", buildFactsFromRows: (rows) => buildOfferFacts(rows), factJobIdField: "job_id", factWindowField: "sent_on" }],
+  ["offer_resolution", {
+    scopedToolName: "list_offers",
+    factName: "offer_fact",
+    buildFactsFromRows: (rows) => buildOfferFacts(rows),
+    factJobIdField: "job_id",
+    // `resolved_at`, not `sent_on`: an offer question is asked about when the offer was DECIDED,
+    // and resolved_at is the clock every published hire report on this tenant already uses.
+    // `sent_on` answered "when did we extend it", a different question, silently.
+    factWindowField: "resolved_at",
+    // `status` is deliberately NOT set: the whole point of this metric is the status MIX, so
+    // filtering it server-side would leave the rate with nothing to divide by. `current_only`
+    // collapses each application's version chain to its current row, which is what keeps
+    // `Deprecated` superseded versions out of the total.
+    readParams: { current_only: true },
+    readParamNames: HIRE_FACTS_OFFER_READ_PARAM_NAMES,
+    outstandingWithoutWindowField: isOutstandingOffer,
+    reconcileHires: true,
+  }],
 ]);
 
 // Deterministic NL time windows ("this quarter" was silently ignored in the live pilot — an
@@ -873,13 +930,22 @@ async function executePlannedDomain(
   const binding = metricId ? PLANNED_DOMAIN_BINDINGS.get(metricId) : undefined;
   if (!binding || !metricId) return null;
 
-  const read = await readAllScopedRows<Record<string, unknown>>(
+  // The domain's own server-side filters, sanitized against the binding's allowlist so an unlisted
+  // param is a compile-time-visible mistake rather than a silent drop. Routed through the shared
+  // 422 fallback: the read carries no date params today, but the helper is the one place that
+  // knows what to do when a live endpoint rejects a filter its contract advertises.
+  const readParams = binding.readParams
+    ? sanitizeReadParams(binding.readParams, runtime.limits, { allowedParamNames: binding.readParamNames })
+    : {};
+  const outcome = await readAllWithDateFallback<Record<string, unknown>>(
     runtime,
     QUESTION_ANSWER_TOOL.name,
     binding.scopedToolName,
-    {},
+    readParams,
+    [],
     deadline
   );
+  const read = outcome.read;
   if (read.kind === "denial") {
     // Surface the real denial (audited by the caller) rather than falling back to missing_domain —
     // "the read failed" and "the domain is unimplemented" are different truths.
@@ -893,6 +959,7 @@ async function executePlannedDomain(
     : null;
   const factResult = binding.buildFactsFromRows(read.rows);
   const omissions: string[] = [];
+  let offersOutstanding = 0;
   let scopedFactResult = factResult;
   if (scopeIds && scopeIds.size > 0) {
     if (binding.factJobIdField) {
@@ -923,6 +990,10 @@ async function executePlannedDomain(
         const at = typeof raw === "string" ? Date.parse(raw) : Number.NaN;
         if (!Number.isFinite(at)) {
           missingTimestamp += 1;
+          // A row with no window timestamp is not always a data gap: on offers it is usually an
+          // offer that has not resolved YET. The binding says which, and the count reaches the
+          // metric so it can be surfaced instead of disappearing into missingTimestamp.
+          if (binding.outstandingWithoutWindowField?.(fact)) offersOutstanding += 1;
           return false;
         }
         return at >= bounds.startMs && at <= bounds.endMs;
@@ -944,7 +1015,64 @@ async function executePlannedDomain(
   const metric = computeMetric(metricId, {
     facts: { [binding.factName]: scopedFactResult } as MetricComputeContext["facts"],
     nowMs: runtime.now(),
+    ...(binding.outstandingWithoutWindowField || binding.readParams?.current_only === true
+      ? {
+          offerRead: {
+            rawRowsRead: read.rawRowsRead,
+            // The read already asked the API for current versions only, so what came back IS the
+            // post-current_only set. Naming both numbers is what lets the answer say whether its
+            // denominator counts chains or extensions.
+            rowsAfterCurrentOnly: read.rows.length,
+            offersOutstanding,
+            supersededVersionsRead: false,
+          },
+        }
+      : {}),
   });
+  // The two cheap halves of the hire reconciliation line, from the read already in hand plus ONE
+  // bridged applications read. They lead the answer because "our offer acceptance rate is X" and
+  // "Greenhouse thinks we hired Y people" are the two numbers a People Ops reader will be asked
+  // about in the same breath, and on this tenant they disagree.
+  let reconciliationLead: string | undefined;
+  const nextSteps: string[] = [];
+  if (binding.reconcileHires) {
+    const accepted = (scopedFactResult.facts as Array<Record<string, unknown>>).filter(
+      (fact) => fact.status === HIRE_ACCEPTED_OFFER_STATUS
+    );
+    const bridged = await readIdChunks(
+      runtime,
+      QUESTION_ANSWER_TOOL.name,
+      "list_applications",
+      uniquePositiveIds(accepted, "application_id"),
+      (batch) => sanitizeReadParams(
+        { ids: batch.join(",") },
+        runtime.limits,
+        { allowedParamNames: HIRE_FACTS_ID_BRIDGE_READ_PARAM_NAMES }
+      ),
+      deadline
+    );
+    if (bridged.kind === "denial") return bridged.result;
+    const markedHired = bridged.rows.filter(
+      (row) => typeof row.status === "string" && row.status.trim().toLowerCase() === "hired"
+    ).length;
+    reconciliationLead =
+      `${accepted.length} accepted current offers; ${markedHired} of their applications ` +
+      `${markedHired === 1 ? "is" : "are"} marked hired in Greenhouse.`;
+    omissions.push(
+      "These two counts are dated on different clocks — offers.resolved_at for the first, applications.status (point-in-time) for the second — and Greenhouse sets status=hired only once the hire endpoint has fired, so the second trailing the first is normal rather than an error."
+    );
+    // Each count carries ITS OWN withheld figure. Summing them would report a number no read made.
+    if (read.privacyWithheld > 0) {
+      omissions.push(`${read.privacyWithheld} offer row(s) withheld as private candidates you cannot see.`);
+    }
+    if (bridged.read.privacyWithheld > 0) {
+      omissions.push(`${bridged.read.privacyWithheld} of those applications withheld as private candidates you cannot see.`);
+    }
+    nextSteps.push(
+      "Ask for the openings closed by a hire to complete the reconciliation — it is a third population (openings.closed_at plus the close-reason dictionary) and costs two further reads, so it is not run unasked."
+    );
+  }
+
   const completeness = read.status === "complete" ? metric.completeness : read.status;
   const plan: AnalysisPlan = {
     interpretedQuestion: question,
@@ -992,7 +1120,10 @@ async function executePlannedDomain(
         // The same composition contract every other answer shape carries: scope first, then the
         // window. This branch used to carry no message at all, so the one disclosure a recruiter
         // reads first was missing on exactly the path that answers a metric question.
-        message: composeAnswerMessage({ scopeHeader, appliedTimeWindow, clause: `computed ${metricId}` }),
+        message: [
+          reconciliationLead,
+          composeAnswerMessage({ scopeHeader, appliedTimeWindow, clause: `computed ${metricId}` }),
+        ].filter((part): part is string => Boolean(part)).join(" "),
         metric,
         read: {
           complete: read.complete,
@@ -1004,7 +1135,7 @@ async function executePlannedDomain(
       },
       analyses: [{ planned_metric: metricId, metric }],
       denials: [],
-      next_steps: [],
+      next_steps: nextSteps,
     },
     nextCursor: null,
   };
@@ -1764,4 +1895,40 @@ function stringArray(value: unknown): string[] {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * An offer that has neither resolved nor been superseded — sent, and still out. Classified the same
+ * way computeOfferResolutionMix classifies the mix (case-insensitively, because the status vocab is
+ * tenant-defined and this tenant capitalizes), so the two cannot disagree about what "outstanding"
+ * means. `Deprecated` is excluded: a superseded version is not an offer anybody is waiting on.
+ */
+function isOutstandingOffer(fact: Record<string, unknown>): boolean {
+  const status = typeof fact.status === "string" ? fact.status.trim().toLowerCase() : "";
+  if (status.length === 0) return false;
+  if (status.includes("accept") || status.includes("reject") || status.includes("declin")) return false;
+  return !status.includes("deprecat");
+}
+
+/**
+ * The recipes' errorToDenial, for the planner's own read path. Same classes, same order: an
+ * identity failure keeps its code, a cancellation and a timeout keep theirs, a window-validation
+ * message is a LIMIT_EXCEEDED the caller can act on, and anything else is an UPSTREAM_ERROR
+ * classified rather than echoed raw.
+ */
+function plannerErrorToDenial(toolName: string, error: unknown): RecruiterToolResult {
+  if (error instanceof IdentityResolutionError) {
+    return deny(toolName, error.code, error.message);
+  }
+  if (isToolCancelledError(error)) {
+    return deny(toolName, "CANCELLED", "Scoped Greenhouse question planner was cancelled because the client request ended.");
+  }
+  if (isToolTimeoutError(error)) {
+    return deny(toolName, "TOOL_TIMEOUT", "Scoped Greenhouse question planner timed out before returning data.");
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("window exceeds") || message.includes("requires a valid window")) {
+    return deny(toolName, "LIMIT_EXCEEDED", message);
+  }
+  return deny(toolName, "UPSTREAM_ERROR", classifyUpstreamError(error, "The planned analysis failed before returning data."));
 }
