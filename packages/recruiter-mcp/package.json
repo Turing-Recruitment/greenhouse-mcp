@@ -32,6 +32,7 @@
     "greenhouse-recruiter-revoke-oauth": "bin/greenhouse-recruiter-revoke-oauth.mjs",
     "greenhouse-recruiter-revocation-drill": "bin/greenhouse-recruiter-revocation-drill.mjs",
     "greenhouse-recruiter-reconcile-identity": "bin/greenhouse-recruiter-reconcile-identity.mjs",
+    "greenhouse-recruiter-attest-private-candidates": "bin/greenhouse-recruiter-attest-private-candidates.mjs",
     "greenhouse-recruiter-snapshot": "bin/greenhouse-recruiter-snapshot.mjs"
   },
   "scripts": {

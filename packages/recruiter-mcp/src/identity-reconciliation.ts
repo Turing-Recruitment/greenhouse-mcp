@@ -281,13 +281,26 @@ export async function applyIdentityReconciliationPlan(
   for (const entry of [...plan.revoked, ...plan.tombstoned]) {
     const url = new URL(`${baseUrl}/rest/v1/${encodeURIComponent(table)}`);
     url.searchParams.set("greenhouse_user_id", `eq.${entry.greenhouseUserId}`);
-    // PATCH replaces only these three columns; greenhouse_user_id / primary_email / google_subject /
+    // PATCH replaces only these columns; greenhouse_user_id / primary_email / google_subject /
     // first_seen_at / slack_user_id / source are untouched. evidence_detail is intentionally
     // REPLACED (not merged): for a deactivated row the deprovisioning cause is the relevant evidence,
     // and a returning recruiter's bootstrap provenance is rewritten by the bootstrap upsert anyway.
+    //
+    // The three private-candidate attestation columns are cleared here and NOWHERE else on the
+    // write side (CLO-273). Deprovisioning is exactly the moment an org-wide private-candidate
+    // grant stops being true, and the attestation is a standing statement about a live person's
+    // Greenhouse permission — leaving it set would mean a returning row, or a row someone
+    // re-bootstrapped, silently carried an attestation nobody made this year. Clearing it is
+    // fail-safe in the same direction as the status flip: it can only withhold. The bootstrap
+    // upsert deliberately does NOT carry these columns (identity-bootstrap.ts:14-23), so
+    // re-bootstrapping a returning recruiter does not resurrect the attestation either — it has to
+    // be re-recorded by hand.
     const body = {
       status: DEACTIVATED_STATUS,
       last_verified_at: appliedAt,
+      private_candidates_attested: false,
+      private_candidates_attested_at: null,
+      private_candidates_attested_by: `identity_directory_reconciliation:${entry.action}`,
       evidence_detail: {
         source: "identity_directory_reconciliation",
         action: entry.action,

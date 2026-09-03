@@ -6,6 +6,11 @@ import {
 } from "../../scoped-core/src/index.js";
 import { apiGet, apiGetWithCursor, configure } from "../../control-plane/dist/client-readonly.js";
 import { createIdentityActorResolver, type IdentityDirectory } from "./identity.js";
+import {
+  createPrivateCandidateAttestationLookup,
+  createPrivateCandidateAttestationStamp,
+  type PrivateCandidateAttestationLookup,
+} from "./private-candidate-attestation.js";
 import { createSiteAdminAwarePermissionProvider } from "./site-admin-permission.js";
 import { createCachingRawReader, readReadCacheConfig } from "./read-cache.js";
 import { createTtlMemo } from "./ttl-memo.js";
@@ -33,6 +38,28 @@ type PermissionProviderLike = {
   getPermittedJobIds(userId: number, signal?: AbortSignal): Promise<unknown>;
 };
 const sharedPermissionProviders = new Map<string, PermissionProviderLike>();
+
+// The attestation lookup keeps the "warn once per failure class" state, so it has to outlive the
+// per-request server the same way the permission providers do. Keyed on the directory coordinates
+// that change its behaviour; the KEY never carries the service-role key, only whether one is set.
+const sharedAttestationLookups = new Map<string, PrivateCandidateAttestationLookup>();
+
+function getPrivateCandidateAttestationLookup(env: NodeJS.ProcessEnv): PrivateCandidateAttestationLookup {
+  const key = [
+    env.GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_URL ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_TABLE ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_GREENHOUSE_USER_ID_COLUMN ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_STATUS_COLUMN ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_RESOLVED_STATUS ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_KEY ? "keyed" : "unkeyed",
+  ].join("|");
+  let lookup = sharedAttestationLookups.get(key);
+  if (!lookup) {
+    lookup = createPrivateCandidateAttestationLookup(env);
+    sharedAttestationLookups.set(key, lookup);
+  }
+  return lookup;
+}
 
 // The TTL + single-flight + refcount + evict-on-failure machinery this used to spell out inline
 // now lives in ttl-memo.ts, unchanged, because the action-entitlement lookup needs the same
@@ -67,7 +94,14 @@ export function createProductionScopedReader(
   const cachedRawReader = createCachingRawReader(rawReader, readReadCacheConfig(env));
   const ttlMs = readPermissionTtlMs(env);
   const disableSiteAdmin = readBooleanEnvFlag(env, "GREENHOUSE_RECRUITER_DISABLE_SITE_ADMIN_ALL_ACCESS");
-  const providerKey = `ttl:${ttlMs}|siteadmin:${disableSiteAdmin ? "off" : "on"}`;
+  const attestationLookup = getPrivateCandidateAttestationLookup(env);
+  const providerKey = [
+    `ttl:${ttlMs}`,
+    `siteadmin:${disableSiteAdmin ? "off" : "on"}`,
+    // The stamp's answer is part of what the memo caches, so a differently-configured directory has
+    // to get its own provider or one process's attestation state would serve another's reads.
+    `attest:${env.GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_URL ?? ""}|${env.GREENHOUSE_RECRUITER_IDENTITY_TABLE ?? ""}`,
+  ].join("|");
   let permissionProvider = sharedPermissionProviders.get(providerKey);
   if (!permissionProvider) {
     const basePermissionProvider = createHarvestPermissionProvider({ rawReader, ttlMs });
@@ -78,7 +112,17 @@ export function createProductionScopedReader(
     const chained = disableSiteAdmin
       ? basePermissionProvider
       : createSiteAdminAwarePermissionProvider({ base: basePermissionProvider, rawReader });
-    permissionProvider = memoizePermissionScope(chained, ttlMs);
+    // The private-candidate attestation is stamped onto every all-access answer HERE, inside the
+    // memo, so the flag ages on the same clock as the scope it belongs to: a CLI attestation is
+    // observed within readPermissionTtlMs (60s by default, and immediately in production, which
+    // sets GREENHOUSE_RECRUITER_FORCE_PERMISSION_TTL_ZERO). Stamping outside the memo would write
+    // one actor's attestation onto the shared cached object.
+    const stamped = createPrivateCandidateAttestationStamp({
+      chained,
+      base: basePermissionProvider,
+      isAttested: attestationLookup,
+    });
+    permissionProvider = memoizePermissionScope(stamped, ttlMs);
     sharedPermissionProviders.set(providerKey, permissionProvider);
   }
   return createScopedGreenhouseReader<AuthenticatedSession>({

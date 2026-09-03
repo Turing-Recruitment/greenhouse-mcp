@@ -71,6 +71,35 @@ export type PermissionScope =
        * no legacy confidential jobs — and keeps the raw, unfiltered read path exactly as it was.
        */
       excludedJobIds?: ReadonlySet<number>;
+      /**
+       * Has an operator attested that Greenhouse grants this actor the org-wide "Can create and
+       * view private candidates" permission?
+       *
+       * All-access is INFERRED here — from `/v3/users.site_admin`, or from an all-jobs role marker
+       * on `/v3/user_job_permissions`. Neither is that permission, which Greenhouse grants per user
+       * and Harvest v3 does not expose at all. Treating "sees every job" as "sees every private
+       * candidate" therefore handed out access the organization's own model decides separately, on
+       * an input this layer cannot read.
+       *
+       * Only `=== true` counts. Absent or false means UNATTESTED: the actor keeps every other row
+       * they could read, and keeps the private candidates their per-job Greenhouse roles grant
+       * (see `privateCapableJobIds` below), but the org-wide private set is withheld. The flag is
+       * stamped in exactly one place — `recruiter-mcp/src/private-candidate-attestation.ts`'s
+       * provider wrapper — so a new all-access path inherits the gate rather than bypassing it.
+       */
+      privateCandidatesAttested?: boolean;
+      /**
+       * The jobs this all-access actor holds through a private-capable Greenhouse role, recovered
+       * from their EXPLICIT per-job grants.
+       *
+       * Only consulted while unattested. Greenhouse grants private-candidate visibility two ways —
+       * the org-wide user permission the attestation stands for, and the built-in "Private" Job
+       * Admin role on a specific req — and the site-admin path discards the second when it widens
+       * an actor to `all`. Without this an unattested all-access actor would lose private access
+       * the organization had already granted them on their own reqs, which is a narrowing with no
+       * external constraint behind it.
+       */
+      privateCapableJobIds?: ReadonlySet<number>;
     }
   | {
       kind: "jobs";
@@ -2315,9 +2344,22 @@ function everyJobExcept(excludedJobIds: ReadonlySet<number>): ReadonlySet<number
 
 function clonePermissionScope(scope: PermissionScope): PermissionScope {
   if (scope.kind === "all") {
-    return scope.excludedJobIds
-      ? { kind: "all", excludedJobIds: new Set(scope.excludedJobIds) }
-      : { kind: "all" };
+    // Rebuilt field by field rather than spread, deliberately: this clone is the choke point every
+    // provider answer passes through (`normalizePermissionScope`), so a field that is not named
+    // here is a field the reader never sees. Anything added to the all-branch must be added here
+    // too — a silently dropped `privateCandidatesAttested` would withhold private candidates from
+    // an attested admin, and a silently dropped `privateCapableJobIds` would withhold them from an
+    // unattested one on their own reqs.
+    return {
+      kind: "all",
+      ...(scope.excludedJobIds ? { excludedJobIds: new Set(scope.excludedJobIds) } : {}),
+      ...(scope.privateCandidatesAttested === undefined
+        ? {}
+        : { privateCandidatesAttested: scope.privateCandidatesAttested }),
+      ...(scope.privateCapableJobIds
+        ? { privateCapableJobIds: new Set(scope.privateCapableJobIds) }
+        : {}),
+    };
   }
   return scope.privateCapableJobIds
     ? {
@@ -2341,7 +2383,13 @@ function isPermissionScope(value: unknown): value is PermissionScope {
     return false;
   }
   if (value.kind === "all") {
-    return true;
+    // The optional fields are validated rather than waved through: a provider that answered
+    // `privateCandidatesAttested: "true"` (a string out of a JSON config) must not be read as
+    // attested, and `=== true` is the only thing the gate accepts anywhere.
+    if (value.privateCandidatesAttested !== undefined && typeof value.privateCandidatesAttested !== "boolean") {
+      return false;
+    }
+    return value.privateCapableJobIds === undefined || isSetLike(value.privateCapableJobIds);
   }
   return value.kind === "jobs" && isSetLike(value.jobIds);
 }
