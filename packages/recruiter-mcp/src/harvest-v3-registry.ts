@@ -148,6 +148,17 @@ const EVIDENCE_TOOL_ENDPOINT_PAIRS = [
   ["search_my_applied_candidate_tags", "/v3/applied_candidate_tags"],
   ["search_my_user_roles", "/v3/user_roles"],
   ["search_my_email_templates", "/v3/email_templates"],
+  ["search_my_user_job_permissions", "/v3/user_job_permissions"],
+  ["search_my_future_job_permissions", "/v3/future_job_permissions"],
+  ["search_my_job_candidate_attributes", "/v3/job_candidate_attributes"],
+  ["search_my_candidate_attribute_types", "/v3/candidate_attribute_types"],
+  ["search_my_scorecard_candidate_attributes", "/v3/scorecard_candidate_attributes"],
+  ["search_my_focus_candidate_attributes", "/v3/focus_candidate_attributes"],
+  ["search_my_scorecard_question_candidate_attributes", "/v3/scorecard_question_candidate_attributes"],
+  ["search_my_user_emails", "/v3/user_emails"],
+  ["search_my_bulk_requests", "/v3/bulk_requests"],
+  ["search_my_blocked_spam_sources", "/v3/blocked_spam_sources"],
+  ["search_my_job_board_custom_locations", "/v3/job_board_custom_locations"],
 ] as const;
 
 export const HARVEST_V3_EVIDENCE_TOOL_ENDPOINTS: ReadonlyMap<string, string> = new Map(EVIDENCE_TOOL_ENDPOINT_PAIRS);
@@ -163,10 +174,8 @@ const JOB_SCOPED_ENDPOINTS = new Set([
   "/v3/applications",
   "/v3/approval_flows",
   "/v3/candidate_attribute_types",
-  "/v3/focus_candidate_attributes",
   "/v3/interview_kits",
   "/v3/interviews",
-  "/v3/job_board_custom_locations",
   "/v3/job_candidate_attributes",
   "/v3/job_hiring_managers",
   "/v3/job_interview_stages",
@@ -206,7 +215,6 @@ const INTERVIEW_BACKED_ENDPOINTS = new Set([
 const SCORECARD_BACKED_ENDPOINTS = new Set([
   "/v3/scorecard_candidate_attributes",
   "/v3/scorecard_question_answers",
-  "/v3/scorecard_question_candidate_attributes",
 ]);
 
 const JOIN_BACKED_ENDPOINTS = new Set([
@@ -216,6 +224,13 @@ const JOIN_BACKED_ENDPOINTS = new Set([
   // — it was classified for a field the endpoint does not return. It reaches a job the same way
   // /v3/job_post_locations does: job_post_id -> /v3/job_posts -> job_id.
   "/v3/job_post_searchable_locations",
+  // R2d moved both of these off a scope class named for a field their row does not carry.
+  // /v3/focus_candidate_attributes was job_scoped with no job_id (only interview_kit_id), and
+  // /v3/scorecard_question_candidate_attributes was scorecard_backed with no scorecard_id (only
+  // scorecard_question_id). Each would have resolved every row `unresolved` and withheld the page.
+  // They follow the rubric-structure chains their siblings already use.
+  "/v3/focus_candidate_attributes",
+  "/v3/scorecard_question_candidate_attributes",
   "/v3/approvers",
   "/v3/default_interviewers",
   "/v3/job_post_locations",
@@ -244,6 +259,10 @@ const GLOBAL_REFERENCE_ENDPOINTS = new Set([
   "/v3/departments",
   "/v3/email_templates",
   "/v3/interviewer_tags",
+  // R2d moved this out of JOB_SCOPED_ENDPOINTS: the row carries greenhouse_job_board_id and NO
+  // job_id, so it is board configuration (the custom location labels a board offers), not a
+  // requisition row, and classifying it as job-scoped would have withheld every row.
+  "/v3/job_board_custom_locations",
   "/v3/job_boards",
   "/v3/offices",
   "/v3/pay_inputs",
@@ -338,6 +357,12 @@ const GLOBAL_HIDDEN_MODEL_PARAMS: Record<string, string> = {
  *                                  endpoint+field pair explicitly.
  *   /v3/jobs.is_template         — never hidden here because /v3/jobs documents no such PARAMETER; see
  *                                  LIVE_REJECTED_PARAMS below.
+ *   /v3/user_emails.email        — R2d bound the endpoint behind a ROW gate (site admins and
+ *                                  operators only, evidence-projection.ts operatorOnlyProjector). A
+ *                                  reader who receives no rows learns nothing by filtering them, and
+ *                                  one who receives every row already holds the addresses; hiding the
+ *                                  filter on top of the row gate protected nothing and only stopped
+ *                                  an admin looking a colleague up.
  */
 const PATH_HIDDEN_MODEL_PARAMS: Record<string, Record<string, string>> = {
   "/v3/candidates": {
@@ -354,10 +379,6 @@ const PATH_HIDDEN_MODEL_PARAMS: Record<string, Record<string, string>> = {
   // reads carry no privately-flagged option values, so narrowing by one infers nothing.
   "/v3/offers": {
     custom_field_option_id: "Greenhouse's private custom-field permission strips these values (private-custom-fields.ts); filtering by an option id infers the stripped compensation value from the result size, so the filter stays hidden with the values.",
-  },
-  "/v3/user_emails": {
-    email: "Greenhouse gates the staff email directory; filtering by an address is only meaningful to an actor who may read it, and the projection restores these rows to site admins and operators only.",
-    verification_token_sent_at: "Greenhouse gates the staff email directory; account-verification timing is administration metadata for the same permission.",
   },
 };
 
@@ -617,10 +638,10 @@ function joinDependenciesForPath(path: string, scopeClass: HarvestScopeClass): J
   if (path === "/v3/approver_groups") {
     return [scopeJoin("approval_flow_id", "approval_flow_ids", "/v3/approval_flows")];
   }
-  if (path === "/v3/scorecard_questions" || path === "/v3/default_interviewers") {
+  if (path === "/v3/scorecard_questions" || path === "/v3/default_interviewers" || path === "/v3/focus_candidate_attributes") {
     return [scopeJoin("interview_kit_id", "interview_kit_ids", "/v3/interview_kits")];
   }
-  if (path === "/v3/scorecard_question_options") {
+  if (path === "/v3/scorecard_question_options" || path === "/v3/scorecard_question_candidate_attributes") {
     return [
       scopeJoin("scorecard_question_id", "scorecard_question_ids", "/v3/scorecard_questions"),
       scopeJoin("interview_kit_id", "interview_kit_ids", "/v3/interview_kits"),

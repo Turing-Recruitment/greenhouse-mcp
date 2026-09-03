@@ -95,6 +95,17 @@ const EVIDENCE_TOOL_SCOPED_TOOL_ENTRIES = [
   ["search_my_applied_candidate_tags", "list_applied_candidate_tags"],
   ["search_my_user_roles", "list_user_roles"],
   ["search_my_email_templates", "list_email_templates"],
+  ["search_my_user_job_permissions", "list_user_job_permissions"],
+  ["search_my_future_job_permissions", "list_future_job_permissions"],
+  ["search_my_job_candidate_attributes", "list_job_candidate_attributes"],
+  ["search_my_candidate_attribute_types", "list_candidate_attribute_types"],
+  ["search_my_scorecard_candidate_attributes", "list_scorecard_candidate_attributes"],
+  ["search_my_focus_candidate_attributes", "list_focus_candidate_attributes"],
+  ["search_my_scorecard_question_candidate_attributes", "list_scorecard_question_candidate_attributes"],
+  ["search_my_user_emails", "list_user_emails"],
+  ["search_my_bulk_requests", "list_bulk_requests"],
+  ["search_my_blocked_spam_sources", "list_blocked_spam_sources"],
+  ["search_my_job_board_custom_locations", "list_job_board_custom_locations"],
 ] as const;
 
 export const EVIDENCE_TOOL_SCOPED_TOOL_NAMES: ReadonlyMap<string, string> = new Map(
@@ -222,7 +233,14 @@ function boundingRuleForScopeClass(scopeClass: HarvestScopeClass): string {
     return "Reference rows are not job-filtered; they may be used only as safe projected dimensions for scoped facts.";
   }
   if (scopeClass === "admin_reference") {
-    return "Admin reference rows are not exposed on the default recruiter surface except as internal permission infrastructure.";
+    // R2d bound /v3/user_job_permissions, so "not exposed on the default recruiter surface" stopped
+    // being true. The row is bounded exactly like any other job-scoped read — it carries job_id and
+    // the endpoint takes job_ids — so a reader sees who can reach THEIR reqs, never an org-wide map.
+    return "Rows must carry a permitted job_id before projection; a reader sees permission rows for their own requisitions only.";
   }
-  return "Sensitive personal rows require an explicit role, purpose, and projection profile before model exposure.";
+  // R2d bound /v3/user_emails. There is no job to bound a staff-directory row to, so the gate is the
+  // reader's ROLE rather than their requisitions: the projector returns rows to a site admin or an
+  // allowlisted operator and nothing to a job-scoped recruiter, which is the line Greenhouse itself
+  // draws around its staff-directory and permission settings.
+  return "Rows reach site admins and allowlisted operators only; a job-scoped recruiter receives none.";
 }

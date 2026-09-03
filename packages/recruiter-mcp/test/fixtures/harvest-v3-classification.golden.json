@@ -140,7 +140,7 @@
     "defaultProjectionProfile": "safe_reference"
   },
   "/v3/focus_candidate_attributes": {
-    "scopeClass": "job_scoped",
+    "scopeClass": "join_backed",
     "sensitivityClass": "default_operational",
     "defaultProjectionProfile": "default_operational"
   },
@@ -170,7 +170,7 @@
     "defaultProjectionProfile": "default_operational"
   },
   "/v3/job_board_custom_locations": {
-    "scopeClass": "job_scoped",
+    "scopeClass": "global_reference",
     "sensitivityClass": "default_operational",
     "defaultProjectionProfile": "default_operational"
   },
@@ -310,7 +310,7 @@
     "defaultProjectionProfile": "safe_reference"
   },
   "/v3/scorecard_question_candidate_attributes": {
-    "scopeClass": "scorecard_backed",
+    "scopeClass": "join_backed",
     "sensitivityClass": "role_gated",
     "defaultProjectionProfile": "safe_reference"
   },

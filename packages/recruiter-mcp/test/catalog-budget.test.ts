@@ -16,7 +16,12 @@ import type { AuthenticatedSession } from "../src/types.js";
  *   before R2  44 mounted tools   99,230 B tools +  4,003 B instructions = 103,233 B (~25.8k tokens)
  *   before R2  66 registered      148,917 B      +  4,003 B              = 152,920 B (~38.2k tokens)
  *   after R2a+R2b, 70 tools       159,961 B      +  4,003 B              = 163,964 B (~41.0k tokens)
- *   after R2c+R2d, 82 tools       (asserted below, against BUDGET_BYTES)
+ *   after R2c,     70 tools       120,918 B      +  5,046 B              = 125,964 B (~31.5k tokens)
+ *   after R2d,     81 tools       139,220 B      +  5,046 B              = 144,266 B (~36.1k tokens)
+ *
+ * So the surface ends at 81 read tools — 37 more than a recruiter could reach before week two — for
+ * 8,654 B LESS than the 66-tool catalog cost, and 20,743 B less than the 44 mounted tools plus the
+ * 22 that were hidden. With a full write entitlement the 103-tool catalog is 182,821 B (~45.7k).
  *
  * Where the 66-tool baseline went (measured per parameter name, 619 params over 66 tools):
  *   created_at + updated_at   35,700 B   the anyOf date-range union on 117 params

@@ -822,6 +822,9 @@ describe("the privacy tool sets are checked against the registry's endpoints, no
       // R2b: a tag row is (candidate_id, candidate_tag_id) — it names a candidate, so it is
       // candidate substance and the private gate must cover it.
       "/applied_candidate_tags",
+      // R2d: the row carries an interviewer's free-text `note` about one candidate, reached through
+      // its scorecard.
+      "/scorecard_candidate_attributes",
       "/scorecard_question_answers",
       "/scorecard_question_answer_options",
     ]);
@@ -870,6 +873,21 @@ describe("the privacy tool sets are checked against the registry's endpoints, no
       "/job_post_searchable_locations",
       "/user_roles",
       "/email_templates",
+      // R2d. Rubric CONFIGURATION and org diagnostics. The attribute family below describes what a
+      // scorecard rates and which question maps to which trait — the ratings themselves live on
+      // /scorecard_candidate_attributes, which is classified as candidate substance above. The
+      // permission, staff-directory, bulk-request, spam and board-location rows describe people who
+      // work here or the org's own configuration, never an applicant.
+      "/job_candidate_attributes",
+      "/candidate_attribute_types",
+      "/focus_candidate_attributes",
+      "/scorecard_question_candidate_attributes",
+      "/user_job_permissions",
+      "/future_job_permissions",
+      "/user_emails",
+      "/bulk_requests",
+      "/blocked_spam_sources",
+      "/job_board_custom_locations",
     ]);
 
     const problems: string[] = [];

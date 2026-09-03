@@ -136,7 +136,47 @@ const EVIDENCE_PROJECTORS = new Map<string, Projector>([
   ["search_my_applied_candidate_tags", denylistProjector("/v3/applied_candidate_tags")],
   ["search_my_user_roles", denylistProjector("/v3/user_roles")],
   ["search_my_email_templates", denylistProjector("/v3/email_templates")],
+  // R2d. Requisition permissions, the candidate-attribute rubric family, and the two org-diagnostic
+  // dictionaries: id/label/FK rows with no contact field on the v3 contract (locked by the PII sweep
+  // in test/evidence.test.ts). The scorecard-attribute row's free-text `note` passes through — it is
+  // interviewer feedback, the same class as scorecard notes, and the private-candidate gate covers
+  // the row upstream.
+  ["search_my_user_job_permissions", denylistProjector("/v3/user_job_permissions")],
+  ["search_my_job_candidate_attributes", denylistProjector("/v3/job_candidate_attributes")],
+  ["search_my_candidate_attribute_types", denylistProjector("/v3/candidate_attribute_types")],
+  ["search_my_scorecard_candidate_attributes", denylistProjector("/v3/scorecard_candidate_attributes")],
+  ["search_my_focus_candidate_attributes", denylistProjector("/v3/focus_candidate_attributes")],
+  ["search_my_scorecard_question_candidate_attributes", denylistProjector("/v3/scorecard_question_candidate_attributes")],
+  ["search_my_bulk_requests", denylistProjector("/v3/bulk_requests")],
+  ["search_my_blocked_spam_sources", denylistProjector("/v3/blocked_spam_sources")],
+  ["search_my_job_board_custom_locations", denylistProjector("/v3/job_board_custom_locations")],
+  // Staff permission configuration and the staff email directory. Neither row carries a job_id, so
+  // there is nothing to bound them to — the gate is the reader's ROLE instead of their requisitions.
+  ["search_my_future_job_permissions", operatorOnlyProjector("/v3/future_job_permissions")],
+  ["search_my_user_emails", operatorOnlyProjector("/v3/user_emails")],
 ]);
+
+/**
+ * A ROW gate, not a field gate.
+ *
+ * Greenhouse restricts its own permission settings and staff-directory pages to site admins. These
+ * two endpoints are those pages' API, and their rows carry no job_id, so the job-scoping every other
+ * read relies on has nothing to bind to — dropping fields would leave a job-scoped recruiter holding
+ * a row of ids that still discloses that a colleague holds a grant. So the whole row is withheld for
+ * anyone but a site admin or an allowlisted operator, and the tool description says so rather than
+ * returning an unexplained empty list.
+ *
+ * This is the ONE narrowing in R2d, and its citation is the second line of the charter: never
+ * silently grant access the org's own Greenhouse permissions deny. It is not a fail-closed on an
+ * unknown question — the same read, run by the site admin who administers the directory, returns
+ * every row.
+ */
+function operatorOnlyProjector(endpointPath: string): (value: unknown) => unknown {
+  return (value) => {
+    if (activeProjectionProfile !== "operator_site_admin") return Array.isArray(value) ? [] : null;
+    return projectData(value, (row) => projectRowWithDenylist(row, endpointPath));
+  };
+}
 
 function denylistProjector(endpointPath: string): (value: unknown) => unknown {
   return (value) => projectData(value, (row) => projectRowWithDenylist(row, endpointPath));
@@ -240,11 +280,12 @@ const DEFAULT_OMISSION_POLICIES_BY_ENDPOINT = new Map<string, FieldOmissionPolic
     // restored for that profile in PROFILE_FIELD_RESTORES, exactly like /v3/users.primary_email.
     //
     // Nothing ELSE on the row is withheld. `body`, `subject` and `html_body` are company copy every
-    // recruiter already sends, and `user_id` is an id, not contact data. The control-plane surface
-    // still gates this endpoint behind its Tier-3 doctrine (control-plane/src/index.ts, the
-    // list_email_templates registration): that gate cited an "expanded access" posture rather than a
-    // Greenhouse permission, and it does not govern this scoped recruiter surface, where the
-    // recruiter's own permissions are enforced per read.
+    // recruiter already sends, and `user_id` is an id, not contact data. The legacy control-plane
+    // package still gates this endpoint behind its Tier-3 doctrine (its own list_email_templates
+    // registration): that gate cited an "expanded access" posture rather than a Greenhouse
+    // permission, and it does not govern this scoped recruiter surface, where the recruiter's own
+    // permissions are enforced per read. (Naming that package's file by PATH in this comment trips
+    // the raw-client import boundary in scripts/verify-guards.mjs, which greps source text for it.)
     { field: "recipients", reason: "privacy" },
   ]],
   ["/v3/users", [

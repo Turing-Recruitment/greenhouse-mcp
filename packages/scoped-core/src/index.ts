@@ -1505,6 +1505,8 @@ export const CANDIDATE_SUBSTANCE_TOOLS: ReadonlySet<string> = new Set([
   // R2b: an applied-tag row names a candidate by id, so an unattested actor must not learn a private
   // candidate exists by seeing their tag row.
   "list_applied_candidate_tags",
+  // R2d: `note` on a scorecard-attribute row is an interviewer's free text about one candidate.
+  "list_scorecard_candidate_attributes",
   "list_scorecard_question_answers",
   "list_scorecard_question_answer_options",
 ]);
@@ -2525,6 +2527,29 @@ export const DEFAULT_FILTER_REGISTRY: ReadonlyMap<string, ToolRegistration> =
     // through the same job_post_id -> /job_posts -> job_id chain as /job_post_locations, never as a
     // direct job-scoped row (which would have resolved every row unresolved and withheld the page).
     ["list_job_post_searchable_locations", policyListTool("/job_post_searchable_locations")],
+    // R2d. The candidate-attribute (structured rubric) family. Each is bound to the field its row
+    // ACTUALLY carries: job_candidate_attributes and candidate_attribute_types carry job_id;
+    // scorecard_candidate_attributes carries scorecard_id; focus_candidate_attributes and
+    // scorecard_question_candidate_attributes carry neither and reach a job through the kit/question
+    // chain, so they are policy-driven like the rest of the rubric structure.
+    ["list_job_candidate_attributes", listTool("/job_candidate_attributes", filterDirectJobScopedRow)],
+    ["list_candidate_attribute_types", listTool("/candidate_attribute_types", filterDirectJobScopedRow)],
+    ["list_scorecard_candidate_attributes", listTool("/scorecard_candidate_attributes", filterScorecardBackedRow)],
+    ["list_focus_candidate_attributes", policyListTool("/focus_candidate_attributes")],
+    ["list_scorecard_question_candidate_attributes", policyListTool("/scorecard_question_candidate_attributes")],
+    // R2d. "Who else can see this req" — bounded to the reader's OWN reqs by the same direct job
+    // filter every job-scoped read uses, so it is never an org-wide view of who has access to what.
+    ["list_user_job_permissions", listTool("/user_job_permissions", filterDirectJobScopedRow)],
+    // R2d. Staff configuration and operational diagnostics, none of which can carry a candidate row.
+    // future_job_permissions and user_emails additionally return rows only to a site admin or
+    // operator (evidence-projection.ts operatorOnlyProjector) — Greenhouse restricts its own
+    // permission and staff-directory settings to site admins, and this surface does not open a side
+    // door around that.
+    ["list_future_job_permissions", globalReferenceListTool("/future_job_permissions")],
+    ["list_user_emails", globalReferenceListTool("/user_emails")],
+    ["list_bulk_requests", globalReferenceListTool("/bulk_requests")],
+    ["list_blocked_spam_sources", globalReferenceListTool("/blocked_spam_sources")],
+    ["list_job_board_custom_locations", globalReferenceListTool("/job_board_custom_locations")],
     ["list_pay_input_ranges", policyListTool("/pay_input_ranges")],
     ["list_interviewer_tags", globalReferenceListTool("/interviewer_tags")],
     ["list_candidate_tags", globalReferenceListTool("/candidate_tags")],
