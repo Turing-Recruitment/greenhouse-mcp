@@ -1,0 +1,157 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createRecruiterMcpServer } from "../src/server.js";
+import { RECRUITER_TOOL_DEFINITIONS } from "../src/tools/register.js";
+import type { AuthenticatedSession } from "../src/types.js";
+
+/**
+ * R2c — the catalog is context every recruiter pays for on every call, so it is measured, not
+ * assumed.
+ *
+ * MEASURED BASELINES (this harness: instructions + tools/list through a real McpServer and an
+ * in-memory client, JSON.stringify of the tools array, UTF-8 bytes).
+ *
+ *   before R2  44 mounted tools   99,230 B tools +  4,003 B instructions = 103,233 B (~25.8k tokens)
+ *   before R2  66 registered      148,917 B      +  4,003 B              = 152,920 B (~38.2k tokens)
+ *   after R2a+R2b, 70 tools       159,961 B      +  4,003 B              = 163,964 B (~41.0k tokens)
+ *   after R2c+R2d, 82 tools       (asserted below, against BUDGET_BYTES)
+ *
+ * Where the 66-tool baseline went (measured per parameter name, 619 params over 66 tools):
+ *   created_at + updated_at   35,700 B   the anyOf date-range union on 117 params
+ *   offset + per_page + cursor 32,490 B  one pagination convention, restated 157 times
+ *   scope_handle + job_ids     14,980 B  one scope convention, restated 71 times
+ * i.e. 51% of the catalog was JSON-Schema plumbing repeating three sentences. R2c states each once —
+ * in SERVER_INSTRUCTIONS, which the client reads at initialize — and leaves the per-parameter text as
+ * a pointer rather than a paragraph.
+ */
+
+/**
+ * The ceiling: no growth over the 66-tool catalog this repo already had, after R2b and R2d add
+ * sixteen tools and R2c adds a description to every previously bare parameter.
+ */
+const BUDGET_BYTES = 150_000;
+
+function session(): AuthenticatedSession {
+  return { subject: "google-subject-sam", surface: "test", client: "claude_desktop_chat", tokenId: "recruiter-token-abc123" };
+}
+
+async function measureCatalog(): Promise<{
+  toolCount: number;
+  toolsBytes: number;
+  instructionsBytes: number;
+  totalBytes: number;
+  tools: Array<{ name: string; description?: string; inputSchema?: { properties?: Record<string, unknown> } }>;
+  instructions: string;
+}> {
+  const { server } = createRecruiterMcpServer({
+    session: session(),
+    env: { GREENHOUSE_RECRUITER_ALLOW_TEST_SURFACE: "true" },
+    configureGreenhouse: false,
+    scopedReader: { async scopedRead() { throw new Error("no scoped read in a catalog measurement"); } } as never,
+  });
+  const client = new Client({ name: "r2c-budget", version: "1" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const listed = await client.listTools();
+    const instructions = client.getInstructions() ?? "";
+    const toolsBytes = Buffer.byteLength(JSON.stringify(listed.tools), "utf8");
+    const instructionsBytes = Buffer.byteLength(instructions, "utf8");
+    return {
+      toolCount: listed.tools.length,
+      toolsBytes,
+      instructionsBytes,
+      totalBytes: toolsBytes + instructionsBytes,
+      tools: listed.tools as never,
+      instructions,
+    };
+  } finally {
+    await client.close().catch(() => undefined);
+    await server.close().catch(() => undefined);
+  }
+}
+
+describe("R2c the catalog fits its context budget", () => {
+  it("costs no more than the 66-tool catalog did, while mounting more tools", async () => {
+    const measured = await measureCatalog();
+
+    assert.equal(measured.toolCount, RECRUITER_TOOL_DEFINITIONS.length, "measure the whole mounted catalog");
+    assert.ok(
+      measured.totalBytes <= BUDGET_BYTES,
+      `catalog is ${measured.totalBytes} B (${measured.toolsBytes} B tools + ${measured.instructionsBytes} B instructions) `
+        + `across ${measured.toolCount} tools, over the ${BUDGET_BYTES} B budget. The 66-tool catalog before R2c was `
+        + `152,920 B, so this is growth, not slimming.`
+    );
+    // Instructions ride in the initialize payload, so they are part of the bill, not free.
+    assert.ok(measured.instructionsBytes > 0, "instructions must actually reach the client");
+  });
+
+  /**
+   * The rule is COST, not length. A 269-character clock definition on one analysis front door costs
+   * 269 bytes and prevents a wrong answer; the same 130 characters on 117 date parameters cost 15 KB
+   * and say what SERVER_INSTRUCTIONS already says. Capping description LENGTH would have punished the
+   * first and permitted the second, so the budget is per parameter NAME across the whole catalog —
+   * which is exactly the quantity that blew out before R2c (created_at alone: 17,850 B).
+   */
+  const PER_PARAM_NAME_BUDGET_BYTES = 9_000;
+
+  it("spends no more on any one parameter name than a stated-once convention would", async () => {
+    const measured = await measureCatalog();
+    const bytesByName = new Map<string, { count: number; bytes: number }>();
+    let dateUnions = 0;
+    let totalParams = 0;
+    const bare: string[] = [];
+    for (const tool of measured.tools) {
+      for (const [name, raw] of Object.entries(tool.inputSchema?.properties ?? {})) {
+        const spec = raw as { anyOf?: unknown[]; description?: string };
+        totalParams += 1;
+        if (spec.anyOf) dateUnions += 1;
+        if (!spec.description) bare.push(`${tool.name}.${name}`);
+        const entry = bytesByName.get(name) ?? { count: 0, bytes: 0 };
+        entry.count += 1;
+        entry.bytes += Buffer.byteLength(JSON.stringify({ [name]: spec }), "utf8");
+        bytesByName.set(name, entry);
+      }
+    }
+
+    assert.equal(dateUnions, 0, "the anyOf date-range union is collapsed to one string parameter");
+    assert.deepEqual(
+      bare,
+      [],
+      `${bare.length} of ${totalParams} parameters carry no description at all, so the model has only the `
+        + `name to guess from: ${bare.slice(0, 12).join(", ")}`
+    );
+
+    const overspent = [...bytesByName.entries()]
+      .filter(([, entry]) => entry.bytes > PER_PARAM_NAME_BUDGET_BYTES)
+      .map(([name, entry]) => `${name}: ${entry.bytes} B across ${entry.count} tools`);
+    assert.deepEqual(
+      overspent,
+      [],
+      `a single parameter name is spending more than ${PER_PARAM_NAME_BUDGET_BYTES} B of catalog on its own — `
+        + `almost always a convention restated per-parameter instead of once in SERVER_INSTRUCTIONS: ${overspent.join("; ")}`
+    );
+  });
+
+  it("puts the read conventions before the ~2,048-character client truncation boundary", async () => {
+    const measured = await measureCatalog();
+    // Several clients truncate server instructions around 2 KB. A convention stated after the cut is
+    // a convention the model never reads, which is how the per-parameter restating started.
+    const head = measured.instructions.slice(0, 2048);
+    for (const fragment of [
+      "COMPLETE scoped set",
+      "per_page is a RESULT cap",
+      "next_offset",
+      "2026-04-01..2026-06-30",
+      "scope_handle",
+    ]) {
+      assert.ok(
+        head.includes(fragment),
+        `"${fragment}" falls after the 2,048-character boundary, where a truncating client never sees it`
+      );
+    }
+  });
+});

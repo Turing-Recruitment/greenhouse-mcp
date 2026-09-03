@@ -113,18 +113,19 @@ const resolveJobScopeSchema = {
   query: z.string().optional().describe("Natural-language job or role reference to resolve."),
   greenhouse_job_ids: z.array(z.number().int().positive()).optional().describe("Exact Greenhouse job ids to validate and scope."),
   requisition_ids: z.array(z.string()).optional().describe("Requisition ids to resolve; duplicates return ambiguity."),
-  filters: jobScopeFiltersSchema,
+  filters: jobScopeFiltersSchema.describe("Narrow the candidate requisitions before matching."),
   aliases: z.array(z.string()).optional().describe("Acronyms/aliases to expand (e.g. FDE)."),
   role_families: z.array(z.string()).optional().describe("Role-family phrases to expand."),
-  default_status: z.enum(["open_only", "open_and_draft", "all"]).optional(),
-  max_candidates: z.number().int().positive().optional(),
-  allow_auto_confirm: z.boolean().optional(),
+  default_status: z.enum(["open_only", "open_and_draft", "all"]).optional().describe("Which job statuses to consider when the query names none."),
+  max_candidates: z.number().int().positive().optional().describe("Maximum matching requisitions to propose."),
+  allow_auto_confirm: z.boolean().optional().describe("Let a unique high-confidence match confirm itself without a round trip."),
   purpose: z
     .enum([
       "scorecard_accountability", "interview_feedback_drag", "stage_latency", "pipeline_quality",
       "source_quality", "rejection_reason_drift", "general_question", "comparison", "inventory",
     ])
-    .optional(),
+    .optional()
+    .describe("Which analysis the scope is for; tunes matching and the confirmation bar."),
 };
 
 const confirmJobScopeSchema = {
@@ -132,7 +133,7 @@ const confirmJobScopeSchema = {
   confirmation_token: z.string().describe("confirmation_token returned by resolve_job_scope."),
   decision: z.enum(["confirm_all", "confirm_selected", "reject", "revise"]).describe("Confirmation decision."),
   selected_job_ids: z.array(z.number().int().positive()).optional().describe("Subset of the proposed jobs when decision=confirm_selected; can only narrow."),
-  revised_query: z.string().optional(),
+  revised_query: z.string().optional().describe("Replacement job/role text when decision=revise."),
   acknowledgements: z
     .object({
       acknowledge_partial_inventory: z.boolean().optional(),
@@ -141,7 +142,8 @@ const confirmJobScopeSchema = {
       acknowledge_broad_admin_scope: z.boolean().optional(),
       acknowledge_stale_index: z.boolean().optional(),
     })
-    .optional(),
+    .optional()
+    .describe("Acknowledge the caveats resolve_job_scope raised, so it can confirm."),
 };
 
 const getJobScopeSchema = {

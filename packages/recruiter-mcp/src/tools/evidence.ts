@@ -43,9 +43,7 @@ export function evidenceToolParamsSchema(toolName: string): Record<string, z.Zod
     .int()
     .positive()
     .optional()
-    .describe(
-      "Skip this many rows of the complete scoped set before returning results. Use result_truncated.next_offset from a prior call to page onward (pairs with per_page)."
-    );
+    .describe("Rows to skip; follow result_truncated.next_offset to page onward.");
   // Bridgeable endpoints have NO job_ids filter, so a confirmed requisition scope is otherwise inert on
   // them: application-backed (application_stages/scorecards/rejection_details/notes/attachments) bridge
   // to application_ids (L1); the R2 siblings bridge to their own id filter (scorecard_question_answers ->
@@ -57,15 +55,11 @@ export function evidenceToolParamsSchema(toolName: string): Record<string, z.Zod
     schema.scope_handle = z
       .string()
       .optional()
-      .describe(
-        "Signed scope_handle from resolve_job_scope/confirm_job_scope. When present, this read is auto-bridged to the confirmed scope's ids on this endpoint's own id filter and constrained to them (this endpoint has no job_ids filter). Preferred over job_ids."
-      );
+      .describe("Signed handle from resolve_job_scope; wins over job_ids.");
     schema.job_ids = z
       .string()
       .optional()
-      .describe(
-        "Comma-separated Greenhouse job ids to scope this read to. Validated against your permissions, then auto-bridged to this endpoint's id filter for those jobs. scope_handle wins if both are present."
-      );
+      .describe("Comma-separated Greenhouse job ids to scope this read to.");
   }
   return schema;
 }
@@ -186,47 +180,113 @@ export async function runEvidenceTool(
   return projectEvidenceResult(result, adapter, privateCustomFieldKeys);
 }
 
+/**
+ * R2c: the per-parameter text is a POINTER, not a paragraph.
+ *
+ * Measured on the 66-tool catalog this replaces: 619 parameters cost 109,622 B of JSON Schema, and
+ * three sentences accounted for 83,170 B of it — the date-range blurb on 117 params (41,780 B), the
+ * pagination convention on 157 (32,490 B), and the scope-carrier convention on 71 (14,980 B). Every
+ * recruiter paid for all three on every call, at initialize, before asking anything.
+ *
+ * Each of those conventions is now stated ONCE, in SERVER_INSTRUCTIONS, ahead of the ~2,048-character
+ * boundary several clients truncate at (test/catalog-budget.test.ts asserts both the placement and
+ * the total). What stays here is the field-specific part: which id, which enum, which date.
+ *
+ * The bar for a description below is ~60 characters. That is not terseness for its own sake — a
+ * bare parameter is worse than a short one (the model guesses), and a paragraph is worse than a
+ * sentence (it displaces the answer).
+ */
+const PARAM_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  // Pagination and result shaping. The full convention is in SERVER_INSTRUCTIONS.
+  cursor: "Resume an incomplete read with read.next_cursor.",
+  per_page: "Result cap only; upstream reading is unaffected. Pair with offset.",
+  ids: "Comma-separated ids of the rows this tool returns.",
+  // Filters whose NAME does not say what they mean.
+  active: "Only rows currently active.",
+  current: "Only the row that is current now (not history).",
+  open: "Only open rows.",
+  live: "Only posts currently live on a board.",
+  internal: "Only internal-only rows.",
+  featured: "Only featured posts.",
+  default: "Only the default row.",
+  verified: "Only verified rows.",
+  is_draft: "Only draft rows.",
+  deactivated: "Only deactivated users (departed or disabled).",
+  confidential: "Only confidential requisitions.",
+  current_only: "Only the current version of each offer, not superseded ones.",
+  show_service_accounts: "Include service accounts, which are excluded by default.",
+  private: "Only private candidates.",
+  email: "Exact email address to match.",
+  tag: "Exact candidate tag name to match.",
+  token: "Exact tracking-link slug to match.",
+  primary_email: "Exact work email address to match.",
+  value: "Exact value to match.",
+  status: "Filter to one status.",
+  external_event_id: "Exact calendar event id from the external system.",
+  requisition_id: "Exact requisition id as your org writes it (e.g. REQ-1234).",
+  external_office_id: "Exact office id in your HRIS, not Greenhouse's.",
+  external_department_id: "Exact department id in your HRIS, not Greenhouse's.",
+  bulk_action_uuid: "Exact bulk-request uuid.",
+  related_post_type: "Kind of record the link points at.",
+  source_type: "Kind of blocked source.",
+  email_type: "Greenhouse email type; see the enum for the legal values.",
+  from_type: "Which sender address the template uses.",
+  stage_name: "Exact interview-stage name as configured on the job.",
+  scheduling_type: "How the interview is scheduled.",
+};
+
+/** A last-resort description derived from the parameter's own name and type, so none is ever bare. */
+function derivedParameterDescription(parameter: ParameterSpec): string {
+  const subject = parameter.name.replace(/_ids?$/, "").replace(/_/g, " ");
+  if (parameter.type === "array" || parameter.name.endsWith("_ids")) {
+    return `Comma-separated ${subject} ids to filter by.`;
+  }
+  if (parameter.name.endsWith("_id")) {
+    return `Exact ${subject} id to filter by.`;
+  }
+  if (parameter.type === "boolean") {
+    return `Filter on ${parameter.name.replace(/_/g, " ")}.`;
+  }
+  return `Filter by ${parameter.name.replace(/_/g, " ")}.`;
+}
+
+function describeParameter(parameter: ParameterSpec): string {
+  return PARAM_DESCRIPTIONS[parameter.name] ?? derivedParameterDescription(parameter);
+}
+
 function zodSchemaForParameter(parameter: ParameterSpec): z.ZodTypeAny {
-  if (parameter.name === "cursor") {
+  if (parameter.name === "per_page") {
+    return z.number().int().positive().optional().describe(describeParameter(parameter));
+  }
+  // v3's date filters (created_at/updated_at/resolved_at/sent_on/...) accept bracket ranges upstream.
+  //
+  // The tool boundary takes ONE STRING: an exact ISO value, or the "START..END" shorthand, either
+  // side of which may be empty ("2026-04-01.." is a floor, "..2026-06-30" a ceiling). The read layer
+  // translates the shorthand into v3's bracket params (translateRangeParams, evidence-read.ts), which
+  // is unchanged and still accepts a {gte,lte,gt,lt} OBJECT from the internal callers that build
+  // params directly — recipes and the planner, which do not pass through this schema.
+  //
+  // What the MODEL loses by the collapse is the exclusive bounds (gt/lt), and the reason is measured
+  // rather than hypothetical: advertising the object form to the model cost 357 bytes per date
+  // parameter across 117 of them — 41,780 B, a quarter of the whole catalog — paid by every recruiter
+  // at every initialize, to express "after but not including this instant" on a recruiting window
+  // where the inclusive open-ended form already says what anyone means.
+  if (/(_at|_on)$/.test(parameter.name)) {
     return z
       .string()
       .optional()
-      .describe(
-        "Resume a truncated read: pass read.next_cursor from a prior incomplete response. Not needed on a complete read — one search call returns the complete scoped set."
-      );
-  }
-  if (parameter.name === "per_page") {
-    return z
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .describe("Result cap: return at most this many rows of the complete scoped set (upstream reading is unaffected). Pair with offset to page.");
+      .describe("ISO date-time, or a range 2026-04-01..2026-06-30 (either side may be empty).");
   }
   if (parameter.type === "boolean") {
-    return z.boolean().optional();
+    return z.boolean().optional().describe(describeParameter(parameter));
   }
   if (parameter.enumValues && parameter.enumValues.length > 0) {
-    return z.enum(parameter.enumValues as [string, ...string[]]).optional();
+    // The legal values live in the schema's own enum, where a client renders them. Repeating them in
+    // the description would bill for the list twice.
+    return z.enum(parameter.enumValues as [string, ...string[]]).optional().describe(describeParameter(parameter));
   }
   if (parameter.type === "integer" || parameter.type === "number") {
-    return z.number().int().positive().optional();
+    return z.number().int().positive().optional().describe(describeParameter(parameter));
   }
-  // v3's date filters (created_at/updated_at/resolved_at/sent_on/...) accept bracket ranges
-  // upstream; the tool boundary takes an exact ISO value, a {gte,lte,gt,lt} object, or the
-  // "START..END" shorthand — the read layer translates the last two to bracket params.
-  if (/(_at|_on)$/.test(parameter.name)) {
-    return z
-      .union([
-        z.string(),
-        z
-          .object({ gte: z.string().optional(), lte: z.string().optional(), gt: z.string().optional(), lt: z.string().optional() })
-          .strict(),
-      ])
-      .optional()
-      .describe(
-        'ISO date-time; or a RANGE as {"gte": "...", "lte": "..."} (any of gte/lte/gt/lt) or the string shorthand "2026-04-01..2026-06-30".'
-      );
-  }
-  return z.string().optional();
+  return z.string().optional().describe(describeParameter(parameter));
 }
