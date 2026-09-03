@@ -887,3 +887,287 @@ describe("the privacy tool sets are checked against the registry's endpoints, no
     assert.deepStrictEqual(problems, []);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Third fold, item 1: a DIRECT candidate id is one carrier, not a short circuit
+// ---------------------------------------------------------------------------
+
+/**
+ * A note that names a public candidate directly AND an application belonging to a private one.
+ *
+ * The resolver used to return on the direct association and never look at the sibling, so the row
+ * was handed to an unattested actor on the strength of the public name printed on it while the
+ * application it hangs off pointed at someone they may not see.
+ */
+const DIRECT_PLUS_PARENT: Record<string, Array<Record<string, unknown>>> = {
+  "/candidates": [
+    { id: 501, private: false },
+    { id: 504, private: true },
+  ],
+  "/applications": [{ id: 1004, job_id: 7, candidate_id: 504 }],
+  "/notes": [{ id: 7401, visibility: "public", candidate_id: 501, application_id: 1004 }],
+};
+
+describe("a direct candidate_id is one carrier among the row's carriers, not a short circuit", () => {
+  it("withholds from an unattested ALL-ACCESS actor when a sibling carrier names someone else", async () => {
+    const { scoped } = readerFor({
+      scope: { kind: "all" },
+      raw: rawReader(handlerFor(DIRECT_PLUS_PARENT)),
+    });
+    const result = await scoped.scopedRead(100, "list_notes", {});
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepStrictEqual(rowIds(result.data), []);
+    assert.equal(result.rowCounts.privacyWithheld, 1);
+  });
+
+  it("withholds from an unattested DIRECT OPERATOR too", async () => {
+    const { scoped } = readerFor({
+      scope: { kind: "all" },
+      raw: rawReader(handlerFor(DIRECT_PLUS_PARENT)),
+      operatorActorIds: new Set([900]),
+      attestation: async () => false,
+    });
+    const result = await scoped.scopedRead(900, "list_notes", {});
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepStrictEqual(rowIds(result.data), []);
+    assert.equal(result.rowCounts.privacyWithheld, 1);
+  });
+
+  it("withholds when a sibling carrier cannot be read at all", async () => {
+    const DANGLING: Record<string, Array<Record<string, unknown>>> = {
+      "/candidates": [{ id: 501, private: false }],
+      "/applications": [],
+      "/notes": [{ id: 7401, visibility: "public", candidate_id: 501, application_id: 99999 }],
+    };
+    const { scoped } = readerFor({ scope: { kind: "all" }, raw: rawReader(handlerFor(DANGLING)) });
+    const result = await scoped.scopedRead(100, "list_notes", {});
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepStrictEqual(rowIds(result.data), []);
+  });
+});
+
+/**
+ * The same strictness must NOT reach the job-scope engine. `resolveRowCandidate` is shared: the
+ * privacy gate is a backstop after BOTH engines, so a rule written into the walk unconditionally
+ * would change what a job-scoped recruiter sees when a sibling id dangles — and, through
+ * `PermissionJoinError`, what `action-visibility.ts` lets them write.
+ */
+describe("the job-scope engine's dangling-sibling behaviour is untouched", () => {
+  const ENGINE_DANGLING: Record<string, Array<Record<string, unknown>>> = {
+    "/candidates": [{ id: 501, private: false }],
+    "/applications": [{ id: 1001, job_id: 7, candidate_id: 501 }],
+    "/scorecards": [],
+    // The row filter for an education row reads candidate_id only; the dangling scorecard_id is a
+    // sibling the engine has never consulted.
+    "/candidate_educations": [{ id: 7601, candidate_id: 501, scorecard_id: 99999 }],
+  };
+
+  it("returns the row, and spends no read on the sibling", async () => {
+    const raw = rawReader(handlerFor(ENGINE_DANGLING));
+    const { scoped } = readerFor({ scope: { kind: "jobs", jobIds: new Set([7]) }, raw });
+    const result = await scoped.scopedRead(100, "list_candidate_educations", {});
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepStrictEqual(rowIds(result.data), [7601]);
+    assert.equal(
+      raw.calls.some((call) => call.path === "/scorecards"),
+      false,
+      JSON.stringify(raw.calls.map((call) => call.path))
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Third fold, item 2: the walked jobs must AGREE, not merely overlap
+// ---------------------------------------------------------------------------
+
+describe("carriers that walk to different jobs resolve unresolved, not to their union", () => {
+  it("withholds an interviewer whose interview and scorecard sit on different reqs", async () => {
+    const SPLIT_JOB: Record<string, Array<Record<string, unknown>>> = {
+      "/candidates": [{ id: 504, private: true }],
+      "/applications": [
+        { id: 1047, job_id: 7, candidate_id: 504 },
+        { id: 1048, job_id: 8, candidate_id: 504 },
+      ],
+      "/interviews": [{ id: 2048, application_id: 1048 }],
+      "/scorecards": [{ id: 4047, application_id: 1047 }],
+      "/interviewers": [{ id: 3050, interview_id: 2048, scorecard_id: 4047 }],
+    };
+    const { scoped } = readerFor({
+      scope: { kind: "all", privateCapableJobIds: new Set([7]) },
+      raw: rawReader(handlerFor(SPLIT_JOB)),
+    });
+    const result = await scoped.scopedRead(100, "list_interviewers", {});
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepStrictEqual(rowIds(result.data), []);
+  });
+
+  it("withholds one whose second carrier sits on an EXCLUDED confidential job", async () => {
+    const SPLIT_EXCLUDED: Record<string, Array<Record<string, unknown>>> = {
+      // Public candidate: the withholding here is the job disagreement, not privacy.
+      "/candidates": [{ id: 501, private: false }],
+      "/applications": [
+        { id: 1047, job_id: 7, candidate_id: 501 },
+        { id: 1049, job_id: 9, candidate_id: 501 },
+      ],
+      "/interviews": [{ id: 2049, application_id: 1049 }],
+      "/scorecards": [{ id: 4047, application_id: 1047 }],
+      "/interviewers": [{ id: 3051, interview_id: 2049, scorecard_id: 4047 }],
+    };
+    const { scoped } = readerFor({
+      scope: { kind: "all", excludedJobIds: new Set([9]) },
+      raw: rawReader(handlerFor(SPLIT_EXCLUDED)),
+    });
+    const result = await scoped.scopedRead(100, "list_interviewers", {});
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepStrictEqual(rowIds(result.data), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Third fold, item 3: a SUCCESSFUL batch that answers for nobody
+// ---------------------------------------------------------------------------
+
+describe("a successful parent batch that returns no rows still seeds every id it asked for", () => {
+  it("keeps the call count at the batch ceiling when /scorecards answers 200 with []", async () => {
+    const answers = Array.from({ length: 100 }, (_, index) => ({ id: 40000 + index, scorecard_id: 50000 + index }));
+    const raw = rawReader((path, params) => {
+      if (path === "/scorecard_question_answers" && params?.ids === undefined) return answers;
+      return [];
+    });
+    const { scoped } = readerFor({ scope: { kind: "all" }, raw });
+    const result = await scoped.scopedRead(100, "list_scorecard_question_answers", {});
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepStrictEqual(rowIds(result.data), []);
+    // The page, plus one /scorecards batch per 50 ids. Retrying the absentees one at a time is 103.
+    assert.equal(raw.calls.length, 3, JSON.stringify(raw.calls.map((call) => call.path)));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Third fold, item 4: the 100-row call ceiling, dual-carrier included
+// ---------------------------------------------------------------------------
+
+function pageOf(count: number, build: (index: number) => Record<string, unknown>): Record<string, unknown>[] {
+  return Array.from({ length: count }, (_, index) => build(index));
+}
+
+/** 100 rows, 100 distinct candidates, half of them private. */
+function hundredRowTenant(options: { dualCarrier: boolean }): Record<string, Array<Record<string, unknown>>> {
+  return {
+    "/candidates": pageOf(100, (i) => ({ id: 500 + i, private: i % 2 === 1 })),
+    "/applications": pageOf(100, (i) => ({ id: 1000 + i, job_id: 7, candidate_id: 500 + i })),
+    "/interviews": pageOf(100, (i) => ({ id: 2000 + i, application_id: 1000 + i })),
+    "/scorecards": pageOf(100, (i) => ({ id: 4000 + i, application_id: 1000 + i })),
+    "/scorecard_question_answers": pageOf(100, (i) => ({ id: 5000 + i, scorecard_id: 4000 + i })),
+    "/interviewers": pageOf(100, (i) => ({
+      id: 3000 + i,
+      interview_id: 2000 + i,
+      ...(options.dualCarrier ? { scorecard_id: 4000 + i } : {}),
+    })),
+  };
+}
+
+interface CallCeiling {
+  label: string;
+  toolName: string;
+  dualCarrier: boolean;
+  calls: number;
+  /** The endpoint made to answer 200 with `[]` for every batched `ids=` request. */
+  emptyBatch: string;
+  /** The ceiling when that batch names nobody. Every row is withheld; nothing is retried per id. */
+  emptyBatchCalls: number;
+}
+
+const CALL_CEILINGS: readonly CallCeiling[] = [
+  // The page, plus one /candidates privacy batch per 50 rows.
+  {
+    label: "applications",
+    toolName: "list_applications",
+    dualCarrier: false,
+    calls: 3,
+    emptyBatch: "/candidates",
+    emptyBatchCalls: 3,
+  },
+  // The page, plus /scorecards, /applications and /candidates at two batches each.
+  {
+    label: "answers",
+    toolName: "list_scorecard_question_answers",
+    dualCarrier: false,
+    calls: 7,
+    emptyBatch: "/scorecards",
+    emptyBatchCalls: 3,
+  },
+  {
+    label: "interviewers (interview_id only)",
+    toolName: "list_interviewers",
+    dualCarrier: false,
+    calls: 7,
+    emptyBatch: "/interviews",
+    emptyBatchCalls: 3,
+  },
+  // Two carriers means two endpoints primed at the first hop: nine, not seven. And when the FIRST
+  // carrier's batch names nobody, the row is withheld on that alone — resolving it through the
+  // surviving carrier is the leak item 1 closed, and the 109 calls it took to leak are gone with it.
+  {
+    label: "interviewers (interview_id + scorecard_id)",
+    toolName: "list_interviewers",
+    dualCarrier: true,
+    calls: 9,
+    emptyBatch: "/interviews",
+    emptyBatchCalls: 7,
+  },
+];
+
+describe("a hundred-row page stays at its batch ceiling", () => {
+  for (const ceiling of CALL_CEILINGS) {
+    it(`${ceiling.label}: ${ceiling.calls} calls`, async () => {
+      const raw = rawReader(handlerFor(hundredRowTenant({ dualCarrier: ceiling.dualCarrier })));
+      const { scoped } = readerFor({ scope: { kind: "all" }, raw });
+      const result = await scoped.scopedRead(100, ceiling.toolName, {});
+      assert.equal(result.ok, true);
+      if (!result.ok) return;
+      assert.equal(result.rowCounts.returned, 50, ceiling.label);
+      assert.equal(raw.calls.length, ceiling.calls, JSON.stringify(raw.calls.map((call) => call.path)));
+    });
+
+    it(`${ceiling.label}: ${ceiling.calls} calls with a private-capable role held`, async () => {
+      const raw = rawReader(handlerFor(hundredRowTenant({ dualCarrier: ceiling.dualCarrier })));
+      const { scoped } = readerFor({
+        scope: { kind: "all", privateCapableJobIds: new Set([7]) },
+        raw,
+      });
+      const result = await scoped.scopedRead(100, ceiling.toolName, {});
+      assert.equal(result.ok, true);
+      if (!result.ok) return;
+      assert.equal(result.rowCounts.returned, 100, ceiling.label);
+      assert.equal(raw.calls.length, ceiling.calls, JSON.stringify(raw.calls.map((call) => call.path)));
+    });
+
+    it(`${ceiling.label}: ${ceiling.emptyBatchCalls} calls when ${ceiling.emptyBatch} answers 200 with []`, async () => {
+      const tables = hundredRowTenant({ dualCarrier: ceiling.dualCarrier });
+      const inner = handlerFor(tables);
+      const raw = rawReader((path, params) =>
+        path === ceiling.emptyBatch && params?.ids !== undefined ? [] : inner(path, params)
+      );
+      const { scoped } = readerFor({ scope: { kind: "all" }, raw });
+      const result = await scoped.scopedRead(100, ceiling.toolName, {});
+      assert.equal(result.ok, true);
+      if (!result.ok) return;
+      // Nobody resolves, so nobody is returned — including the dual-carrier rows, whose surviving
+      // carrier must not answer for a sibling nobody could read.
+      assert.equal(result.rowCounts.returned, 0, ceiling.label);
+      assert.equal(
+        raw.calls.length,
+        ceiling.emptyBatchCalls,
+        JSON.stringify(raw.calls.map((call) => call.path))
+      );
+    });
+  }
+});

@@ -261,6 +261,29 @@ interface ScopeContext {
    * when Greenhouse is failing.
    */
   failClosedOnBatchFailure?: boolean;
+  /**
+   * Every carrier on a row must AGREE, and every one of them must be readable.
+   *
+   * Set only on the privacy-only branches, for the same reason `failClosedOnBatchFailure` is. There
+   * a row nobody can pin to one person on one req is withheld — that is the whole verdict, and it
+   * costs the reader one row. Three rules ride on this flag:
+   *
+   *   1. A direct `candidate_id` is ONE carrier, not a short circuit. A note naming a public
+   *      candidate and an `application_id` belonging to a private one was returned on the strength
+   *      of the public name printed on it.
+   *   2. A carrier whose parent cannot be READ makes the row unresolved even when another carrier
+   *      answered. Unknown privacy has never been "not private" on these branches.
+   *   3. The jobs the walk passes through must be ONE job. An interviewer whose interview sat on
+   *      job 8 and whose scorecard sat on job 7 was admitted by a Private role on job 7 alone, and
+   *      the same union let a row on an excluded confidential job ride in on a permitted sibling.
+   *
+   * The scope ENGINES deliberately do not set it. `resolveRowCandidate` is shared — the privacy
+   * gate is a backstop after both engines — so writing these rules in unconditionally would change
+   * what a job-scoped recruiter sees when a sibling id dangles, and, through PermissionJoinError
+   * and `recruiter-mcp/src/action-visibility.ts:147`, what they are allowed to write. Their
+   * long-standing first-carrier-wins resolution and their PERMISSION_JOIN_FAILED denial stand.
+   */
+  strictCarrierResolution?: boolean;
   applicationTerminal: ScopeTerminal;
   applicationCache: Map<number, Promise<Record<string, unknown> | null>>;
   candidateApplicationsCache: Map<number, Promise<Record<string, unknown>[]>>;
@@ -911,6 +934,19 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
       // when they do not). With exclusions there is one further batched job-resolution pass over
       // the page. The window is bounded: from migration 0008 until the operator runs
       // greenhouse-recruiter-attest-private-candidates for each org-wide user.
+      //
+      // Measured, on a hundred-row page of a hundred distinct candidates — the ceiling
+      // `private-candidate-multihop.test.ts` locks, and the same figure whether or not the actor
+      // holds a private-capable role, and whether a parent batch fails, returns `[]` or answers in
+      // full (an id nobody named is seeded rather than retried):
+      //
+      //   list_applications                        3  page + 2 x /candidates
+      //   list_scorecard_question_answers          7  page + 2 each x /scorecards, /applications, /candidates
+      //   list_interviewers (interview_id only)    7  page + 2 each x /interviews, /applications, /candidates
+      //   list_interviewers (+ scorecard_id)       9  two carriers means two endpoints primed at the first hop
+      //
+      // Nine, not seven, is the honest number for a real `/v3/interviewers` row: it carries BOTH
+      // ids, and both have to be walked or the second one is a way past the gate.
       if (permissionScope.kind === "all" && !allAccessAttested) {
         const excludedJobIds = permissionScope.excludedJobIds ?? new Set<number>();
         return withholdUnattestedPrivateCandidates({
@@ -1064,6 +1100,9 @@ function privacyOnlyContext(
     // This branch withholds a row it cannot resolve rather than denying the page, so a failed batch
     // has one answer for every id in it and there is nothing a per-row retry could discover.
     failClosedOnBatchFailure: true,
+    // Same branch, same reason: a row whose carriers disagree, or one of whose carriers cannot be
+    // read, is withheld here rather than resolved by picking whichever carrier answered first.
+    strictCarrierResolution: true,
     privateCapableJobIds: typeof privateCapableJobIds === "function" ? new Set<number>() : privateCapableJobIds,
     ...(typeof privateCapableJobIds === "function"
       ? { resolvePrivateCapableJobIds: privateCapableJobIds }
@@ -1579,6 +1618,14 @@ async function resolveRowCandidate(
   const jobIds = new Set<number>();
   const walked = await walkRowCandidate(row, context, jobIds, 0);
   if (walked.state === "unresolved") return { state: "unresolved" };
+  // Two carriers that walked to DIFFERENT reqs do not describe a row on both of them; they describe
+  // a row whose req is unknown. On the privacy-only branches that is `unresolved` and withheld,
+  // because the two callers of this both spend the answer on a per-job question — "does the actor
+  // hold Private on this row's job", "is this row on a confidential job" — and a union answers yes
+  // to either as soon as ONE walked job qualifies. The engines keep the union: they were already
+  // deciding job scope from it, and narrowing it here would withhold rows from job-scoped
+  // recruiters for a reason unrelated to privacy.
+  if (context.strictCarrierResolution === true && jobIds.size > 1) return { state: "unresolved" };
   if (walked.state === "none") return { state: "none", jobIds };
   return { state: "resolved", candidateId: walked.candidateId, jobIds };
 }
@@ -1588,11 +1635,20 @@ async function resolveRowCandidate(
  *
  * Two carriers naming DIFFERENT candidates is `unresolved` and therefore withheld: a row that is
  * about two people cannot be admitted on the privacy of one of them, and picking the first is how
- * the leak got here. A carrier whose parent cannot be READ is `unresolved` only when nothing else
- * on the record resolved — which is exactly the single-carrier rule this file already applied, kept
- * unchanged. Once another carrier has named the person the row is about, that person's privacy is
- * not unknown, and withholding on a dangling sibling reference would drop rows over a stale id
- * rather than over anyone's privacy.
+ * the leak got here.
+ *
+ * A row's own `candidate_id` is one of those carriers, not a verdict that ends the walk. Returning
+ * on it meant a note that named a public candidate directly AND an `application_id` belonging to a
+ * private one was handed over on the strength of the public name printed on it. It is treated as a
+ * carrier only where `strictCarrierResolution` is set, i.e. on the privacy-only branches; the scope
+ * engines keep the first-carrier-wins resolution they have always had, and pay no extra read for it
+ * (a row that names its candidate still resolves without touching its siblings there).
+ *
+ * A carrier whose parent cannot be READ is likewise `unresolved` under that flag even when another
+ * carrier answered — the row names a record nobody could check, and on a privacy-only branch the
+ * cost of that is one withheld row. Without the flag it stays what it has always been: unresolved
+ * only when nothing else on the record resolved, so a stale sibling id does not drop a row from a
+ * job-scoped recruiter's page.
  *
  * Depth is bounded by the declared hop count, so a cyclic parent shape terminates rather than
  * spinning; the branching is over the four declared carriers, and every parent read goes through
@@ -1604,17 +1660,26 @@ async function walkRowCandidate(
   jobIds: Set<number>,
   depth: number
 ): Promise<RowCandidateWalk> {
+  const strict = context.strictCarrierResolution === true;
   const own = rowOwnJob(record, context.applicationTerminal);
   if (own.state === "resolved") jobIds.add(own.jobId);
 
   const direct = extractAssociatedCandidateId(record);
-  if (direct !== null) return { state: "resolved", candidateId: direct };
-  if (depth >= CANDIDATE_PARENT_HOPS.length) return { state: "unresolved" };
+  if (direct !== null && !strict) return { state: "resolved", candidateId: direct };
+  // The cycle bound. A record that names its candidate answers even here — refusing to would turn
+  // the loop guard into a denial — but no further hop is taken from it.
+  if (depth >= CANDIDATE_PARENT_HOPS.length) {
+    return direct === null ? { state: "unresolved" } : { state: "resolved", candidateId: direct };
+  }
 
   const hops = candidateParentHopsFor(record);
-  if (hops.length === 0) return { state: "none" };
+  if (hops.length === 0) {
+    return direct === null ? { state: "none" } : { state: "resolved", candidateId: direct };
+  }
 
-  let candidateId: number | null = null;
+  // Seeded with the row's own association, so a sibling carrier that walks to somebody else is a
+  // conflict rather than a second opinion nobody compares against.
+  let candidateId: number | null = direct;
   let sawUnresolved = false;
   let conflict = false;
   for (const next of hops) {
@@ -1633,6 +1698,7 @@ async function walkRowCandidate(
     else if (candidateId !== walked.candidateId) conflict = true;
   }
   if (conflict) return { state: "unresolved" };
+  if (strict && sawUnresolved) return { state: "unresolved" };
   if (candidateId !== null) return { state: "resolved", candidateId };
   return sawUnresolved ? { state: "unresolved" } : { state: "none" };
 }
@@ -1859,7 +1925,11 @@ async function primeCandidateParents(
   for (let depth = 0; depth < CANDIDATE_PARENT_HOPS.length && frontier.length > 0; depth += 1) {
     const wanted = new Map<string, Set<number>>();
     for (const row of frontier) {
-      if (extractAssociatedCandidateId(row) !== null) continue;
+      // A record that names its own candidate ends the walk on the scope engines, so its siblings
+      // are never read there and must not be primed. Under `strictCarrierResolution` the walk keeps
+      // going, and skipping here would leave every one of those siblings to a per-row read inside
+      // the decision loop — the N+1 this primer exists to prevent.
+      if (context.strictCarrierResolution !== true && extractAssociatedCandidateId(row) !== null) continue;
       // Every declared carrier, matching the walk: priming only the first left the second hop of a
       // dual-carrier row to a per-row read inside the decision loop.
       for (const next of candidateParentHopsFor(row)) {
@@ -1905,6 +1975,18 @@ async function primeCandidateParents(
           if (id === null || cache.has(id)) continue;
           cache.set(id, Promise.resolve(parent));
           loaded.push(parent);
+        }
+        // A batch can SUCCEED and still answer for nobody — a 200 carrying `[]`, or a page that
+        // names only some of the ids asked for (a deleted parent, one the credential cannot read).
+        // Caching only what came back left every absentee to its own per-id retry of the endpoint
+        // that just declined to name it: a hundred answer rows whose `/scorecards` batch returned
+        // `[]` cost 103 calls. `per_page` is set so a full chunk of 50 always lands in one page, so
+        // an absent id is a real absence and not pagination. Same verdict as a failed batch, and
+        // only on the privacy-only branches, where an unreadable parent withholds ITS row.
+        if (!context.failClosedOnBatchFailure) continue;
+        for (const id of page.ids) {
+          if (cache.has(id)) continue;
+          cache.set(id, Promise.resolve(null));
         }
       }
     }
