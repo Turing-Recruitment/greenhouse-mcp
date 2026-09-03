@@ -277,7 +277,149 @@ describe("production scoped reader configuration", () => {
       _resetClientState();
     }
   });
+  // ---------------------------------------------------------------------------
+  // B19 — the SITE-ADMIN seam, end to end. Nothing else drives it: `isAttested: () => true`
+  //       inside createProductionScopedReader, or deleting the stamp entirely, left the whole
+  //       suite green.
+  // ---------------------------------------------------------------------------
+
+  it("withholds private candidates from an UNATTESTED non-operator site admin, and returns them once attested", async () => {
+    for (const attested of [false, true]) {
+      const originalFetch = globalThis.fetch;
+      const calls: string[] = [];
+      globalThis.fetch = fakeSiteAdminGreenhouseFetch(calls, { attested, privateCandidateIds: new Set([502]) });
+      try {
+        _resetClientState();
+        configureGreenhouseFromEnv({
+          GREENHOUSE_CLIENT_ID: "client-id",
+          GREENHOUSE_CLIENT_SECRET: "client-secret",
+        } as NodeJS.ProcessEnv);
+        const reader = createProductionScopedReader(identityDirectoryForUser(903), {
+          // No OPERATOR_ACTOR_IDS: this actor reaches `all` through /v3/users.site_admin, which is
+          // the production path for Kelsey and Eduardo and the one nothing tested.
+          ...ATTESTED_DIRECTORY_ENV,
+          GREENHOUSE_RECRUITER_PERMISSION_TTL_MS: attested ? "0" : "1",
+          GREENHOUSE_RECRUITER_READ_CACHE_DISABLED: "true",
+        } as NodeJS.ProcessEnv);
+
+        const result = await reader.scopedRead(testSession(), "list_applications", {});
+
+        assert.equal(result.ok, true);
+        if (!result.ok) return;
+        assert.equal(
+          calls.some((url) => url.includes("/rest/v1/recruiter_identity_directory")),
+          true,
+          "the stamp must reach the directory for a site admin, not only for an operator"
+        );
+        if (attested) {
+          assert.deepEqual(result.data, [
+            { id: 1, jobs: [{ id: 111 }], candidate_id: 501 },
+            { id: 2, jobs: [{ id: 222 }], candidate_id: 502 },
+          ]);
+          assert.deepEqual(result.permissionScope, { kind: "all", permittedJobCount: null });
+          assert.equal(result.scoped, false);
+        } else {
+          assert.deepEqual(result.data, [{ id: 1, jobs: [{ id: 111 }], candidate_id: 501 }],
+            "candidate 502 is private and nobody has attested this admin's Greenhouse permission");
+          assert.deepEqual(result.permissionScope, {
+            kind: "all",
+            permittedJobCount: null,
+            privateCandidatesWithheld: true,
+          });
+          assert.equal(result.scoped, true);
+          assert.equal(result.rowCounts.privacyWithheld, 1);
+        }
+      } finally {
+        globalThis.fetch = originalFetch;
+        _resetClientState();
+      }
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // B22 — the attestation memo. Forcing its TTL to an hour used to leave the suite green.
+  // ---------------------------------------------------------------------------
+
+  it("passes the attestation lookup straight through at TTL 0, and caches it above zero", async () => {
+    for (const [ttl, expectedDirectoryReads] of [["0", 2], ["120000", 1]] as const) {
+      const originalFetch = globalThis.fetch;
+      const calls: string[] = [];
+      globalThis.fetch = fakeGreenhouseFetch(calls, { attested: true });
+      try {
+        _resetClientState();
+        configureGreenhouseFromEnv({
+          GREENHOUSE_CLIENT_ID: "client-id",
+          GREENHOUSE_CLIENT_SECRET: "client-secret",
+        } as NodeJS.ProcessEnv);
+        const reader = createProductionScopedReader(identityDirectoryForUser(900), {
+          OPERATOR_ACTOR_IDS: "900",
+          ...ATTESTED_DIRECTORY_ENV,
+          // A TTL no other case uses, so this gets its own entry in the module-scoped registries.
+          GREENHOUSE_RECRUITER_PERMISSION_TTL_MS: ttl === "0" ? "0" : "120000",
+          GREENHOUSE_RECRUITER_IDENTITY_TABLE: `memo_probe_${ttl}`,
+          GREENHOUSE_RECRUITER_READ_CACHE_DISABLED: "true",
+        } as NodeJS.ProcessEnv);
+
+        await reader.scopedRead(testSession(), "list_applications", {});
+        await reader.scopedRead(testSession(), "list_applications", {});
+
+        assert.equal(
+          countCalls(calls, `/rest/v1/memo_probe_${ttl}`),
+          expectedDirectoryReads,
+          ttl === "0"
+            ? "production forces TTL 0, and an attestation cleared by the CLI must be observed on the very next read"
+            : "above zero the attestation ages on the same clock as the permission scope it decides"
+        );
+      } finally {
+        globalThis.fetch = originalFetch;
+        _resetClientState();
+      }
+    }
+  });
 });
+
+/**
+ * A tenant where actor 903 is a SITE ADMIN — no /user_job_permissions rows, `site_admin: true` on
+ * /v3/users, and no confidential jobs — which is how the production all-access path is actually
+ * reached by everyone except the one operator id.
+ */
+function fakeSiteAdminGreenhouseFetch(
+  calls: string[],
+  directory: { attested: boolean; privateCandidateIds?: ReadonlySet<number> }
+): typeof fetch {
+  return async (input) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    calls.push(url);
+
+    if (url.includes("/rest/v1/recruiter_identity_directory")) {
+      return jsonResponse([{ private_candidates_attested: directory.attested }]);
+    }
+    if (url === "https://auth.greenhouse.io/token") {
+      return jsonResponse({
+        access_token: "test-access-token",
+        expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+      });
+    }
+
+    const parsed = new URL(url);
+    if (parsed.pathname === "/v3/users") {
+      return jsonResponse([{ id: 903, site_admin: true, deactivated: false }]);
+    }
+    if (parsed.pathname === "/v3/jobs") return jsonResponse([]);
+    if (parsed.pathname === "/v3/user_job_permissions") return jsonResponse([]);
+    if (parsed.pathname === "/v3/user_roles") return jsonResponse([]);
+    if (parsed.pathname === "/v3/applications") {
+      return jsonResponse([
+        { id: 1, jobs: [{ id: 111 }], candidate_id: 501 },
+        { id: 2, jobs: [{ id: 222 }], candidate_id: 502 },
+      ]);
+    }
+    if (parsed.pathname === "/v3/candidates") {
+      return jsonResponse(candidatePrivacyRows(parsed, directory.privateCandidateIds));
+    }
+    return new Response("not found", { status: 404 });
+  };
+}
 
 function identityDirectoryForUser(greenhouseUserId: number) {
   return createStaticIdentityDirectory([

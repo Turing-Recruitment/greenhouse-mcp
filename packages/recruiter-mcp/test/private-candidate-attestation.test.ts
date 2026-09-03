@@ -11,7 +11,12 @@ import {
 import { createHarvestPermissionProvider, type PermissionLookupResult, type RawReadClient } from "../../scoped-core/src/index.js";
 import { createSiteAdminAwarePermissionProvider } from "../src/site-admin-permission.js";
 import { buildIdentityBootstrapPlan } from "../src/identity-bootstrap.js";
-import { applyIdentityReconciliationPlan, buildIdentityReconciliationPlan } from "../src/identity-reconciliation.js";
+import { createOauthEnrollment } from "../src/oauth-enroll.js";
+import {
+  applyIdentityReconciliationPlan,
+  buildIdentityReconciliationPlan,
+  fetchResolvedDirectoryRows,
+} from "../src/identity-reconciliation.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIGRATION = join(HERE, "../supabase/migrations/0008_private_candidate_attestation.sql");
@@ -213,16 +218,15 @@ describe("B13: the permission-provider attestation stamp", () => {
 
   it("leaves a job-scoped answer untouched and never asks for an attestation", async () => {
     let asked = 0;
-    const raw = rawReader((path, params) => {
-      if (path === "/users") return [{ id: 100, site_admin: false }];
-      if (path === "/user_job_permissions") return String(params?.user_ids) === "100" ? [{ user_id: 100, job_id: 3 }] : [];
-      return [];
-    });
-    const base = createHarvestPermissionProvider({ rawReader: raw });
-    const chained = createSiteAdminAwarePermissionProvider({ base, rawReader: raw });
+    // The chain's exact object, so the assertion below is identity rather than a disjunction that
+    // both a Set and a `{kind:"jobs"}` object satisfy — the shape a stamp that rebuilt the answer
+    // would also satisfy.
+    const chainAnswer: PermissionLookupResult = { kind: "jobs", jobIds: new Set([3]) };
+    const chained = { async getPermittedJobIds(): Promise<PermissionLookupResult> { return chainAnswer; } };
+    const base = { async getPermittedJobIds(): Promise<PermissionLookupResult> { return chainAnswer; } };
     const stamp = createPrivateCandidateAttestationStamp({ chained, base, isAttested: async () => { asked += 1; return true; } });
     const scope = await stamp.getPermittedJobIds(100);
-    assert.ok(scope instanceof Set || (scope as { kind?: string }).kind === "jobs");
+    assert.strictEqual(scope, chainAnswer, "a non-all answer is handed back untouched, not rebuilt");
     assert.equal(asked, 0, "a job-scoped actor has no org-wide grant to attest");
   });
 
@@ -259,13 +263,40 @@ describe("B10: identity writers and the attestation columns", () => {
     }
   });
 
-  it("the oauth enrollment insert carries none of the three columns — a new enrollment takes the database default", () => {
-    // Enrollment inserts exactly the bootstrap row shape (oauth-enroll.ts builds it through
-    // buildIdentityBootstrapPlan and POSTs `entry.row`), so the assertion above is the same lock;
-    // this one holds the source-level fact that nothing else is added on the enrollment path.
-    const source = readFileSync(join(HERE, "../src/oauth-enroll.ts"), "utf8");
+  it("the oauth enrollment insert carries none of the three columns — a new enrollment takes the database default", async () => {
+    // Asserted on the PAYLOAD the enrollment actually POSTs, through a fake directory. The previous
+    // version grepped oauth-enroll.ts for the column names, which would have passed just as
+    // happily if the enrollment had started writing them through a variable.
+    const posted: Array<Record<string, unknown>> = [];
+    const fetchImpl = (async (input: URL | string, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if ((init.method ?? "GET") === "POST" && url.pathname.includes("recruiter_identity_directory")) {
+        const body = JSON.parse(String(init.body)) as unknown;
+        for (const row of Array.isArray(body) ? body : [body]) posted.push(row as Record<string, unknown>);
+        return jsonResponse([{ greenhouse_user_id: 5085047004 }], 201);
+      }
+      return jsonResponse([]);
+    }) as unknown as typeof fetch;
+
+    const enrollment = createOauthEnrollment({
+      readUsersByPrimaryEmail: async () => [{ id: 5085047004, primary_email: "new@turing.com" }],
+      readFullRoster: async () => ({ users: [], complete: true }),
+      directory: {
+        supabaseUrl: SUPABASE_URL,
+        apiKey: "test-service-role-key",
+        table: "recruiter_identity_directory",
+        timeoutMs: 5_000,
+        fetchImpl,
+      },
+      allowedDomains: ["turing.com"],
+      disabled: false,
+    });
+    const outcome = await enrollment.enroll("new@turing.com");
+
+    assert.equal(outcome.status, "enrolled", JSON.stringify(outcome));
+    assert.equal(posted.length, 1, "the enrollment must have inserted exactly one directory row");
     for (const column of PRIVATE_CANDIDATE_ATTESTATION_COLUMNS) {
-      assert.ok(!source.includes(column), `oauth-enroll.ts must not write ${column}`);
+      assert.ok(!(column in posted[0]!), `a new enrollment must take the database default for ${column}, not set it`);
     }
   });
 
@@ -292,8 +323,254 @@ describe("B10: identity writers and the attestation columns", () => {
     assert.equal(bodies[0]!.private_candidates_attested_at, null);
     assert.equal(
       bodies[0]!.private_candidates_attested_by,
-      "identity_directory_reconciliation:revoke",
-      "a deprovisioned recruiter's attestation is cleared, and the clearing names its cause"
+      null,
+      "the column names the OPERATOR who attested, so clearing it writes null — the cause is recorded " +
+        "in evidence_detail, where the rest of the deprovisioning provenance already lives"
     );
+    assert.deepEqual(bodies[0]!.evidence_detail, {
+      source: "identity_directory_reconciliation",
+      action: "revoke",
+      reason: "Greenhouse user is deactivated in the roster.",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B21 — the base provider runs ONCE per stamp, and the site-admin path stops
+//       discarding its private-capable answer
+// ---------------------------------------------------------------------------
+
+describe("B21: one base-provider sweep per stamp", () => {
+  function countingChain(rows: {
+    users: unknown[];
+    jobs?: unknown[];
+    permissions: unknown[];
+    roles?: unknown[];
+  }) {
+    const sweeps: string[] = [];
+    const raw = rawReader((path, params) => {
+      if (path === "/users") return rows.users;
+      if (path === "/jobs") return rows.jobs ?? [];
+      if (path === "/user_job_permissions") {
+        sweeps.push(String(params?.user_ids ?? "cursor"));
+        return rows.permissions;
+      }
+      if (path === "/user_roles") return rows.roles ?? [];
+      return [];
+    });
+    const base = createHarvestPermissionProvider({ rawReader: raw });
+    return { sweeps, base, chained: createSiteAdminAwarePermissionProvider({ base, rawReader: raw }) };
+  }
+
+  it("sweeps /user_job_permissions once for an unattested site admin with confidential jobs", async () => {
+    const { sweeps, base, chained } = countingChain({
+      users: [{ id: 100, site_admin: true, deactivated: false }],
+      jobs: [{ id: 42, confidential: true }],
+      permissions: [{ user_id: 100, job_id: 7, role_id: 900 }],
+      roles: [{ id: 900, name: "Private", role_type: "job_admin" }],
+    });
+    const stamp = createPrivateCandidateAttestationStamp({ chained, base, isAttested: async () => false });
+    const scope = await stamp.getPermittedJobIds(100) as {
+      kind: string;
+      excludedJobIds?: ReadonlySet<number>;
+      privateCapableJobIds?: ReadonlySet<number>;
+    };
+
+    assert.equal(scope.kind, "all");
+    assert.deepEqual([...(scope.excludedJobIds ?? [])], [42]);
+    assert.deepEqual([...(scope.privateCapableJobIds ?? [])], [7]);
+    assert.equal(sweeps.length, 1,
+      "the site-admin wrapper already read the grants for the confidential check; the stamp must reuse that answer");
+  });
+
+  it("carries the private-capable jobs the site-admin wrapper resolved, without a second sweep", async () => {
+    const { sweeps, base, chained } = countingChain({
+      users: [{ id: 100, site_admin: true, deactivated: false }],
+      jobs: [{ id: 42, confidential: true }],
+      permissions: [{ user_id: 100, job_id: 7, role_id: 900 }],
+      roles: [{ id: 900, name: "Private", role_type: "job_admin" }],
+    });
+    const chainedScope = await chained.getPermittedJobIds(100) as { privateCapableJobIds?: ReadonlySet<number> };
+    assert.deepEqual([...(chainedScope.privateCapableJobIds ?? [])], [7],
+      "the wrapper widens the actor to `all` and used to throw the private-capable answer away");
+    assert.equal(sweeps.length, 1);
+    void base;
+  });
+
+  it("keeps the private-capable jobs behind an all-jobs role marker without asking base twice", async () => {
+    const { sweeps, base, chained } = countingChain({
+      users: [{ id: 100, site_admin: false }],
+      permissions: [
+        { user_id: 100, role: { name: "All Jobs" } },
+        { user_id: 100, job_id: 7, role_id: 900 },
+      ],
+      roles: [{ id: 900, name: "Private", role_type: "job_admin" }],
+    });
+    const stamp = createPrivateCandidateAttestationStamp({ chained, base, isAttested: async () => false });
+    const scope = await stamp.getPermittedJobIds(100) as {
+      kind: string;
+      privateCapableJobIds?: ReadonlySet<number>;
+    };
+    assert.equal(scope.kind, "all");
+    assert.deepEqual([...(scope.privateCapableJobIds ?? [])], [7]);
+    assert.equal(sweeps.length, 1, "the marker answer already carries the grants; a second base call is pure cost");
+  });
+
+  it("asks base at most once when the chain answered `all` with nothing to reuse", async () => {
+    let baseCalls = 0;
+    const chained = { async getPermittedJobIds(): Promise<PermissionLookupResult> { return { kind: "all" }; } };
+    const base = {
+      async getPermittedJobIds(): Promise<PermissionLookupResult> {
+        baseCalls += 1;
+        return { kind: "jobs", jobIds: new Set([7]), privateCapableJobIds: new Set([7]) };
+      },
+    };
+    const stamp = createPrivateCandidateAttestationStamp({ chained, base, isAttested: async () => false });
+    const scope = await stamp.getPermittedJobIds(100) as { privateCapableJobIds?: ReadonlySet<number> };
+    assert.deepEqual([...(scope.privateCapableJobIds ?? [])], [7]);
+    assert.equal(baseCalls, 1);
+  });
+
+  it("costs no base call at all for an ATTESTED actor", async () => {
+    let baseCalls = 0;
+    const chained = { async getPermittedJobIds(): Promise<PermissionLookupResult> { return { kind: "all" }; } };
+    const base = {
+      async getPermittedJobIds(): Promise<PermissionLookupResult> {
+        baseCalls += 1;
+        return new Set<number>();
+      },
+    };
+    const stamp = createPrivateCandidateAttestationStamp({ chained, base, isAttested: async () => true });
+    await stamp.getPermittedJobIds(100);
+    assert.equal(baseCalls, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B22 — the deprovision PATCH survives an unmigrated table, and keeps the
+//       provenance of the attestation it clears
+// ---------------------------------------------------------------------------
+
+describe("B22: deprovisioning against a table migration 0008 has not reached", () => {
+  function planFor(row: Record<string, unknown> = {}) {
+    return buildIdentityReconciliationPlan({
+      directoryRows: [
+        {
+          greenhouseUserId: 5085047004,
+          primaryEmail: "gone@turing.com",
+          status: "resolved",
+          ...row,
+        } as never,
+      ],
+      greenhouseUsers: [{ id: 5085047004, primary_email: "gone@turing.com", deactivated: true }],
+      rosterComplete: true,
+      rosterAsOf: "2026-09-03T00:00:00.000Z",
+    });
+  }
+
+  it("retries without the attestation columns and still deactivates the row", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const report = await applyIdentityReconciliationPlan(planFor(), {
+      supabaseUrl: SUPABASE_URL,
+      apiKey: "test-service-role-key",
+      appliedAt: "2026-09-03T00:00:00.000Z",
+      fetchImpl: (async (_input: unknown, init: RequestInit) => {
+        if (init?.method !== "PATCH") return jsonResponse([]);
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        bodies.push(body);
+        if ("private_candidates_attested" in body) {
+          return new Response(
+            JSON.stringify({ code: "PGRST204", message: "Could not find the 'private_candidates_attested' column" }),
+            { status: 400, headers: { "content-type": "application/json" } }
+          );
+        }
+        return jsonResponse([]);
+      }) as unknown as typeof fetch,
+    });
+
+    assert.equal(bodies.length, 2, "the first PATCH names the new columns; the retry drops them");
+    assert.deepEqual(Object.keys(bodies[1]!).sort(), ["evidence_detail", "last_verified_at", "status"]);
+    assert.equal(report.oauthRevocations.length, 1,
+      "the OAuth sweep must still run — aborting on the first 400 left the session alive, which is fail-OPEN");
+    assert.equal(report.entries?.[0]?.attestationCleared, false);
+  });
+
+  it("reports attestationCleared true on the ordinary path", async () => {
+    const report = await applyIdentityReconciliationPlan(planFor(), {
+      supabaseUrl: SUPABASE_URL,
+      apiKey: "test-service-role-key",
+      appliedAt: "2026-09-03T00:00:00.000Z",
+      fetchImpl: (async () => jsonResponse([])) as unknown as typeof fetch,
+    });
+    assert.equal(report.entries?.[0]?.attestationCleared, true);
+  });
+
+  it("still throws, with the response body, on a 400 that is not a missing column", async () => {
+    await assert.rejects(
+      () =>
+        applyIdentityReconciliationPlan(planFor(), {
+          supabaseUrl: SUPABASE_URL,
+          apiKey: "test-service-role-key",
+          fetchImpl: (async (_input: unknown, init: RequestInit) =>
+            init?.method === "PATCH"
+              ? new Response(JSON.stringify({ code: "23505", message: "duplicate key" }), { status: 400 })
+              : jsonResponse([])) as unknown as typeof fetch,
+        }),
+      /duplicate key/
+    );
+  });
+
+  it("nulls the attested_by column and preserves the prior attestation as evidence", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    await applyIdentityReconciliationPlan(
+      planFor({
+        privateCandidatesAttested: true,
+        privateCandidatesAttestedAt: "2026-09-01T10:00:00.000Z",
+        privateCandidatesAttestedBy: "Sam Vangelos (attested 2026-09-01)",
+      }),
+      {
+        supabaseUrl: SUPABASE_URL,
+        apiKey: "test-service-role-key",
+        appliedAt: "2026-09-03T00:00:00.000Z",
+        fetchImpl: (async (_input: unknown, init: RequestInit) => {
+          if (init?.method === "PATCH") bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+          return jsonResponse([]);
+        }) as unknown as typeof fetch,
+      }
+    );
+    assert.equal(bodies[0]!.private_candidates_attested, false);
+    assert.equal(bodies[0]!.private_candidates_attested_at, null);
+    assert.equal(bodies[0]!.private_candidates_attested_by, null,
+      "migration 0008 documents attested_by as null when unattested, and the CLI's --clear writes null");
+    assert.deepEqual((bodies[0]!.evidence_detail as Record<string, unknown>).priorAttestation, {
+      attested: true,
+      at: "2026-09-01T10:00:00.000Z",
+      by: "Sam Vangelos (attested 2026-09-01)",
+    });
+  });
+
+  it("reads the three columns in the plan select, and falls back when they do not exist", async () => {
+    const selects: string[] = [];
+    const rows = await fetchResolvedDirectoryRows({
+      supabaseUrl: SUPABASE_URL,
+      apiKey: "test-service-role-key",
+      fetchImpl: (async (input: unknown) => {
+        const select = new URL(String(input)).searchParams.get("select") ?? "";
+        selects.push(select);
+        if (select.includes("private_candidates_attested")) {
+          return new Response(
+            JSON.stringify({ code: "42703", message: 'column "private_candidates_attested" does not exist' }),
+            { status: 400, headers: { "content-type": "application/json" } }
+          );
+        }
+        return jsonResponse([
+          { greenhouse_user_id: 1, primary_email: "a@turing.com", status: "resolved" },
+        ]);
+      }) as unknown as typeof fetch,
+    });
+    assert.equal(selects.length, 2);
+    assert.ok(selects[0]!.includes("private_candidates_attested"));
+    assert.ok(!selects[1]!.includes("private_candidates_attested"));
+    assert.equal(rows.length, 1);
   });
 });

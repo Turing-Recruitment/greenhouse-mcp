@@ -132,7 +132,14 @@ export function createPrivateCandidateAttestationLookup(
   const warnOnce = (failureClass: string, detail: string): void => {
     if (warnedClasses.has(failureClass)) return;
     warnedClasses.add(failureClass);
-    warn(`[private-candidate-attestation] ${failureClass}: ${detail} — treating org-wide actors as unattested.`);
+    try {
+      warn(`[private-candidate-attestation] ${failureClass}: ${detail} — treating org-wide actors as unattested.`);
+    } catch (error) {
+      // A logger that throws must not become a read failure. This function's whole contract is
+      // "never rejects", and it is called from inside the permission path — a console replaced by a
+      // transport that raises on a closed stream would otherwise turn a diagnostic into an outage
+      // on every scoped read. The class is already marked, so the throw is not retried either.
+    }
   };
 
   if (access === null) {
@@ -187,9 +194,16 @@ export function createPrivateCandidateAttestationLookup(
       return false;
     }
     if (body.length !== 1) {
-      // Zero rows is the ordinary answer for an actor with no directory row and needs no warning
-      // beyond its class; two rows is a directory defect worth surfacing.
-      if (body.length > 1) warnOnce("duplicate_rows", "more than one resolved row matched this Greenhouse user id");
+      if (body.length > 1) {
+        warnOnce("duplicate_rows", "more than one resolved row matched this Greenhouse user id");
+      } else {
+        // Zero rows is a failure class of its own, and it is the QUIET one: the actor reads
+        // everything except private candidates, forever, and nothing in the envelope says why. It
+        // happens when the id is not in the directory at all, and — the case that actually bites —
+        // when the row is there but not `resolved`. Warned once per process like the rest, so the
+        // silent withhold is diagnosable without a log flood.
+        warnOnce("missing_row", "no resolved directory row matched this Greenhouse user id");
+      }
       return false;
     }
     const row = body[0] as Record<string, unknown> | null;
@@ -250,7 +264,12 @@ export function createPrivateCandidateAttestationStamp(
       if (await options.isAttested(greenhouseUserId, signal)) {
         return { ...scope, privateCandidatesAttested: true };
       }
-      const privateCapableJobIds = await explicitPrivateCapableJobIds(options.base, greenhouseUserId, signal);
+      const privateCapableJobIds = await explicitPrivateCapableJobIds(
+        options.base,
+        scope,
+        greenhouseUserId,
+        signal
+      );
       return {
         ...scope,
         privateCandidatesAttested: false,
@@ -268,15 +287,26 @@ function isAllAccessScope(value: unknown): value is PermissionScope & { kind: "a
  * The jobs this actor holds through a private-capable Greenhouse role, read from their EXPLICIT
  * per-job grants.
  *
- * Fails soft to `undefined`: if the base provider cannot answer, no job is treated as
- * private-capable and the unattested actor sees no private candidates at all, which is the same
- * direction every other failure in this layer takes. It can only under-grant, never over-grant.
+ * The chain's own answer is consulted FIRST, and it usually has one. The site-admin wrapper reads
+ * `/user_job_permissions` for the confidential-job check and now carries the private-capable subset
+ * of those grants forward; the base provider's all-jobs marker path resolves them in the same sweep
+ * it was already paginating. Calling base again to recover what the chain just fetched cost a
+ * duplicated `/user_job_permissions` pagination (plus a `/user_roles` read) on EVERY unattested
+ * all-access answer, on a TTL production forces to zero.
+ *
+ * Fails soft to `undefined`: if neither the chain nor the base provider can answer, no job is
+ * treated as private-capable and the unattested actor sees no private candidates at all, which is
+ * the same direction every other failure in this layer takes. It can only under-grant.
  */
 async function explicitPrivateCapableJobIds(
   base: PermissionProviderLike,
+  chainedScope: PermissionScope & { kind: "all" },
   greenhouseUserId: number,
   signal?: AbortSignal
 ): Promise<ReadonlySet<number> | undefined> {
+  if (chainedScope.privateCapableJobIds !== undefined) {
+    return new Set(chainedScope.privateCapableJobIds);
+  }
   let granted: unknown;
   try {
     granted = await base.getPermittedJobIds(greenhouseUserId, signal);
@@ -284,8 +314,11 @@ async function explicitPrivateCapableJobIds(
     if (signal?.aborted) throw signal.reason;
     return undefined;
   }
-  if (!isRecord(granted) || granted.kind !== "jobs") return undefined;
-  const privateCapable = (granted as Extract<PermissionScope, { kind: "jobs" }>).privateCapableJobIds;
+  if (!isRecord(granted)) return undefined;
+  // Either shape can carry it now: `jobs` for an ordinary per-job actor, `all` when the base
+  // provider's own all-jobs marker fired and it resolved the explicit roles alongside it.
+  if (granted.kind !== "jobs" && granted.kind !== "all") return undefined;
+  const privateCapable = (granted as Extract<PermissionScope, { kind: "jobs" | "all" }>).privateCapableJobIds;
   return privateCapable === undefined ? undefined : new Set(privateCapable);
 }
 

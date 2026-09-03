@@ -2,12 +2,9 @@ import {
   PRIVATE_CANDIDATES_ATTESTED_AT_COLUMN,
   PRIVATE_CANDIDATES_ATTESTED_BY_COLUMN,
   PRIVATE_CANDIDATES_ATTESTED_COLUMN,
+  readPrivateCandidateAttestationAccess,
+  type PrivateCandidateAttestationAccess,
 } from "./private-candidate-attestation.js";
-import {
-  assertCanonicalSupabaseProjectRef,
-  normalizeOptionalSupabaseIdentifier,
-  normalizeSupabaseApiKey,
-} from "./supabase-config.js";
 
 // greenhouse-recruiter-attest-private-candidates: record (or withdraw) the operator's attestation
 // that Greenhouse grants a user the org-wide "Can create and view private candidates" permission
@@ -95,39 +92,38 @@ export function parseAttestPrivateCandidatesArgs(args: string[]): AttestPrivateC
   };
 }
 
-interface DirectoryAccess {
-  baseUrl: string;
-  apiKey: string;
-  table: string;
-}
+type DirectoryAccess = PrivateCandidateAttestationAccess;
 
+/**
+ * Resolved through the SAME reader the runtime lookup uses.
+ *
+ * The writer and the reader have to agree about which table, which id column and which status value
+ * the attestation lives under, and the directory supports overriding all three
+ * (`GREENHOUSE_RECRUITER_IDENTITY_*`). This CLI used to hard-code `greenhouse_user_id`, `status` and
+ * `resolved`, so on any directory configured with an override the PATCH matched nothing, the
+ * "exactly one row" check would have caught it — but only after the operator had been told which
+ * columns to set on a row the tool could not find.
+ */
 function readAccess(env: NodeJS.ProcessEnv): DirectoryAccess {
-  const supabaseUrl = env.GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_URL;
-  const apiKey = env.GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_KEY;
-  if (!supabaseUrl || !apiKey) {
+  const access = readPrivateCandidateAttestationAccess(env);
+  if (!access) {
     throw new Error(
       "Set GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_URL and GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_KEY to attest private-candidate access."
     );
   }
-  return {
-    baseUrl: assertCanonicalSupabaseProjectRef(supabaseUrl, "Supabase identity directory"),
-    apiKey: normalizeSupabaseApiKey(apiKey, "Supabase identity directory"),
-    table: normalizeOptionalSupabaseIdentifier(
-      env.GREENHOUSE_RECRUITER_IDENTITY_TABLE,
-      "recruiter_identity_directory",
-      "Supabase identity directory table"
-    ),
-  };
+  return access;
 }
 
-const SELECTED_COLUMNS = [
-  "greenhouse_user_id",
-  "primary_email",
-  "status",
-  PRIVATE_CANDIDATES_ATTESTED_COLUMN,
-  PRIVATE_CANDIDATES_ATTESTED_AT_COLUMN,
-  PRIVATE_CANDIDATES_ATTESTED_BY_COLUMN,
-].join(",");
+function selectedColumns(access: DirectoryAccess): string {
+  return [
+    access.greenhouseUserIdColumn,
+    "primary_email",
+    access.statusColumn,
+    PRIVATE_CANDIDATES_ATTESTED_COLUMN,
+    PRIVATE_CANDIDATES_ATTESTED_AT_COLUMN,
+    PRIVATE_CANDIDATES_ATTESTED_BY_COLUMN,
+  ].join(",");
+}
 
 async function readRows(
   access: DirectoryAccess,
@@ -169,15 +165,15 @@ export async function attestPrivateCandidates(
     const matches = await readRows(
       access,
       fetchImpl,
-      [["primary_email", `eq.${parsed.email}`], ["status", "eq.resolved"]],
-      "greenhouse_user_id,primary_email,status"
+      [["primary_email", `eq.${parsed.email}`], [access.statusColumn, `eq.${access.resolvedStatus}`]],
+      [access.greenhouseUserIdColumn, "primary_email", access.statusColumn].join(",")
     );
     if (matches.length !== 1) {
       throw new Error(
         `--email ${parsed.email} matched ${matches.length} resolved rows; pass --greenhouse-user-id to name exactly one.`
       );
     }
-    const id = matches[0]!.greenhouse_user_id;
+    const id = matches[0]![access.greenhouseUserIdColumn];
     greenhouseUserId = typeof id === "number" ? id : Number.parseInt(String(id), 10);
     if (!Number.isSafeInteger(greenhouseUserId) || greenhouseUserId <= 0) {
       throw new Error(`--email ${parsed.email} resolved to an unusable greenhouse_user_id.`);
@@ -185,10 +181,10 @@ export async function attestPrivateCandidates(
   }
 
   const filters: Array<[string, string]> = [
-    ["greenhouse_user_id", `eq.${greenhouseUserId}`],
-    ["status", "eq.resolved"],
+    [access.greenhouseUserIdColumn, `eq.${greenhouseUserId}`],
+    [access.statusColumn, `eq.${access.resolvedStatus}`],
   ];
-  const beforeRows = await readRows(access, fetchImpl, filters, SELECTED_COLUMNS);
+  const beforeRows = await readRows(access, fetchImpl, filters, selectedColumns(access));
   const before = beforeRows.length === 1 ? beforeRows[0]! : null;
 
   const body = parsed.clear

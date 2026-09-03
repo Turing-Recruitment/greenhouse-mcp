@@ -3,6 +3,12 @@ import { resolve } from "node:path";
 import { extractRows, isInactiveUser, parsePositiveId } from "./identity-bootstrap.js";
 import { revokeOauthGrants } from "./oauth-grant-store.js";
 import {
+  PRIVATE_CANDIDATE_ATTESTATION_COLUMNS,
+  PRIVATE_CANDIDATES_ATTESTED_AT_COLUMN,
+  PRIVATE_CANDIDATES_ATTESTED_BY_COLUMN,
+  PRIVATE_CANDIDATES_ATTESTED_COLUMN,
+} from "./private-candidate-attestation.js";
+import {
   assertCanonicalSupabaseProjectRef,
   normalizeOptionalSupabaseIdentifier,
   normalizeSupabaseApiKey,
@@ -42,6 +48,15 @@ export interface IdentityDirectoryRow {
   status: string;
   /** ISO; when present, a row newer than the roster is never tombstoned (see rosterAsOf). */
   lastVerifiedAt?: string;
+  /**
+   * The private-candidate attestation as it stood when the plan was read (CLO-273). Carried so the
+   * deprovision PATCH — which REPLACES evidence_detail — can record what it is clearing instead of
+   * destroying it. All three are absent against a table migration 0008 has not reached, which is a
+   * supported state, not an error.
+   */
+  privateCandidatesAttested?: boolean;
+  privateCandidatesAttestedAt?: string | null;
+  privateCandidatesAttestedBy?: string | null;
 }
 
 export type ReconciliationAction = "keep" | "revoke" | "tombstone" | "skip";
@@ -51,6 +66,8 @@ export interface ReconciliationEntry {
   primaryEmail: string;
   action: ReconciliationAction;
   reason: string;
+  /** The attestation this row carried when the plan was built, for the PATCH's evidence record. */
+  priorAttestation?: { attested: boolean; at: string | null; by: string | null };
 }
 
 export interface IdentityReconciliationPlan {
@@ -105,7 +122,19 @@ export function buildIdentityReconciliationPlan(
   const absent: ReconciliationEntry[] = [];
 
   for (const row of resolvedRows) {
-    const base = { greenhouseUserId: row.greenhouseUserId, primaryEmail: row.primaryEmail };
+    const base = {
+      greenhouseUserId: row.greenhouseUserId,
+      primaryEmail: row.primaryEmail,
+      ...(row.privateCandidatesAttested === undefined
+        ? {}
+        : {
+            priorAttestation: {
+              attested: row.privateCandidatesAttested,
+              at: row.privateCandidatesAttestedAt ?? null,
+              by: row.privateCandidatesAttestedBy ?? null,
+            },
+          }),
+    };
     const rosterEntry = roster.get(row.greenhouseUserId);
     if (rosterEntry) {
       if (rosterEntry.inactive) {
@@ -214,6 +243,15 @@ export interface IdentityReconciliationApplyReport {
   tombstonedCount: number;
   /** Per deprovisioned row: whether its OAuth refresh families were swept (CLO-272). */
   oauthRevocations: Array<{ greenhouseUserId: number; primaryEmail: string } & ReconciliationOauthRevocation>;
+  /**
+   * Per deprovisioned row: whether the private-candidate attestation columns were actually cleared.
+   *
+   * `false` means the table has not had migration 0008 applied yet and the PATCH was retried
+   * without them. The status flip and the OAuth sweep still happened — that is the deprovisioning —
+   * but an operator reading this report must be able to see that one column was not written rather
+   * than assume it was.
+   */
+  entries: Array<{ greenhouseUserId: number; action: ReconciliationAction; attestationCleared: boolean }>;
   containsTokens: false;
 }
 
@@ -224,20 +262,38 @@ export async function fetchResolvedDirectoryRows(
   const apiKey = normalizeSupabaseApiKey(config.apiKey, "Supabase identity directory");
   const table = normalizeOptionalSupabaseIdentifier(config.table, "recruiter_identity_directory", "Supabase identity directory table");
 
-  const url = new URL(`${baseUrl}/rest/v1/${encodeURIComponent(table)}`);
-  url.searchParams.set("select", "greenhouse_user_id,primary_email,status,last_verified_at");
-  url.searchParams.set("status", `eq.${DIRECTORY_RESOLVED_STATUS}`);
+  const fetchImpl = config.fetchImpl ?? fetch;
+  const read = async (select: string): Promise<Response> => {
+    const url = new URL(`${baseUrl}/rest/v1/${encodeURIComponent(table)}`);
+    url.searchParams.set("select", select);
+    url.searchParams.set("status", `eq.${DIRECTORY_RESOLVED_STATUS}`);
+    return fetchImpl(url, {
+      method: "GET",
+      headers: {
+        apikey: apiKey,
+        authorization: `Bearer ${apiKey}`,
+        accept: "application/json",
+      },
+    });
+  };
 
-  const response = await (config.fetchImpl ?? fetch)(url, {
-    method: "GET",
-    headers: {
-      apikey: apiKey,
-      authorization: `Bearer ${apiKey}`,
-      accept: "application/json",
-    },
-  });
+  // The attestation columns are read so the deprovision PATCH can record what it clears. They are
+  // asked for OPTIONALLY: this runs against a project migration 0008 may not have reached yet, and
+  // a reconciliation that could not run at all because of a column it only needs for provenance
+  // would be a far worse failure than one that runs without the provenance.
+  const BASE_SELECT = "greenhouse_user_id,primary_email,status,last_verified_at";
+  let response = await read(`${BASE_SELECT},${PRIVATE_CANDIDATE_ATTESTATION_COLUMNS.join(",")}`);
   if (!response.ok) {
-    throw new Error(`Identity directory read failed with status ${response.status}.`);
+    const detail = await readResponseDetail(response);
+    if (!mentionsMissingAttestationColumn(response.status, detail)) {
+      throw new Error(`Identity directory read failed with status ${response.status}. ${detail}`.trim());
+    }
+    response = await read(BASE_SELECT);
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Identity directory read failed with status ${response.status}. ${await readResponseDetail(response)}`.trim()
+    );
   }
   const data = (await response.json()) as unknown;
   if (!Array.isArray(data)) {
@@ -252,7 +308,26 @@ export async function fetchResolvedDirectoryRows(
     const status = typeof row.status === "string" ? row.status : undefined;
     if (greenhouseUserId === undefined || primaryEmail === undefined || status === undefined) continue;
     const lastVerifiedAt = typeof row.last_verified_at === "string" ? row.last_verified_at : undefined;
-    rows.push({ greenhouseUserId, primaryEmail, status, ...(lastVerifiedAt !== undefined ? { lastVerifiedAt } : {}) });
+    const attested = row[PRIVATE_CANDIDATES_ATTESTED_COLUMN];
+    rows.push({
+      greenhouseUserId,
+      primaryEmail,
+      status,
+      ...(lastVerifiedAt !== undefined ? { lastVerifiedAt } : {}),
+      ...(typeof attested === "boolean"
+        ? {
+            privateCandidatesAttested: attested,
+            privateCandidatesAttestedAt:
+              typeof row[PRIVATE_CANDIDATES_ATTESTED_AT_COLUMN] === "string"
+                ? (row[PRIVATE_CANDIDATES_ATTESTED_AT_COLUMN] as string)
+                : null,
+            privateCandidatesAttestedBy:
+              typeof row[PRIVATE_CANDIDATES_ATTESTED_BY_COLUMN] === "string"
+                ? (row[PRIVATE_CANDIDATES_ATTESTED_BY_COLUMN] as string)
+                : null,
+          }
+        : {}),
+    });
   }
   return rows;
 }
@@ -274,6 +349,7 @@ export async function applyIdentityReconciliationPlan(
   const appliedAt = config.appliedAt ?? new Date().toISOString();
   const fetchImpl = config.fetchImpl ?? fetch;
   const oauthRevocations: IdentityReconciliationApplyReport["oauthRevocations"] = [];
+  const entries: IdentityReconciliationApplyReport["entries"] = [];
 
   // Apply revokes and tombstones only. Each is a status flip to 'deactivated' — never a grant — so
   // partial application (if a later row fails) is fail-safe: nothing gains access, and a re-run
@@ -295,33 +371,64 @@ export async function applyIdentityReconciliationPlan(
     // upsert deliberately does NOT carry these columns (identity-bootstrap.ts:14-23), so
     // re-bootstrapping a returning recruiter does not resurrect the attestation either — it has to
     // be re-recorded by hand.
-    const body = {
+    const evidenceDetail: Record<string, unknown> = {
+      source: "identity_directory_reconciliation",
+      action: entry.action,
+      reason: entry.reason,
+      // evidence_detail is REPLACED, not merged, so the attestation being cleared would otherwise
+      // vanish without a trace. Who attested this person, and when, is exactly the thing an auditor
+      // asks about after the row is gone.
+      ...(entry.priorAttestation ? { priorAttestation: entry.priorAttestation } : {}),
+    };
+    // `_by` is nulled, not stamped with the reconciliation's name: migration 0008 documents the
+    // column as the operator who made the attestation, and the CLI's `--clear` writes null. Writing
+    // "identity_directory_reconciliation:<action>" there made the column read as though a machine
+    // had attested the person, which is the opposite of what happened.
+    const attestationClearing = {
+      [PRIVATE_CANDIDATES_ATTESTED_COLUMN]: false,
+      [PRIVATE_CANDIDATES_ATTESTED_AT_COLUMN]: null,
+      [PRIVATE_CANDIDATES_ATTESTED_BY_COLUMN]: null,
+    };
+    const baseBody = {
       status: DEACTIVATED_STATUS,
       last_verified_at: appliedAt,
-      private_candidates_attested: false,
-      private_candidates_attested_at: null,
-      private_candidates_attested_by: `identity_directory_reconciliation:${entry.action}`,
-      evidence_detail: {
-        source: "identity_directory_reconciliation",
-        action: entry.action,
-        reason: entry.reason,
-      },
+      evidence_detail: evidenceDetail,
     };
-    const response = await fetchImpl(url, {
-      method: "PATCH",
-      headers: {
-        apikey: apiKey,
-        authorization: `Bearer ${apiKey}`,
-        "content-type": "application/json",
-        prefer: "return=minimal",
-      },
-      body: JSON.stringify(body),
-    });
+    const patch = async (body: Record<string, unknown>): Promise<Response> =>
+      fetchImpl(url, {
+        method: "PATCH",
+        headers: {
+          apikey: apiKey,
+          authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+          prefer: "return=minimal",
+        },
+        body: JSON.stringify(body),
+      });
+
+    // The three attestation columns are written OPTIONALLY. Naming them unconditionally meant that
+    // against a table migration 0008 had not reached — or inside PostgREST's schema-cache window
+    // right after it did — the very FIRST entry 400ed, the whole apply aborted, and neither the
+    // status flip nor `revokeOauthGrants` ran for anybody. That is fail-OPEN on the one operation
+    // whose entire job is to end access.
+    let attestationCleared = true;
+    let response = await patch({ ...baseBody, ...attestationClearing });
+    if (!response.ok) {
+      const detail = await readResponseDetail(response);
+      if (!mentionsMissingAttestationColumn(response.status, detail)) {
+        throw new Error(
+          `Identity reconciliation update failed for greenhouse_user_id ${entry.greenhouseUserId} with status ${response.status}. ${detail}`.trim()
+        );
+      }
+      attestationCleared = false;
+      response = await patch(baseBody);
+    }
     if (!response.ok) {
       throw new Error(
-        `Identity reconciliation update failed for greenhouse_user_id ${entry.greenhouseUserId} with status ${response.status}.`
+        `Identity reconciliation update failed for greenhouse_user_id ${entry.greenhouseUserId} with status ${response.status}. ${await readResponseDetail(response)}`.trim()
       );
     }
+    entries.push({ greenhouseUserId: entry.greenhouseUserId, action: entry.action, attestationCleared });
     // The directory flip denies every future tool call; the OAuth sweep ends the hosted-Claude
     // session itself (CLO-272): every live refresh family of the email is revoked under its lock
     // and every access-token jti it minted lands on the revocation list. Best effort, and visibly
@@ -347,8 +454,36 @@ export async function applyIdentityReconciliationPlan(
     revokedCount: plan.revoked.length,
     tombstonedCount: plan.tombstoned.length,
     oauthRevocations,
+    entries,
     containsTokens: false,
   };
+}
+
+/**
+ * The response body, for the error message. A PostgREST 400 says WHICH column it could not find,
+ * and a thrown message that dropped it left the operator with a bare status code to diagnose.
+ * Never throws: a body that cannot be read yields an empty detail, not a second failure.
+ */
+async function readResponseDetail(response: Response): Promise<string> {
+  try {
+    const text = await response.clone().text();
+    return text.slice(0, 500);
+  } catch (error) {
+    return "";
+  }
+}
+
+/**
+ * Is this 400 PostgREST saying one of the attestation columns does not exist?
+ *
+ * `PGRST204` is "column not found in the schema cache"; `42703` is Postgres's own undefined_column.
+ * The column name has to appear too, so an unrelated undefined-column error — a real schema bug —
+ * still throws rather than being quietly retried into a partial write.
+ */
+function mentionsMissingAttestationColumn(status: number, detail: string): boolean {
+  if (status !== 400 && status !== 404) return false;
+  if (!/PGRST204|PGRST100|42703/.test(detail)) return false;
+  return PRIVATE_CANDIDATE_ATTESTATION_COLUMNS.some((column) => detail.includes(column));
 }
 
 export interface ReconciliationOauthRevocation {

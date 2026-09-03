@@ -89,6 +89,8 @@ export interface JobScopeIdBridge {
   rawRowsRead: number;
   returnedRowsRead: number;
   permissionExcluded: number;
+  /** Of `permissionExcluded`, how many the private-candidate gate withheld across the derive reads. */
+  privacyWithheld: number;
   unresolvedRows: number;
   pagesRead: number;
   rateLimitRetries: number;
@@ -183,6 +185,7 @@ export async function loadScorecardIdsForJobScope(
   let rawRowsRead = apps.rawRowsRead;
   let returnedRowsRead = apps.returnedRowsRead;
   let permissionExcluded = apps.permissionExcluded;
+  let privacyWithheld = apps.privacyWithheld;
   let unresolvedRows = apps.unresolvedRows;
   let cacheHits = apps.cacheHits;
   let pagesRead = apps.pagesRead;
@@ -228,6 +231,7 @@ export async function loadScorecardIdsForJobScope(
     rawRowsRead += read.rawRowsRead;
     returnedRowsRead += read.rowsReturnedRead ?? read.rows.length;
     permissionExcluded += read.permissionExcluded;
+    privacyWithheld += read.privacyWithheld;
     unresolvedRows += read.unresolvedRows;
     cacheHits += read.cacheHits;
     pagesRead += read.pagesRead;
@@ -249,6 +253,7 @@ export async function loadScorecardIdsForJobScope(
     rawRowsRead,
     returnedRowsRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     cacheHits,
     pagesRead,
@@ -410,6 +415,7 @@ async function deriveIdsFromJobScope(
       rawRowsRead: 0,
       returnedRowsRead: 0,
       permissionExcluded: 0,
+      privacyWithheld: 0,
       unresolvedRows: 0,
       pagesRead: 0,
       rateLimitRetries: 0,
@@ -425,6 +431,7 @@ async function deriveIdsFromJobScope(
   let rawRowsRead = 0;
   let returnedRowsRead = 0;
   let permissionExcluded = 0;
+  let privacyWithheld = 0;
   let unresolvedRows = 0;
   let cacheHits = 0;
   let pagesRead = 0;
@@ -472,6 +479,7 @@ async function deriveIdsFromJobScope(
     rawRowsRead += read.rawRowsRead;
     returnedRowsRead += read.rowsReturnedRead ?? read.rows.length;
     permissionExcluded += read.permissionExcluded;
+    privacyWithheld += read.privacyWithheld;
     unresolvedRows += read.unresolvedRows;
     cacheHits += read.cacheHits;
     pagesRead += read.pagesRead;
@@ -493,6 +501,7 @@ async function deriveIdsFromJobScope(
     rawRowsRead,
     returnedRowsRead,
     permissionExcluded,
+    privacyWithheld,
     unresolvedRows,
     cacheHits,
     pagesRead,

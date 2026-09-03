@@ -61,7 +61,14 @@ npx tsx scripts/probe.ts
 
 Operator behavior:
 
-- Operator without `actAsUser`: unscoped passthrough to the raw read.
+- Operator without `actAsUser`: unscoped passthrough to the raw read, EXCEPT for private
+  candidates. Greenhouse gates those on a per-user permission Harvest v3 does not expose, so the
+  reader asks the identity directory whether an operator has attested this actor
+  (`privateCandidateAttestation`). Attested, the read is byte-identical to what it always was.
+  Unattested — including when no lookup is configured, or the directory cannot be reached — the
+  private candidates the actor's own per-job "Private" Job Admin roles do not reach are withheld,
+  the envelope reports `permissionScope.privateCandidatesWithheld: true`, and `scoped` stays
+  `false`.
 - Operator with `actAsUser`: reads the raw data, then filters it as that user.
 - Non-operator with `actAsUser`: explicit denial.
 

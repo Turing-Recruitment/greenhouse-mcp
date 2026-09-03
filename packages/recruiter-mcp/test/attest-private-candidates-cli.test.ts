@@ -82,7 +82,6 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
     assert.equal(report.status, "attested");
     assert.equal(report.before?.private_candidates_attested, false);
     assert.equal(report.after.private_candidates_attested, true);
-    assert.equal(report.containsTokens, false);
 
     const patch = calls.find((call) => call.method === "PATCH");
     assert.ok(patch, "the CLI must PATCH the directory row");
@@ -135,6 +134,12 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
       "eq.sam.vangelos@turing.com",
       "the email is lowercased to match the resolved-row unique index"
     );
+    assert.equal(
+      calls[0]!.url.searchParams.get("status"),
+      "eq.resolved",
+      "primary_email is unique only among resolved rows (0001:24-26), so the lookup has to say so " +
+        "or a deactivated duplicate makes a live address ambiguous"
+    );
 
     const ambiguous = fakeDirectory(() => [RESOLVED_ROW, { ...RESOLVED_ROW, greenhouse_user_id: 5182584004 }]);
     await assert.rejects(
@@ -159,11 +164,43 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
     );
   });
 
-  it("never prints the service-role key", async () => {
+  it("never prints the service-role key or the project it reached", async () => {
     const { fetchImpl } = fakeDirectory((call) =>
       call.method === "PATCH" ? [{ ...RESOLVED_ROW, private_candidates_attested: true }] : [RESOLVED_ROW]
     );
     const report = await attestPrivateCandidates(ENV, ["--greenhouse-user-id", "5085047004", "--by", "Sam"], fetchImpl);
-    assert.ok(!JSON.stringify(report).includes("test-service-role-key"));
+    const serialized = JSON.stringify(report);
+    assert.ok(!serialized.includes("test-service-role-key"), "the key must never reach the printed report");
+    assert.ok(!serialized.includes("supabase.co"), "nor the project URL");
+  });
+
+  // ---------------------------------------------------------------------------
+  // The directory's column overrides
+  // ---------------------------------------------------------------------------
+
+  it("honours the identity directory's table, column and status overrides", async () => {
+    const { fetchImpl, calls } = fakeDirectory((call) =>
+      call.method === "PATCH" ? [{ ...RESOLVED_ROW, private_candidates_attested: true }] : [RESOLVED_ROW]
+    );
+    await attestPrivateCandidates(
+      {
+        ...ENV,
+        GREENHOUSE_RECRUITER_IDENTITY_TABLE: "directory_v2",
+        GREENHOUSE_RECRUITER_IDENTITY_GREENHOUSE_USER_ID_COLUMN: "gh_user_id",
+        GREENHOUSE_RECRUITER_IDENTITY_STATUS_COLUMN: "row_status",
+        GREENHOUSE_RECRUITER_IDENTITY_RESOLVED_STATUS: "active",
+      } as NodeJS.ProcessEnv,
+      ["--greenhouse-user-id", "5085047004", "--by", "Sam"],
+      fetchImpl
+    );
+
+    const patch = calls.find((call) => call.method === "PATCH");
+    assert.ok(patch);
+    assert.match(patch.url.pathname, /directory_v2$/,
+      "the writer must reach the same table the reader resolves the attestation from");
+    assert.equal(patch.url.searchParams.get("gh_user_id"), "eq.5085047004");
+    assert.equal(patch.url.searchParams.get("row_status"), "eq.active",
+      "hard-coded `status=eq.resolved` writes nothing on a directory configured with an override, " +
+        "and the CLI would report success for a row it never touched");
   });
 });
