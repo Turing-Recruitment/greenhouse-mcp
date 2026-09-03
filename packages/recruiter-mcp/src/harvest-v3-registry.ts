@@ -144,6 +144,10 @@ const EVIDENCE_TOOL_ENDPOINT_PAIRS = [
   ["search_my_job_boards", "/v3/job_boards"],
   ["search_my_custom_field_departments", "/v3/custom_field_departments"],
   ["search_my_custom_field_offices", "/v3/custom_field_offices"],
+  ["search_my_job_post_searchable_locations", "/v3/job_post_searchable_locations"],
+  ["search_my_applied_candidate_tags", "/v3/applied_candidate_tags"],
+  ["search_my_user_roles", "/v3/user_roles"],
+  ["search_my_email_templates", "/v3/email_templates"],
 ] as const;
 
 export const HARVEST_V3_EVIDENCE_TOOL_ENDPOINTS: ReadonlyMap<string, string> = new Map(EVIDENCE_TOOL_ENDPOINT_PAIRS);
@@ -169,7 +173,6 @@ const JOB_SCOPED_ENDPOINTS = new Set([
   "/v3/job_interviews",
   "/v3/job_notes",
   "/v3/job_owners",
-  "/v3/job_post_searchable_locations",
   "/v3/job_posts",
   "/v3/jobs",
   "/v3/offers",
@@ -208,6 +211,11 @@ const SCORECARD_BACKED_ENDPOINTS = new Set([
 
 const JOIN_BACKED_ENDPOINTS = new Set([
   "/v3/approver_groups",
+  // R2b moved this out of JOB_SCOPED_ENDPOINTS. The v3 contract documents job_post_id and NO job_id
+  // on the row, so a direct job-scoped filter resolved every row `unresolved` and withheld the page
+  // — it was classified for a field the endpoint does not return. It reaches a job the same way
+  // /v3/job_post_locations does: job_post_id -> /v3/job_posts -> job_id.
+  "/v3/job_post_searchable_locations",
   "/v3/approvers",
   "/v3/default_interviewers",
   "/v3/job_post_locations",
@@ -243,6 +251,11 @@ const GLOBAL_REFERENCE_ENDPOINTS = new Set([
   "/v3/rejection_reasons",
   "/v3/rejection_reasons/{id}",
   "/v3/sources",
+  // R2b moved this out of ADMIN_REFERENCE_ENDPOINTS. A user_role row is {id, name, role_type} — the
+  // dictionary that decodes the role_id on /v3/user_job_permissions and /v3/future_job_permissions.
+  // It names no user, carries no PII, and is the structural twin of /v3/departments. Calling it an
+  // admin diagnostic cited nothing: knowing that "Job Admin" is role 4 grants no access.
+  "/v3/user_roles",
   "/v3/users",
 ]);
 
@@ -252,7 +265,6 @@ const ADMIN_REFERENCE_ENDPOINTS = new Set([
   "/v3/bulk_requests/{bulk_action_uuid}",
   "/v3/future_job_permissions",
   "/v3/user_job_permissions",
-  "/v3/user_roles",
 ]);
 
 const SENSITIVE_PERSONAL_ENDPOINTS = new Set([
@@ -621,7 +633,7 @@ function joinDependenciesForPath(path: string, scopeClass: HarvestScopeClass): J
       scopeJoin("application_id", "application_ids", "/v3/applications"),
     ];
   }
-  if (path === "/v3/job_post_locations" || path === "/v3/pay_input_ranges") {
+  if (path === "/v3/job_post_locations" || path === "/v3/pay_input_ranges" || path === "/v3/job_post_searchable_locations") {
     return [scopeJoin("job_post_id", "job_post_ids", "/v3/job_posts")];
   }
   if (path === "/v3/prospect_pool_stages") {

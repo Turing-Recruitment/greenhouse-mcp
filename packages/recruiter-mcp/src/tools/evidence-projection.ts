@@ -128,6 +128,14 @@ const EVIDENCE_PROJECTORS = new Map<string, Projector>([
   ["search_my_job_boards", denylistProjector("/v3/job_boards")],
   ["search_my_custom_field_departments", denylistProjector("/v3/custom_field_departments")],
   ["search_my_custom_field_offices", denylistProjector("/v3/custom_field_offices")],
+  // R2b. Post locations, applied tags and the role dictionary are id/label rows with no contact
+  // field on the v3 contract (locked by the PII sweep in test/evidence.test.ts), so the shared
+  // denylist projector carries every documented field through. Email templates go through it too;
+  // their one sensitive field has an omission policy below.
+  ["search_my_job_post_searchable_locations", denylistProjector("/v3/job_post_searchable_locations")],
+  ["search_my_applied_candidate_tags", denylistProjector("/v3/applied_candidate_tags")],
+  ["search_my_user_roles", denylistProjector("/v3/user_roles")],
+  ["search_my_email_templates", denylistProjector("/v3/email_templates")],
 ]);
 
 function denylistProjector(endpointPath: string): (value: unknown) => unknown {
@@ -224,6 +232,20 @@ const DEFAULT_OMISSION_POLICIES_BY_ENDPOINT = new Map<string, FieldOmissionPolic
   ["/v3/rejection_reasons", [
     // Reference-catalog admin annotation — private-labeled content, near-zero analytic value.
     { field: "private_note", reason: "privacy" },
+  ]],
+  ["/v3/email_templates", [
+    // `recipients` is free text that in this tenant holds colleague addresses (the cc list a
+    // template sends to). Sam's 2026-09-02 ruling puts teammate email behind the same line as the
+    // staff directory: site admins and operators see it, a job-scoped line recruiter does not. It is
+    // restored for that profile in PROFILE_FIELD_RESTORES, exactly like /v3/users.primary_email.
+    //
+    // Nothing ELSE on the row is withheld. `body`, `subject` and `html_body` are company copy every
+    // recruiter already sends, and `user_id` is an id, not contact data. The control-plane surface
+    // still gates this endpoint behind its Tier-3 doctrine (control-plane/src/index.ts, the
+    // list_email_templates registration): that gate cited an "expanded access" posture rather than a
+    // Greenhouse permission, and it does not govern this scoped recruiter surface, where the
+    // recruiter's own permissions are enforced per read.
+    { field: "recipients", reason: "privacy" },
   ]],
   ["/v3/users", [
     // Restored for site admins and operators by PROFILE_FIELD_RESTORES below — they administer the
@@ -480,6 +502,7 @@ const PROFILE_FIELD_RESTORES: ReadonlyMap<RecruiterProjectionProfileName, Readon
   ["operator_site_admin", new Map([
     ["/v3/users", new Set(["primary_email", "emails", "email"])],
     ["/v3/rejection_reasons", new Set(["private_note"])],
+    ["/v3/email_templates", new Set(["recipients"])],
   ])],
 ]);
 

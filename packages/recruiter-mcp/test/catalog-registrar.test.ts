@@ -198,8 +198,10 @@ describe("R2a read_my_resume reads any attachment the actor may see", () => {
     };
   }
 
-  it("reads a cover letter, a take-home, and an offer letter, not only type=resume", async (context) => {
-    for (const type of ["cover_letter", "take_home_test", "offer_letter", "other"]) {
+  // Two representative types, not four: each call spawns the isolated parser subprocess, and the
+  // property (the type field is not consulted) is proven by any non-"resume" value.
+  it("reads a cover letter and an offer letter, not only type=resume", async (context) => {
+    for (const type of ["cover_letter", "offer_letter"]) {
       await context.test(type, async () => {
         const reader = fakeScopedReader((toolName) => scopedSuccess(toolName, [attachmentRow({ type })]));
         const { runtime } = testRuntime(reader);

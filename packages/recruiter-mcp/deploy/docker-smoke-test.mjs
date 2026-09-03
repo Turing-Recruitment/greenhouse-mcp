@@ -12,7 +12,7 @@ const dockerfilePath = "packages/recruiter-mcp/deploy/Dockerfile";
 // tool is exposed and nothing is hidden — so this equals RECRUITER_TOOL_DEFINITIONS.length. This file
 // is plain .mjs and cannot import the TypeScript source, so the number is a literal that
 // test/deployment-artifacts.test.ts asserts against PILOT_TOOL_NAMES.length; it cannot drift silently.
-const EXPECTED_CATALOG_TOOL_COUNT = 66;
+const EXPECTED_CATALOG_TOOL_COUNT = 70;
 const imageTag = process.env.GREENHOUSE_RECRUITER_DOCKER_SMOKE_IMAGE ?? "greenhouse-recruiter-mcp:smoke";
 const shouldRunContainer = process.env.GREENHOUSE_RECRUITER_DOCKER_SMOKE_RUN === "true";
 const hostPort = normalizePort(process.env.GREENHOUSE_RECRUITER_DOCKER_SMOKE_PORT);

@@ -484,7 +484,10 @@ describe("scoped Greenhouse read wrapper", () => {
       rawReader: raw,
     });
 
-    const result = await scoped.scopedRead(100, "list_email_templates", {});
+    // R2b registered list_email_templates, so this canary moved to a name that is genuinely outside
+  // DEFAULT_FILTER_REGISTRY. What is being locked is the UNREGISTERED-tool contract — deny before any
+  // raw read — not the availability of one particular endpoint.
+  const result = await scoped.scopedRead(100, "list_demographic_answers", {});
 
     assert.equal(result.ok, false);
     assert.equal(result.ok === false && result.denial.code, "TOOL_NOT_AVAILABLE");

@@ -61,6 +61,7 @@ export const RECRUITER_READ_TOOL_ORDER = [
   "search_my_referrers",
   "search_my_custom_field_options",
   "search_my_custom_fields",
+  "search_my_applied_candidate_tags",
   // id -> name dictionaries the catalog's own rows emit ids for: search_my_jobs returns
   // department_id/office_ids, search_my_openings returns close_reason_id, and resolve_job_scope
   // accepts free-text department and office NAMES the model otherwise cannot enumerate.
@@ -83,7 +84,10 @@ export const RECRUITER_READ_TOOL_ORDER = [
   "search_my_interview_kits",
   "search_my_default_interviewers",
   "search_my_job_post_locations",
+  "search_my_job_post_searchable_locations",
   "search_my_pay_input_ranges",
+  "search_my_email_templates",
+  "search_my_user_roles",
   "search_my_interviewer_tags",
   "search_my_candidate_tags",
   "search_my_prospect_pools",

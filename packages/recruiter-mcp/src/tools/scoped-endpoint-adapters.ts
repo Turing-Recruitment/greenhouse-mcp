@@ -91,6 +91,10 @@ const EVIDENCE_TOOL_SCOPED_TOOL_ENTRIES = [
   ["search_my_job_boards", "list_job_boards"],
   ["search_my_custom_field_departments", "list_custom_field_departments"],
   ["search_my_custom_field_offices", "list_custom_field_offices"],
+  ["search_my_job_post_searchable_locations", "list_job_post_searchable_locations"],
+  ["search_my_applied_candidate_tags", "list_applied_candidate_tags"],
+  ["search_my_user_roles", "list_user_roles"],
+  ["search_my_email_templates", "list_email_templates"],
 ] as const;
 
 export const EVIDENCE_TOOL_SCOPED_TOOL_NAMES: ReadonlyMap<string, string> = new Map(

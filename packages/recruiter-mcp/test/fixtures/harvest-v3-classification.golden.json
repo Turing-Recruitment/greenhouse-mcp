@@ -215,7 +215,7 @@
     "defaultProjectionProfile": "default_operational"
   },
   "/v3/job_post_searchable_locations": {
-    "scopeClass": "job_scoped",
+    "scopeClass": "join_backed",
     "sensitivityClass": "default_operational",
     "defaultProjectionProfile": "default_operational"
   },
@@ -350,9 +350,9 @@
     "defaultProjectionProfile": "internal_permission"
   },
   "/v3/user_roles": {
-    "scopeClass": "admin_reference",
-    "sensitivityClass": "admin_diagnostic",
-    "defaultProjectionProfile": "admin_diagnostic"
+    "scopeClass": "global_reference",
+    "sensitivityClass": "default_operational",
+    "defaultProjectionProfile": "default_operational"
   },
   "/v3/users": {
     "scopeClass": "global_reference",

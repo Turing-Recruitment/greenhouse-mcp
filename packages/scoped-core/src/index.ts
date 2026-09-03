@@ -1502,6 +1502,9 @@ export const CANDIDATE_SUBSTANCE_TOOLS: ReadonlySet<string> = new Set([
   "list_attachments",
   "list_candidate_educations",
   "list_candidate_employments",
+  // R2b: an applied-tag row names a candidate by id, so an unattested actor must not learn a private
+  // candidate exists by seeing their tag row.
+  "list_applied_candidate_tags",
   "list_scorecard_question_answers",
   "list_scorecard_question_answer_options",
 ]);
@@ -2461,6 +2464,9 @@ export const DEFAULT_FILTER_REGISTRY: ReadonlyMap<string, ToolRegistration> =
     ["get_candidate", getTool("/candidates", filterCandidateRow)],
     ["list_candidate_educations", listTool("/candidate_educations", filterCandidateBackedRow)],
     ["list_candidate_employments", listTool("/candidate_employments", filterCandidateBackedRow)],
+    // R2b. The pool behind a tag name: search_my_candidate_tags gives the dictionary, this gives who
+    // carries which tag. Candidate-backed, so the private-candidate gate runs on every row.
+    ["list_applied_candidate_tags", listTool("/applied_candidate_tags", filterCandidateBackedRow)],
     ["list_scorecards", listTool("/scorecards", filterApplicationBackedRow)],
     ["list_notes", listTool("/notes", filterNoteOrActivityRow)],
     ["list_attachments", listTool("/attachments", filterAttachmentRow)],
@@ -2489,6 +2495,14 @@ export const DEFAULT_FILTER_REGISTRY: ReadonlyMap<string, ToolRegistration> =
     ["list_close_reasons", globalReferenceListTool("/close_reasons")],
     ["list_custom_field_options", globalReferenceListTool("/custom_field_options")],
     ["list_custom_fields", globalReferenceListTool("/custom_fields")],
+    // R2b. The permission-role dictionary: role names plus the two-value role_type taxonomy that
+    // decode the role_id on /user_job_permissions and /future_job_permissions. No PII, no per-user
+    // rows — it is the same class of id->name dictionary as /departments.
+    ["list_user_roles", globalReferenceListTool("/user_roles")],
+    // R2b. Org email copy: the template a rejection or an availability request sends, and the
+    // template_id a future write needs. `recipients` is projected back to site admins and operators
+    // only (Sam's teammate-email ruling); everything else is company copy every recruiter sends.
+    ["list_email_templates", globalReferenceListTool("/email_templates")],
     ["list_pay_inputs", globalReferenceListTool("/pay_inputs")],
     // Tier-3.4 domain exposure (audit C-DOMAINS). Scope filters are contract-grounded per row shape:
     // approval_flows + interview_kits carry job_id (direct job scoping); prospect_details carries
@@ -2506,6 +2520,11 @@ export const DEFAULT_FILTER_REGISTRY: ReadonlyMap<string, ToolRegistration> =
     ["list_scorecard_question_answer_options", policyListTool("/scorecard_question_answer_options")],
     ["list_default_interviewers", policyListTool("/default_interviewers")],
     ["list_job_post_locations", policyListTool("/job_post_locations")],
+    // R2b. The finer post-level location (city, region, lat/long) behind the coarse country tags the
+    // server instructions apologise for. The row carries job_post_id and NO job_id, so it is bound
+    // through the same job_post_id -> /job_posts -> job_id chain as /job_post_locations, never as a
+    // direct job-scoped row (which would have resolved every row unresolved and withheld the page).
+    ["list_job_post_searchable_locations", policyListTool("/job_post_searchable_locations")],
     ["list_pay_input_ranges", policyListTool("/pay_input_ranges")],
     ["list_interviewer_tags", globalReferenceListTool("/interviewer_tags")],
     ["list_candidate_tags", globalReferenceListTool("/candidate_tags")],

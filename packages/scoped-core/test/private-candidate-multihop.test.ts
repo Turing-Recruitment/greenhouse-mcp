@@ -819,6 +819,9 @@ describe("the privacy tool sets are checked against the registry's endpoints, no
       "/attachments",
       "/candidate_educations",
       "/candidate_employments",
+      // R2b: a tag row is (candidate_id, candidate_tag_id) — it names a candidate, so it is
+      // candidate substance and the private gate must cover it.
+      "/applied_candidate_tags",
       "/scorecard_question_answers",
       "/scorecard_question_answer_options",
     ]);
@@ -861,6 +864,12 @@ describe("the privacy tool sets are checked against the registry's endpoints, no
       "/job_boards",
       "/custom_field_departments",
       "/custom_field_offices",
+      // R2b. Post-level location (city/region/lat-long) reached through job_post_id; the permission
+      // role dictionary (id, name, role_type), which names no user; and the org's email templates.
+      // None can carry a candidate row.
+      "/job_post_searchable_locations",
+      "/user_roles",
+      "/email_templates",
     ]);
 
     const problems: string[] = [];

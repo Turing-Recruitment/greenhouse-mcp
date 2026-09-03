@@ -515,7 +515,20 @@ registerTool(
   }
 );
 
-// 7. Email Templates — Tier 3, gated per doctrine §6
+// 7. Email Templates — Tier 3 on THIS surface, gated per doctrine §6.
+//
+// Retired as a statement about email templates in general (recruiter-mcp R2b, 2026-09-03): the
+// scoped recruiter surface now exposes /v3/email_templates to every recruiter as
+// `search_my_email_templates`. The reasoning is that a template is company copy — the words a
+// rejection or an availability request sends — and no Greenhouse permission gates reading it; the
+// Tier-3 mark here cited an "expanded access" posture, not a permission. The one field that does
+// carry a constraint, `recipients`, is projected back to site admins and operators only on that
+// surface (Sam's teammate-email ruling, 2026-09-02).
+//
+// The gate stays HERE because this surface is different in kind: the control-plane server reads with
+// a service credential and no per-actor scoping, so its Tier-3 actor allowlist is the only thing
+// standing between a caller and an org-wide read. Removing it here would be a permission decision,
+// not a capability one.
 // (GREENHOUSE_ENABLE_TIER3_READS=true + GREENHOUSE_TIER3_ACTOR_IDS non-empty).
 // Registration gate: shouldRegisterTier3Tool() — admin access settings must be present.
 // Request-time gate: wrapTier3Handler() — every call must claim an allowlisted
