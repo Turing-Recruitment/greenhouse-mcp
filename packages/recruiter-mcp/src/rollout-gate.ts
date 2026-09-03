@@ -764,7 +764,18 @@ function validateLiveProbeRequiredChecks(
   return problems;
 }
 
-function validateLiveProbeCheckScopes(
+/**
+ * Every scope-bound check must report the SAME scope the jobs sample reported.
+ *
+ * `scoped` is read off the sample rather than derived from the scope kind. It used to be derived —
+ * `expectedKind === "operator" ? false : true` — which encoded an assumption the private-candidate
+ * attestation (CLO-273) makes false: an ATTESTED org-wide actor reads raw and unfiltered and
+ * reports `scoped: false`, exactly as before the gate existed, while an UNATTESTED one reports
+ * `scoped: true` because rows really were withheld. Both are correct; what the gate is actually
+ * checking is that the probe's own checks AGREE with each other, and a derived expectation cannot
+ * check that — it can only reject one of the two legitimate answers.
+ */
+export function validateLiveProbeCheckScopes(
   profile: LiveProbeEvidence["profile"],
   checks: RecruiterReadinessProbeReport["checks"],
   jobsSample: RecruiterReadinessProbeReport["checks"][number] | undefined
@@ -772,7 +783,11 @@ function validateLiveProbeCheckScopes(
   if (!isRecord(jobsSample) || !isRecord(jobsSample.details)) return ["scoped_jobs_sample:scope_missing"];
   const expectedKind = jobsSample.details.permissionScopeKind;
   const expectedCount = jobsSample.details.permittedJobCount;
-  const expectedScoped = expectedKind === "operator" ? false : true;
+  const expectedScoped = jobsSample.details.scoped;
+  // The sample is the reference every other check is measured against, so it has to carry a real
+  // boolean. A report whose reference check has no `scoped` field cannot establish consistency at
+  // all, and treating that as "consistent" would pass a probe that measured nothing.
+  if (typeof expectedScoped !== "boolean") return ["scoped_jobs_sample:scoped_flag_missing"];
   const problems: string[] = [];
   for (const check of checks) {
     if (!isRecord(check) || typeof check.name !== "string" || !SCOPE_BOUND_LIVE_PROBE_CHECKS.has(check.name)) continue;

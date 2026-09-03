@@ -574,3 +574,82 @@ describe("B22: deprovisioning against a table migration 0008 has not reached", (
     assert.equal(rows.length, 1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Fold 2 — the stamp path survives a directory that is down (item 4), and an
+//          exclusion tenant with no Private roles costs one sweep (item 14)
+// ---------------------------------------------------------------------------
+
+describe("fold 2: a rejecting attestation lookup is unattested, not a read failure", () => {
+  it("treats a lookup that THROWS as unattested and still recovers the explicit private-capable jobs", async () => {
+    let baseCalls = 0;
+    const chained = { async getPermittedJobIds(): Promise<PermissionLookupResult> { return { kind: "all" }; } };
+    const base = {
+      async getPermittedJobIds(): Promise<PermissionLookupResult> {
+        baseCalls += 1;
+        return { kind: "jobs", jobIds: new Set([7]), privateCapableJobIds: new Set([7]) };
+      },
+    };
+    const stamp = createPrivateCandidateAttestationStamp({
+      chained,
+      base,
+      isAttested: async () => {
+        throw new Error("supabase unreachable");
+      },
+    });
+    const scope = await stamp.getPermittedJobIds(100) as {
+      kind: string;
+      privateCandidatesAttested?: boolean;
+      privateCapableJobIds?: ReadonlySet<number>;
+    };
+    assert.equal(scope.kind, "all");
+    assert.equal(scope.privateCandidatesAttested, false);
+    assert.deepEqual([...(scope.privateCapableJobIds ?? [])], [7],
+      "a directory blip must not also cost the actor the reqs Greenhouse already granted them");
+    assert.equal(baseCalls, 1);
+  });
+
+  it("propagates an abort rather than swallowing it as unattested", async () => {
+    const controller = new AbortController();
+    const chained = { async getPermittedJobIds(): Promise<PermissionLookupResult> { return { kind: "all" }; } };
+    const base = { async getPermittedJobIds(): Promise<PermissionLookupResult> { return new Set<number>(); } };
+    const stamp = createPrivateCandidateAttestationStamp({
+      chained,
+      base,
+      isAttested: async () => {
+        controller.abort(new Error("caller gave up"));
+        controller.signal.throwIfAborted();
+        return false;
+      },
+    });
+    await assert.rejects(() => stamp.getPermittedJobIds(100, controller.signal), /caller gave up/);
+  });
+});
+
+describe("fold 2: an exclusion tenant with no Private roles costs one base sweep, not two", () => {
+  it("carries an explicit empty private-capable set so the stamp has nothing to re-fetch", async () => {
+    const sweeps: string[] = [];
+    const raw = rawReader((path, params) => {
+      if (path === "/users") return [{ id: 100, site_admin: true, deactivated: false }];
+      if (path === "/jobs") return [{ id: 42, confidential: true }];
+      if (path === "/user_job_permissions") {
+        sweeps.push(String(params?.user_ids ?? "cursor"));
+        // Grants, but none of them through a private-capable role.
+        return [{ user_id: 100, job_id: 7, role_id: 901 }];
+      }
+      if (path === "/user_roles") return [{ id: 901, name: "Job Admin: Standard", role_type: "job_admin" }];
+      return [];
+    });
+    const base = createHarvestPermissionProvider({ rawReader: raw });
+    const chained = createSiteAdminAwarePermissionProvider({ base, rawReader: raw });
+    const stamp = createPrivateCandidateAttestationStamp({ chained, base, isAttested: async () => false });
+    const scope = await stamp.getPermittedJobIds(100) as {
+      kind: string;
+      privateCapableJobIds?: ReadonlySet<number>;
+    };
+    assert.equal(scope.kind, "all");
+    assert.deepEqual([...(scope.privateCapableJobIds ?? [])], []);
+    assert.equal(sweeps.length, 1,
+      "the wrapper resolved 'no private-capable jobs'; the stamp must read that as an answer, not as silence");
+  });
+});

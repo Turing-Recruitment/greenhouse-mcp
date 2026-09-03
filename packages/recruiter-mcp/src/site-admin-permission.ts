@@ -111,11 +111,23 @@ export function createSiteAdminAwarePermissionProvider(
         // Greenhouse's own "Private" Job Admin role already gave them on their own reqs — and it
         // made the attestation stamp re-read /user_job_permissions to recover what this call had
         // just fetched and thrown away.
-        const privateCapableJobIds =
-          "kind" in granted && granted.kind === "jobs" && granted.privateCapableJobIds
-            ? new Set(granted.privateCapableJobIds)
+        //
+        // Carried even when it is EMPTY, and that is the point: an absent field means "nobody
+        // resolved this", which sends the stamp back to the base provider for a second
+        // /user_job_permissions sweep it will answer identically. An empty SET means "resolved, and
+        // this actor holds no private-capable role" — an answer, not silence. Every tenant with a
+        // legacy confidential job and no Private roles was paying that second sweep on every
+        // permission refresh.
+        // A BARE SET is the base provider's own shorthand for a job scope with no private-capable
+        // grants (`clonePermissionLookupResult` drops the `{kind:"jobs"}` wrapper when the subset is
+        // empty), so it is an answer too — and it is the shape a tenant with no Private roles
+        // actually produces, which is exactly the case that was paying twice.
+        const privateCapableJobIds = !("kind" in granted)
+          ? new Set<number>()
+          : granted.kind === "jobs"
+            ? new Set(granted.privateCapableJobIds ?? [])
             : undefined;
-        const carry = privateCapableJobIds && privateCapableJobIds.size > 0 ? { privateCapableJobIds } : {};
+        const carry = privateCapableJobIds ? { privateCapableJobIds } : {};
         // A base provider that itself answered "all" cannot narrow anything; nothing is excluded.
         if (grantedJobIds === null) {
           const inherited =

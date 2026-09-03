@@ -376,6 +376,58 @@ describe("production scoped reader configuration", () => {
       }
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // Fold 2 item 5 — the provider registry key must fingerprint the WHOLE directory
+  //                 configuration, not just its URL and table.
+  // ---------------------------------------------------------------------------
+
+  it("does not serve one directory configuration's attestation from another's memoized provider", async () => {
+    const table = "column_override_probe";
+    const envFor = (statusColumn?: string) =>
+      ({
+        ...ATTESTED_DIRECTORY_ENV,
+        GREENHOUSE_RECRUITER_IDENTITY_TABLE: table,
+        // Above zero, so the provider's answer is genuinely memoized and a shared registry entry
+        // would serve the first configuration's attestation to the second.
+        GREENHOUSE_RECRUITER_PERMISSION_TTL_MS: "120000",
+        GREENHOUSE_RECRUITER_READ_CACHE_DISABLED: "true",
+        ...(statusColumn ? { GREENHOUSE_RECRUITER_IDENTITY_STATUS_COLUMN: statusColumn } : {}),
+      }) as NodeJS.ProcessEnv;
+
+    const originalFetch = globalThis.fetch;
+    try {
+      for (const [statusColumn, expectedRows] of [[undefined, 2], ["lifecycle_state", 1]] as const) {
+        const calls: string[] = [];
+        // The directory answers "attested" only for the DEFAULT status column; a configuration
+        // filtering on another column matches no row, which is unattested.
+        globalThis.fetch = fakeSiteAdminGreenhouseFetch(calls, {
+          attested: true,
+          privateCandidateIds: new Set([502]),
+          attestedOnlyWhenQueryIncludes: "status=eq.resolved",
+        });
+        _resetClientState();
+        configureGreenhouseFromEnv({
+          GREENHOUSE_CLIENT_ID: "client-id",
+          GREENHOUSE_CLIENT_SECRET: "client-secret",
+        } as NodeJS.ProcessEnv);
+        const reader = createProductionScopedReader(identityDirectoryForUser(903), envFor(statusColumn));
+        const result = await reader.scopedRead(testSession(), "list_applications", {});
+        assert.equal(result.ok, true);
+        if (!result.ok) return;
+        assert.equal(
+          (result.data as unknown[]).length,
+          expectedRows,
+          statusColumn === undefined
+            ? "the default configuration is attested and sees the private candidate"
+            : "a differently-configured directory must not inherit the previous configuration's attestation"
+        );
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      _resetClientState();
+    }
+  });
 });
 
 /**
@@ -385,14 +437,22 @@ describe("production scoped reader configuration", () => {
  */
 function fakeSiteAdminGreenhouseFetch(
   calls: string[],
-  directory: { attested: boolean; privateCandidateIds?: ReadonlySet<number> }
+  directory: {
+    attested: boolean;
+    privateCandidateIds?: ReadonlySet<number>;
+    /** When set, the attestation row comes back only for a query carrying this fragment. */
+    attestedOnlyWhenQueryIncludes?: string;
+  }
 ): typeof fetch {
   return async (input) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     calls.push(url);
 
-    if (url.includes("/rest/v1/recruiter_identity_directory")) {
-      return jsonResponse([{ private_candidates_attested: directory.attested }]);
+    if (url.includes("/rest/v1/")) {
+      const matches =
+        directory.attestedOnlyWhenQueryIncludes === undefined ||
+        url.includes(directory.attestedOnlyWhenQueryIncludes);
+      return jsonResponse(matches ? [{ private_candidates_attested: directory.attested }] : []);
     }
     if (url === "https://auth.greenhouse.io/token") {
       return jsonResponse({

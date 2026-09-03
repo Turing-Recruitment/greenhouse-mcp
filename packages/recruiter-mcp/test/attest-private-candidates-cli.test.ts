@@ -204,3 +204,55 @@ describe("B7: greenhouse-recruiter-attest-private-candidates", () => {
         "and the CLI would report success for a row it never touched");
   });
 });
+
+describe("fold 2: the CLI honours the directory's own column overrides, and counts before it filters", () => {
+  it("resolves --email through the configured email column, not a hard-coded primary_email", async () => {
+    const env = {
+      ...ENV,
+      GREENHOUSE_RECRUITER_IDENTITY_EMAIL_COLUMN: "work_email",
+      GREENHOUSE_RECRUITER_IDENTITY_GREENHOUSE_USER_ID_COLUMN: "gh_user_id",
+      GREENHOUSE_RECRUITER_IDENTITY_STATUS_COLUMN: "lifecycle_state",
+      GREENHOUSE_RECRUITER_IDENTITY_RESOLVED_STATUS: "active",
+    } as NodeJS.ProcessEnv;
+    const row = {
+      gh_user_id: 5085047004,
+      work_email: "sam.vangelos@turing.com",
+      lifecycle_state: "active",
+      private_candidates_attested: false,
+      private_candidates_attested_at: null,
+      private_candidates_attested_by: null,
+    };
+    const { fetchImpl, calls } = fakeDirectory((call) =>
+      call.method === "PATCH" ? [{ ...row, private_candidates_attested: true }] : [row]
+    );
+    const report = await attestPrivateCandidates(env, ["--email", "sam.vangelos@turing.com", "--by", "Sam"], fetchImpl);
+
+    assert.equal(report.greenhouseUserId, 5085047004);
+    assert.equal(calls[0]!.url.searchParams.get("work_email"), "eq.sam.vangelos@turing.com");
+    assert.equal(calls[0]!.url.searchParams.get("lifecycle_state"), "eq.active");
+    assert.equal(calls[0]!.url.searchParams.get("primary_email"), null,
+      "a directory configured with an email override has no primary_email column to filter on");
+    assert.match(calls[0]!.url.searchParams.get("select") ?? "", /work_email/);
+  });
+
+  it("refuses a PATCH response of [row, null] instead of reading it as one row", async () => {
+    // The malformed element used to be FILTERED OUT before the count, so a two-element body with
+    // one usable row reported success — and "how many rows did that change" is the one answer this
+    // command must never guess at.
+    const { fetchImpl } = fakeDirectory((call) =>
+      call.method === "PATCH" ? [{ ...RESOLVED_ROW, private_candidates_attested: true }, null] : [RESOLVED_ROW]
+    );
+    await assert.rejects(
+      attestPrivateCandidates(ENV, ["--greenhouse-user-id", "5085047004", "--by", "Sam"], fetchImpl),
+      /exactly one/i
+    );
+  });
+
+  it("refuses a PATCH response that is a single unusable element", async () => {
+    const { fetchImpl } = fakeDirectory((call) => (call.method === "PATCH" ? [null] : [RESOLVED_ROW]));
+    await assert.rejects(
+      attestPrivateCandidates(ENV, ["--greenhouse-user-id", "5085047004", "--by", "Sam"], fetchImpl),
+      /exactly one/i
+    );
+  });
+});

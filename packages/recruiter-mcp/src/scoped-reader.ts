@@ -44,15 +44,34 @@ const sharedPermissionProviders = new Map<string, PermissionProviderLike>();
 // that change its behaviour; the KEY never carries the service-role key, only whether one is set.
 const sharedAttestationLookups = new Map<string, PrivateCandidateAttestationLookup>();
 
-function getPrivateCandidateAttestationLookup(env: NodeJS.ProcessEnv): PrivateCandidateAttestationLookup {
-  const key = [
+/**
+ * Everything about the directory that changes what an attestation lookup ANSWERS, and nothing that
+ * is a secret.
+ *
+ * One function, used by both registries, because the two used to disagree: the lookup registry keyed
+ * on the id column, the status column and the resolved-status value; the provider registry keyed on
+ * the URL and the table only. A process that rebuilt a reader with a different id/status column
+ * therefore got a fresh lookup and the OLD memoized provider — whose cached answer still carried the
+ * previous configuration's attestation. Same inputs, same key, in both places.
+ *
+ * The API key is never part of the key — only whether one is set, which is what decides whether the
+ * lookup can run at all.
+ */
+export function privateCandidateAttestationFingerprint(env: NodeJS.ProcessEnv): string {
+  return [
     env.GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_URL ?? "",
     env.GREENHOUSE_RECRUITER_IDENTITY_TABLE ?? "",
     env.GREENHOUSE_RECRUITER_IDENTITY_GREENHOUSE_USER_ID_COLUMN ?? "",
     env.GREENHOUSE_RECRUITER_IDENTITY_STATUS_COLUMN ?? "",
     env.GREENHOUSE_RECRUITER_IDENTITY_RESOLVED_STATUS ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_EMAIL_COLUMN ?? "",
+    env.GREENHOUSE_RECRUITER_IDENTITY_LOOKUP_TIMEOUT_MS ?? "",
     env.GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_KEY ? "keyed" : "unkeyed",
   ].join("|");
+}
+
+function getPrivateCandidateAttestationLookup(env: NodeJS.ProcessEnv): PrivateCandidateAttestationLookup {
+  const key = privateCandidateAttestationFingerprint(env);
   let lookup = sharedAttestationLookups.get(key);
   if (!lookup) {
     lookup = createPrivateCandidateAttestationLookup(env);
@@ -120,8 +139,11 @@ export function createProductionScopedReader(
     `ttl:${ttlMs}`,
     `siteadmin:${disableSiteAdmin ? "off" : "on"}`,
     // The stamp's answer is part of what the memo caches, so a differently-configured directory has
-    // to get its own provider or one process's attestation state would serve another's reads.
-    `attest:${env.GREENHOUSE_RECRUITER_IDENTITY_SUPABASE_URL ?? ""}|${env.GREENHOUSE_RECRUITER_IDENTITY_TABLE ?? ""}`,
+    // to get its own provider or one process's attestation state would serve another's reads. The
+    // FULL fingerprint, not the URL and table: a rebuild that changed only the id or status column
+    // reused the provider memoized under the previous configuration — and with it the positive
+    // attestation that configuration had produced.
+    `attest:${privateCandidateAttestationFingerprint(env)}`,
   ].join("|");
   let permissionProvider = sharedPermissionProviders.get(providerKey);
   if (!permissionProvider) {

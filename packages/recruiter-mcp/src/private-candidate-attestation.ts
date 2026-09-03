@@ -54,6 +54,14 @@ export interface PrivateCandidateAttestationAccess {
   apiKey: string;
   table: string;
   greenhouseUserIdColumn: string;
+  /**
+   * The directory's email column. The runtime lookup never filters on it — it resolves by
+   * Greenhouse user id — but the CLI's `--email` does, and it used to hard-code `primary_email`
+   * while every other identifier honoured its override. On a directory configured with
+   * `GREENHOUSE_RECRUITER_IDENTITY_EMAIL_COLUMN` that filter names a column the table does not
+   * have. Resolved here so the reader and the writer cannot disagree about the schema.
+   */
+  emailColumn: string;
   statusColumn: string;
   resolvedStatus: string;
   timeoutMs: number;
@@ -81,6 +89,11 @@ export function readPrivateCandidateAttestationAccess(
       env.GREENHOUSE_RECRUITER_IDENTITY_GREENHOUSE_USER_ID_COLUMN,
       "greenhouse_user_id",
       "Supabase identity Greenhouse user id column"
+    ),
+    emailColumn: normalizeOptionalSupabaseIdentifier(
+      env.GREENHOUSE_RECRUITER_IDENTITY_EMAIL_COLUMN,
+      "primary_email",
+      "Supabase identity email column"
     ),
     statusColumn: normalizeOptionalSupabaseIdentifier(
       env.GREENHOUSE_RECRUITER_IDENTITY_STATUS_COLUMN,
@@ -261,7 +274,20 @@ export function createPrivateCandidateAttestationStamp(
     async getPermittedJobIds(greenhouseUserId: number, signal?: AbortSignal): Promise<unknown> {
       const scope = await options.chained.getPermittedJobIds(greenhouseUserId, signal);
       if (!isAllAccessScope(scope)) return scope;
-      if (await options.isAttested(greenhouseUserId, signal)) {
+      // A lookup that REJECTS is unattested, not a read failure. The lookup's own contract is
+      // "never throws", but it is injected — a memo wrapper, a test double, a future transport —
+      // and letting a rejection out of here turned a Supabase blip into PERMISSION_LOOKUP_FAILED
+      // for every org-wide actor, i.e. a total read outage. The operator branch in scoped-core has
+      // carried this catch since the first fold; the stamp path did not. The recovery below still
+      // runs, so a directory blip does not ALSO cost the actor the reqs Greenhouse granted them.
+      let attested = false;
+      try {
+        attested = (await options.isAttested(greenhouseUserId, signal)) === true;
+      } catch (error) {
+        if (signal?.aborted) throw signal.reason;
+        attested = false;
+      }
+      if (attested) {
         return { ...scope, privateCandidatesAttested: true };
       }
       const privateCapableJobIds = await explicitPrivateCapableJobIds(

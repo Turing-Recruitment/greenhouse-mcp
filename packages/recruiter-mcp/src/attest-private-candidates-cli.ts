@@ -117,7 +117,7 @@ function readAccess(env: NodeJS.ProcessEnv): DirectoryAccess {
 function selectedColumns(access: DirectoryAccess): string {
   return [
     access.greenhouseUserIdColumn,
-    "primary_email",
+    access.emailColumn,
     access.statusColumn,
     PRIVATE_CANDIDATES_ATTESTED_COLUMN,
     PRIVATE_CANDIDATES_ATTESTED_AT_COLUMN,
@@ -165,8 +165,8 @@ export async function attestPrivateCandidates(
     const matches = await readRows(
       access,
       fetchImpl,
-      [["primary_email", `eq.${parsed.email}`], [access.statusColumn, `eq.${access.resolvedStatus}`]],
-      [access.greenhouseUserIdColumn, "primary_email", access.statusColumn].join(",")
+      [[access.emailColumn, `eq.${parsed.email}`], [access.statusColumn, `eq.${access.resolvedStatus}`]],
+      [access.greenhouseUserIdColumn, access.emailColumn, access.statusColumn].join(",")
     );
     if (matches.length !== 1) {
       throw new Error(
@@ -219,12 +219,21 @@ export async function attestPrivateCandidates(
     throw new Error(`Identity directory attestation update failed with status ${response.status}.`);
   }
   const updated = (await response.json()) as unknown;
-  const rows = Array.isArray(updated)
-    ? updated.filter((row): row is Record<string, unknown> => row !== null && typeof row === "object" && !Array.isArray(row))
-    : [];
-  if (rows.length !== 1) {
+  // COUNT first, then validate the element. Filtering malformed elements out before counting meant
+  // a body of `[row, null]` — two rows changed, one of them unreadable — reported success on the
+  // strength of the readable one. The whole point of `return=representation` is not to guess at how
+  // many rows this granted access to.
+  if (!Array.isArray(updated) || updated.length !== 1) {
     throw new Error(
-      `Expected exactly one resolved directory row for greenhouse_user_id ${greenhouseUserId}; the update returned ${rows.length}.`
+      `Expected exactly one resolved directory row for greenhouse_user_id ${greenhouseUserId}; the update returned ${
+        Array.isArray(updated) ? updated.length : "a non-array response"
+      }.`
+    );
+  }
+  const after = updated[0] as unknown;
+  if (after === null || typeof after !== "object" || Array.isArray(after)) {
+    throw new Error(
+      `Expected exactly one resolved directory row for greenhouse_user_id ${greenhouseUserId}; the update returned an unusable row.`
     );
   }
 
@@ -233,7 +242,7 @@ export async function attestPrivateCandidates(
     table: access.table,
     greenhouseUserId,
     before,
-    after: rows[0]!,
+    after: after as Record<string, unknown>,
     containsTokens: false,
   };
 }
