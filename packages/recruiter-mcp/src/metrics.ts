@@ -93,6 +93,17 @@ export interface MetricDefinition {
    * `created_at`) and they answer different questions.
    */
   windowField?: string;
+  /**
+   * The endpoint(s) this metric's `requiredFields` are actually read FROM.
+   *
+   * Undeclared means "any endpoint", which is what the projection layer assumed for every metric:
+   * dropping `status` from /v3/prospect_pools announced that the hire count was blocked, on a read
+   * that had nothing to do with offers. Declaring it here is what lets evidence-projection key the
+   * blocks_answer omission by (endpoint, field) instead of by field alone. Left undeclared where
+   * the endpoint has not been established — a MISSING blocker is worse than a noisy one, so the
+   * mapping is added with evidence, never guessed.
+   */
+  requiredFieldEndpoints?: string[];
   defaultTimeWindow?: string;
   scopeBehavior: "job" | "job_set" | "permitted_scope" | "org_reference";
   exclusions: string[];
@@ -309,6 +320,9 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Offer resolution mix",
     requiredFacts: ["offer_fact"],
     requiredFields: ["status"],
+    // The offer row's own status. A projection that drops `status` from any OTHER endpoint tells us
+    // nothing about this metric.
+    requiredFieldEndpoints: ["/v3/offers"],
     requiredRoleProfile: "recruiter_default",
     // The clock this metric's window actually moves on — the same one the planner applies
     // (question-answer.ts, `factWindowField`). Declared here so a caller reading the capability
@@ -346,6 +360,7 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     // The hire DATE stays absent: a hire missing resolved_at is dated from sent_on and labeled
     // (buildHireFacts), never fail-closed.
     requiredFields: ["status"],
+    requiredFieldEndpoints: ["/v3/offers"],
     requiredRoleProfile: "recruiter_default",
     windowField: "resolved_at",
     defaultTimeWindow: "last_90_days",
@@ -596,6 +611,7 @@ function computeOfferResolutionMix(context: MetricComputeContext): MetricResult 
   let total = 0;
   let accepted = 0;
   let rejected = 0;
+  const unrecognized = new Map<string, number>();
   for (const fact of offerFacts(context).flatMap((result) => result.facts)) {
     total += 1;
     const key = fact.status ?? "unknown";
@@ -606,6 +622,7 @@ function computeOfferResolutionMix(context: MetricComputeContext): MetricResult 
     const offerClass = classifyOfferStatus(key);
     if (offerClass === "accepted") accepted += 1;
     else if (offerClass === "rejected") rejected += 1;
+    else if (offerClass === "unknown") unrecognized.set(key, (unrecognized.get(key) ?? 0) + 1);
   }
   const resolved = accepted + rejected;
   // The offers that were sent and have not come back. Windowing on `resolved_at` — the clock every
@@ -619,6 +636,14 @@ function computeOfferResolutionMix(context: MetricComputeContext): MetricResult 
     ...(outstanding > 0 ? [{ offer_status: "outstanding_no_resolved_at", offer_count: outstanding }] : []),
   ];
   const readOmissions: string[] = [];
+  if (unrecognized.size > 0) {
+    // Named, not bucketed. These rows are in the mix's `total` and in `groups` under their own
+    // verbatim status, and they are deliberately outside the rate: calling an unrecognized value
+    // accepted, rejected or still-open would move a published number on a guess.
+    readOmissions.push(
+      `${[...unrecognized.values()].reduce((sum, count) => sum + count, 0)} offer(s) carry a status outside the published /v3/offers enum (Created, Accepted, Rejected, Deprecated) and are counted in the mix but excluded from the rate: ${[...unrecognized.entries()].map(([value, count]) => `${value} (${count})`).join(", ")}.`
+    );
+  }
   if (outstanding > 0) {
     readOmissions.push(
       `offers_outstanding: ${outstanding} offer(s) in scope are still open (no resolved_at yet), so the resolved_at window cannot place them and they are outside the rate. They are counted here rather than dropped.`

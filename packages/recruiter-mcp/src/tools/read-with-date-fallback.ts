@@ -1,12 +1,14 @@
 import { httpErrorStatus } from "../upstream-error.js";
 import {
   combineReadStatuses,
+  isCancellationDenial,
   readAllScopedRows,
   type ReadAllOptions,
   type ReadAllRowsResult,
   type ReadAllStatus,
 } from "../read-all.js";
-import type { RecruiterToolRuntime, ToolDeadline } from "../runtime.js";
+import { isToolCancelledError, type RecruiterToolRuntime, type ToolDeadline } from "../runtime.js";
+import type { RecruiterToolResult } from "../types.js";
 
 /**
  * A date window a caller asked for, in the shape both legs of the read need: the field it applies
@@ -129,8 +131,25 @@ export async function readAllWithDateFallback<T extends Record<string, unknown>>
     const supplement = await readFallbackFieldLegs<T>(
       runtime, exposedToolName, scopedToolName, params, windowSpecs, deadline, options
     );
+    // A cancellation on a supplemental leg is not a supplement that failed — it is the client
+    // request ending. It is handed back as the denial it is, never degraded to a warning.
+    if (supplement.cancelled) {
+      return {
+        read: { kind: "denial", result: supplement.cancelled },
+        windowAppliedLocally: false,
+        dateParamsRejected: [],
+        windowFields,
+        rowsMissingField: 0,
+        fallbackFieldsQueried: [],
+        fallbackFieldRowsAdded: 0,
+        fallbackFieldPrivacyWithheld: 0,
+      };
+    }
     return {
-      read: supplement.rows.length > 0 || supplement.warnings.length > 0
+      // Merged whenever a leg RAN, not only when it produced rows or warnings: a leg that
+      // legitimately matched nothing still fetched a page and scanned rows upstream, and dropping
+      // it from the accounting understated the read's cost and hid the leg entirely.
+      read: supplement.legsRun > 0
         ? {
             ...read,
             rows: [...read.rows, ...supplement.rows],
@@ -193,6 +212,10 @@ interface FallbackLegResult<T extends Record<string, unknown>> {
   privacyWithheld: number;
   statuses: ReadAllStatus[];
   warnings: string[];
+  /** Legs ATTEMPTED, including ones that returned nothing or failed. Drives the read merge. */
+  legsRun: number;
+  /** Set when a leg was cancelled: the whole read stops and hands this denial back. */
+  cancelled?: RecruiterToolResult;
 }
 
 /**
@@ -206,7 +229,15 @@ interface FallbackLegResult<T extends Record<string, unknown>> {
  * This is a read the previous version did not make, and it is an EXPANSION, not a narrowing: on
  * `/v3/offers` the native leg 422s live, so it costs nothing there; where an endpoint really does
  * honour the filter it buys back the rows a primary-field-only window would have dropped without
- * saying so. A failure on this leg degrades to a warning: the primary rows are real either way.
+ * saying so.
+ *
+ * Each leg runs through `readAllWithDateFallback` itself — its own field as its own primary spec,
+ * no fallbacks of its own, so the recursion is exactly one level deep. That is what gives the leg
+ * the SAME 422 self-heal the primary leg has: before this, a 422 on the sent_on leg (the endpoint
+ * where the 422 is the documented live behaviour) became a warning on a `complete: true` answer
+ * that was quietly missing every sent_on-dated hire. A leg that fails for any OTHER reason still
+ * degrades — the primary rows are real either way — but it marks the combined read
+ * `incomplete_upstream` and names the field, so a short set can never read as a whole one.
  */
 async function readFallbackFieldLegs<T extends Record<string, unknown>>(
   runtime: RecruiterToolRuntime,
@@ -225,6 +256,7 @@ async function readFallbackFieldLegs<T extends Record<string, unknown>>(
     privacyWithheld: 0,
     statuses: [],
     warnings: [],
+    legsRun: 0,
   };
   for (const spec of windowSpecs) {
     const fallbacks = spec.fallbackFields ?? [];
@@ -236,17 +268,32 @@ async function readFallbackFieldLegs<T extends Record<string, unknown>>(
         ...Object.fromEntries(Object.entries(params).filter(([key]) => !ownKeys.has(key))),
         ...bracketParamsForWindows([legSpec]),
       };
-      let read: ReadAllRowsResult<T>;
+      result.legsRun += 1;
+      let outcome: DateFallbackOutcome<T>;
       try {
-        read = await readAllScopedRows<T>(runtime, exposedToolName, scopedToolName, legParams, deadline, options);
-      } catch (error) {
-        result.warnings.push(
-          `the ${field} leg of the ${spec.field} window failed (${error instanceof Error ? error.message : String(error)}), so rows carrying only ${field} may be missing`
+        // One level of recursion: legSpec declares no fallbackFields of its own, so this call
+        // makes no further legs. It buys the leg the primary leg's 422 self-heal.
+        outcome = await readAllWithDateFallback<T>(
+          runtime, exposedToolName, scopedToolName, legParams, [legSpec], deadline, options
         );
+      } catch (error) {
+        if (isToolCancelledError(error)) throw error;
+        result.warnings.push(
+          `the ${field} leg of the ${spec.field} window failed (${error instanceof Error ? error.message : String(error)}), so rows carrying only ${field} are missing from this set`
+        );
+        result.statuses.push("incomplete_upstream");
         continue;
       }
+      const read = outcome.read;
       if (read.kind === "denial") {
-        result.warnings.push(`the ${field} leg of the ${spec.field} window was denied, so rows carrying only ${field} may be missing`);
+        if (isCancellationDenial(read.result)) {
+          result.cancelled = read.result;
+          return result;
+        }
+        result.warnings.push(
+          `the ${field} leg of the ${spec.field} window was denied${read.result.ok === false ? ` (${read.result.denial.code})` : ""}, so rows carrying only ${field} are missing from this set`
+        );
+        result.statuses.push("incomplete_upstream");
         continue;
       }
       result.fieldsQueried.push(field);
@@ -255,6 +302,11 @@ async function readFallbackFieldLegs<T extends Record<string, unknown>>(
       result.privacyWithheld += read.privacyWithheld;
       result.statuses.push(read.status);
       result.warnings.push(...read.warnings);
+      if (outcome.windowAppliedLocally) {
+        result.warnings.push(
+          `the upstream rejected the ${field} filter (${outcome.dateParamsRejected.join(", ")}), so that leg's window was applied locally to the complete scoped set`
+        );
+      }
       // Only the rows this leg alone can supply: everything earlier in the fallback order absent.
       const earlier = [spec.field, ...fallbacks.slice(0, index)];
       const recovered = read.rows.filter((row) => earlier.every((name) => !isPresentString(row[name])));

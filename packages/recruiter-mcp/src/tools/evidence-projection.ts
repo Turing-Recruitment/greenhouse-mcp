@@ -7,7 +7,7 @@ import type {
 } from "../types.js";
 import { readApplicationJobId } from "./application-shapes.js";
 import type { EvidenceEndpointAdapter } from "./scoped-endpoint-adapters.js";
-import { METRIC_REGISTRY } from "../metrics.js";
+import { METRIC_REGISTRY, METRIC_REGISTRY_BY_ID } from "../metrics.js";
 import {
   isForbiddenEvidencePayloadKey,
   looksLikeSensitiveEvidenceString,
@@ -306,6 +306,27 @@ const METRIC_IDS_BY_REQUIRED_FIELD: ReadonlyMap<string, string[]> = (() => {
   }
   return map;
 })();
+
+/**
+ * Which registered metrics an omitted field actually BLOCKS on THIS endpoint.
+ *
+ * The map above is keyed by field alone, and it was consulted on every endpoint's projection, so a
+ * projection that dropped `status` from `/v3/prospect_pools` — an endpoint that carries no offers
+ * at all — announced that the HIRE COUNT could not be answered. A false blocker on a read that was
+ * fine is how an operator learns to ignore the disclosure block, which costs more than the noise.
+ *
+ * A metric that declares `requiredFieldEndpoints` is only implicated on those endpoints. A metric
+ * that declares none keeps the previous field-only behaviour: that is not timidity, it is the
+ * absence of evidence — nobody has yet established which endpoint each of those metrics' fields is
+ * read from, and inventing the mapping here would trade a false blocker for a MISSING one, which is
+ * the worse direction. The two offer metrics are declared because their endpoint is known.
+ */
+export function metricsBlockedByOmittedField(endpointPath: string, field: string): string[] {
+  return (METRIC_IDS_BY_REQUIRED_FIELD.get(field) ?? []).filter((metricId) => {
+    const endpoints = METRIC_REGISTRY_BY_ID.get(metricId)?.requiredFieldEndpoints;
+    return endpoints === undefined || endpoints.includes(endpointPath);
+  });
+}
 
 /**
  * Custom-field VALUES restricted by Greenhouse's "View Private" permission.
@@ -868,7 +889,8 @@ function buildProjectionMetadata(
   // An omission BLOCKS the answer only when a registered metric actually requires that field.
   const requiredFieldOmissions: RecruiterProjectionRequiredFieldOmission[] = [];
   for (const omitted of omittedFields) {
-    for (const metricId of METRIC_IDS_BY_REQUIRED_FIELD.get(omitted.field) ?? []) {
+    // Keyed by (endpoint, field), not by field alone: see metricsBlockedByOmittedField.
+    for (const metricId of metricsBlockedByOmittedField(adapter.endpointPath, omitted.field)) {
       requiredFieldOmissions.push({
         metricOrFact: metricId,
         endpointPath: adapter.endpointPath,

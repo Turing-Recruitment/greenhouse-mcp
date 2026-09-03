@@ -323,6 +323,40 @@ describe("H2b reconciliationLine — one definition of a hire", () => {
     );
   });
 
+  it("keys the version chain off the HIRES, so a stray row cannot inflate offer rows per hire", async () => {
+    // The bridges were keyed off the RETURNED ROWS while the ratio's denominator came from the
+    // facts, so one row the fact builder refuses put its versions in the numerator and itself out
+    // of the denominator — the same "count rows, not hires" bug the line was built to end, one
+    // level down. Found folding fold 2, not in the fold list.
+    const stray = { id: 99, job_id: 10, application_id: 199, candidate_id: 1099, status: "Created", sent_on: "2026-05-01", resolved_at: "2026-05-10T12:00:00.000Z" };
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_offers" && params?.current_only === false) {
+        const ids = String(params?.application_ids ?? "").split(",").filter(Boolean).map(Number);
+        // Two versions per application asked for, so a stray id shows up as two extra rows.
+        return scopedSuccess(toolName, ids.flatMap((id) => [
+          { id, job_id: 10, application_id: id, status: "Accepted", version: 2, resolved_at: "2026-05-10T12:00:00.000Z" },
+          { id: id + 5000, job_id: 10, application_id: id, status: "Deprecated", version: 1, resolved_at: "2026-05-01T12:00:00.000Z" },
+        ]));
+      }
+      if (toolName === "list_offers") return scopedSuccess(toolName, [...ACCEPTED_OFFERS, stray]);
+      if (toolName === "list_applications") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, { includeChain: true });
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    const chainCall = reader.calls.find((call) => call.params?.current_only === false);
+    assert.ok(!String(chainCall?.params?.application_ids ?? "").split(",").includes("199"), "the stray row's application never reaches the chain read");
+    assert.equal(result.line.accepted_current_offers.value, 10);
+    assert.equal(result.line.offer_rows_per_hire.value, 2, "20 version rows across 10 hires, not 22 across 10");
+  });
+
   it("says offer rows per hire is undefined, not null, when the window holds no hires", async () => {
     const reader = fakeScopedReader((toolName) => {
       if (toolName === "list_offers") return scopedSuccess(toolName, []);
@@ -463,7 +497,6 @@ describe("H2c reconciliationLine — the openings read discloses what it did", (
 
   it("reads NOTHING for an explicitly empty req set on any of the three counts", async () => {
     const reader = fakeScopedReader((toolName) => {
-      if (toolName === "list_close_reasons") return scopedSuccess(toolName, []);
       throw new Error(`an empty scope must not read ${toolName}`);
     });
     const { runtime } = testRuntime(reader);
@@ -483,10 +516,162 @@ describe("H2c reconciliationLine — the openings read discloses what it did", (
     assert.equal(result.line.openings_closed_by_hire.value, 0);
     assert.equal(result.line.applications_status_hired_scope_all_time?.value, 0);
     assert.deepStrictEqual(
-      toolNames(reader.calls).filter((name) => name !== "list_close_reasons"),
+      toolNames(reader.calls),
       [],
-      "an empty explicit scope reads no offers, no applications and no openings"
+      "an empty explicit scope reads NOTHING — not offers, not applications, not openings, and not the close-reason dictionary it has no ids to resolve"
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H2d: every read behind the line is contained, and a cancellation is the one
+// thing that stops it.
+//
+// readAllScopedRows rethrows a 5xx, so the openings read, the close-reason
+// dictionary and the all-time count could each escape as an exception and
+// destroy two counts that had already been computed off completed reads.
+// ---------------------------------------------------------------------------
+describe("H2d reconciliationLine — contained reads, propagated cancellation", () => {
+  function failingReader(failing: string, thrown: Error) {
+    const base = reconciliationReader();
+    return fakeScopedReader((toolName, params) => {
+      if (toolName === failing) throw thrown;
+      return base.scopedRead(undefined as never, toolName, params, undefined);
+    });
+  }
+
+  for (const [label, failing, options] of [
+    ["the closed-openings read", "list_openings", { includeOpenings: true }],
+    ["the close-reason dictionary", "list_close_reasons", { includeOpenings: true }],
+  ] as const) {
+    it(`keeps the other counts when ${label} fails upstream`, async () => {
+      const reader = failingReader(failing, new Error(`Greenhouse API error: 500 Internal Server Error (/${failing}) [correlation_id=test]`));
+      const { runtime } = testRuntime(reader);
+
+      const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, options);
+
+      assert.equal(result.kind, "line", "one broken population must not destroy two computed counts");
+      if (result.kind !== "line") return;
+      assert.equal(result.line.accepted_current_offers.value, 10);
+      assert.equal(result.line.accepted_offer_applications_marked_hired.value, 8);
+      assert.equal(result.line.openings_closed_by_hire.not_read, true);
+      assert.ok(
+        result.line.openings_closed_by_hire.notes.some((note) => /500|could not be read/i.test(note)),
+        `the failure is named on the count, got ${JSON.stringify(result.line.openings_closed_by_hire.notes)}`
+      );
+    });
+  }
+
+  it("keeps the other counts when the all-time hired-application read fails upstream", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_applications" && params?.status === "hired") {
+        throw new Error("Greenhouse API error: 500 Internal Server Error (/applications) [correlation_id=test]");
+      }
+      return reconciliationReader().scopedRead(undefined as never, toolName, params, undefined);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, {
+      includeAllTimeHiredApplications: true,
+    });
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    assert.equal(result.line.accepted_current_offers.value, 10);
+    assert.equal(result.line.applications_status_hired_scope_all_time?.not_read, true);
+  });
+
+  for (const failing of ["list_applications", "list_openings"] as const) {
+    it(`propagates a cancellation on ${failing} rather than answering a client that has gone`, async () => {
+      const reader = failingReader(failing, new Error("SCOPED_GREENHOUSE_TOOL_CANCELLED"));
+      const { runtime } = testRuntime(reader);
+
+      const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, { includeOpenings: true });
+
+      assert.equal(result.kind, "denial");
+      if (result.kind !== "denial") return;
+      assert.equal(result.result.ok === false && result.result.denial.code, "CANCELLED");
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// H2e: a count from a read that stopped early is a FLOOR, and says so.
+//
+// Every count carried an exact value regardless of the status of the read behind
+// it, so a bridge that timed out after one batch of 50 rendered "50 of those
+// applications are marked hired" beside a complete offer count — a confident
+// wrong number, which is the failure this whole line exists to prevent.
+// ---------------------------------------------------------------------------
+describe("H2e reconciliationLine — a truncated read yields a floor, not a number", () => {
+  const SIXTY_OFFERS = Array.from({ length: 60 }, (_, index) => ({
+    id: index + 1,
+    job_id: 10,
+    application_id: 100 + index,
+    candidate_id: 1000 + index,
+    status: "Accepted",
+    sent_on: "2026-05-01",
+    resolved_at: "2026-05-10T12:00:00.000Z",
+  }));
+
+  it("marks the bridged count partial and renders 'at least N' when batch two times out", async () => {
+    let batches = 0;
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_offers") return scopedSuccess(toolName, SIXTY_OFFERS);
+      if (toolName === "list_applications") {
+        batches += 1;
+        if (batches > 1) throw new Error("SCOPED_GREENHOUSE_TOOL_TIMEOUT:deadline");
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    assert.equal(batches, 2, "the bridge really did run more than one batch");
+    const count = result.line.accepted_offer_applications_marked_hired;
+    assert.equal(count.value, 50, "the rows that did come back are real");
+    assert.equal(count.partial, true, "but they are only part of the accepted set");
+    assert.equal(result.line.accepted_current_offers.partial, false, "the offer read completed, so its count is exact");
+    const rendered = hireReconciliationSummary(result.line);
+    assert.match(rendered, /at least 50 of those applications are marked hired/);
+    assert.match(rendered, /60 accepted current offers/, "the complete count is NOT hedged");
+    assert.ok(!/at least 60 accepted/.test(rendered), "a floor on a complete read would be a false hedge");
+    assert.ok(
+      count.notes.some((note) => /stopped before every id batch|did not finish|floor/i.test(note)),
+      `the count says which read stopped, got ${JSON.stringify(count.notes)}`
+    );
+  });
+
+  it("marks the accepted-offer count itself partial when the hire read is the one that stops", async () => {
+    const jobIds = Array.from({ length: 60 }, (_, index) => 9_000_000 + index);
+    let offerChunks = 0;
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_offers" && params?.["resolved_at[gte]"] !== undefined) {
+        offerChunks += 1;
+        if (offerChunks > 1) throw new Error("SCOPED_GREENHOUSE_TOOL_TIMEOUT:deadline");
+        return scopedSuccess(toolName, SIXTY_OFFERS.slice(0, 10));
+      }
+      if (toolName === "list_offers") return scopedSuccess(toolName, []);
+      if (toolName === "list_applications") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", { jobIds, label: "60 named reqs" }, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    assert.equal(result.line.accepted_current_offers.value, 10);
+    assert.equal(result.line.accepted_current_offers.partial, true);
+    assert.match(hireReconciliationSummary(result.line), /at least 10 accepted current offers/);
   });
 });
 

@@ -94,7 +94,7 @@ export interface RecruiterToolSuccess<T = unknown> {
 export interface EvidenceReadEnvelope {
   // True only when every cursor page was fetched (no deadline/rate-limit/page-cap truncation).
   complete: boolean;
-  status: "complete" | "incomplete_scope_resolution" | "incomplete_timeout" | "incomplete_rate_limited" | "incomplete_page_cap";
+  status: "complete" | "incomplete_scope_resolution" | "incomplete_timeout" | "incomplete_rate_limited" | "incomplete_page_cap" | "incomplete_upstream";
   /** Rows admitted by scope filtering across all upstream reads; bridge hops are included. */
   rows_returned: number;
   raw_rows_read: number;
@@ -144,11 +144,11 @@ export interface EvidenceBridgeEnvelope {
   // id-derivation read(s). Emitted by the R2 scorecard/interview/candidate bridges. The original
   // application_ids bridge keeps its own field names below, so its envelope is byte-for-byte unchanged.
   scoped_id_count?: number;
-  derive_read_status?: "complete" | "incomplete_scope_resolution" | "incomplete_timeout" | "incomplete_rate_limited" | "incomplete_page_cap";
+  derive_read_status?: "complete" | "incomplete_scope_resolution" | "incomplete_timeout" | "incomplete_rate_limited" | "incomplete_page_cap" | "incomplete_upstream";
   derive_read_complete?: boolean;
   // L1 application_ids-bridge disclosure (present only when via === "application_ids").
   scoped_application_count?: number;
-  application_read_status?: "complete" | "incomplete_scope_resolution" | "incomplete_timeout" | "incomplete_rate_limited" | "incomplete_page_cap";
+  application_read_status?: "complete" | "incomplete_scope_resolution" | "incomplete_timeout" | "incomplete_rate_limited" | "incomplete_page_cap" | "incomplete_upstream";
   application_read_complete?: boolean;
 }
 

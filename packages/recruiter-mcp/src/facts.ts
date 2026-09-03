@@ -403,25 +403,34 @@ export const HIRE_ACCEPTED_OFFER_STATUS = "Accepted";
 /**
  * What an offer row's status MEANS, decided in exactly one place.
  *
- * Before this there were two answers in one report: the hire count matched `Accepted` exactly while
- * the acceptance mix matched case-insensitively on a substring, so on a tenant that writes
- * "accepted" or "Accepted - verbal" the lead sentence and the rate beneath it counted different
- * offers and neither said so. Offer status vocabulary is TENANT-DEFINED (this tenant capitalizes:
- * Accepted / Rejected / Created / Deprecated), so the tolerant reading is the correct one — but it
- * has to be the ONLY one.
+ * Classified against the ENUM the vendored contract publishes for `/v3/offers.status` —
+ * `Created`, `Accepted`, `Rejected`, `Deprecated` (harvest-v3-registry.generated.ts, from
+ * docs/harvest-v3-api/raw/reference/0130-get_v3-offers.md) — matched on the whole normalized
+ * value, case- and whitespace-tolerant.
  *
- * `superseded` is checked first: a Deprecated row is a previous version of an offer, not an
- * outcome, and it must never land in a rate's denominator.
+ * It is NOT a substring match, and that is the fix rather than a narrowing. `includes("accept")`
+ * read `"Not Accepted"` — a refusal — as a hire, which is the exact opposite of what the row says,
+ * and it contradicted the hire metric's own stated exclusion ("offers whose status is not exactly
+ * Accepted are excluded"). A value outside the enum is `unknown`: it is counted and named in the
+ * omissions, never guessed into a bucket. Guessing is how one unrecognized tenant vocabulary word
+ * silently moves a hire count.
+ *
+ * `superseded` still comes first in meaning: a Deprecated row is a previous version of an offer,
+ * not an outcome, and it must never land in a rate's denominator.
  */
 export type OfferStatusClass = "accepted" | "rejected" | "superseded" | "outstanding" | "unknown";
+
+const OFFER_STATUS_CLASS_BY_VALUE: ReadonlyMap<string, OfferStatusClass> = new Map([
+  ["deprecated", "superseded"],
+  ["rejected", "rejected"],
+  ["accepted", "accepted"],
+  ["created", "outstanding"],
+]);
 
 export function classifyOfferStatus(status: unknown): OfferStatusClass {
   const normalized = typeof status === "string" ? status.trim().toLowerCase() : "";
   if (normalized.length === 0) return "unknown";
-  if (normalized.includes("deprecat")) return "superseded";
-  if (normalized.includes("reject") || normalized.includes("declin")) return "rejected";
-  if (normalized.includes("accept")) return "accepted";
-  return "outstanding";
+  return OFFER_STATUS_CLASS_BY_VALUE.get(normalized) ?? "unknown";
 }
 
 /**
@@ -443,6 +452,7 @@ export function buildHireFacts(
   let notAccepted = 0;
   let datedFromSentOn = 0;
   let undated = 0;
+  const unrecognizedStatuses = new Map<string, number>();
 
   for (const row of records) {
     const offerId = positiveInteger(row.id);
@@ -452,7 +462,14 @@ export function buildHireFacts(
       continue;
     }
     const status = stringField(row.status);
-    if (classifyOfferStatus(status) !== "accepted") {
+    const statusClass = classifyOfferStatus(status);
+    if (statusClass !== "accepted") {
+      // A status OUTSIDE the published enum is its own disclosure. Folding it into "not Accepted"
+      // said the row was a known non-hire when the truth is that nobody here knows what it is —
+      // and on a tenant that renames a status, that difference is the whole hire count.
+      if (statusClass === "unknown" && status !== undefined) {
+        unrecognizedStatuses.set(status, (unrecognizedStatuses.get(status) ?? 0) + 1);
+      }
       notAccepted += 1;
       continue;
     }
@@ -487,6 +504,9 @@ export function buildHireFacts(
     ...projectionOmissions.map((omission) => `${omission.metricOrFact}:${omission.endpointPath}.${omission.field}:${omission.impact}`),
     ...(missingIdentifiers > 0 ? [`${missingIdentifiers} offer row(s) omitted because required identifiers were missing.`] : []),
     ...(notAccepted > 0 ? [`${notAccepted} offer row(s) excluded because their status is not Accepted (only accepted offers count as hires).`] : []),
+    ...(unrecognizedStatuses.size > 0
+      ? [`${[...unrecognizedStatuses.values()].reduce((sum, count) => sum + count, 0)} offer row(s) carried a status that is not recognized against the published /v3/offers enum (Created, Accepted, Rejected, Deprecated) and were excluded rather than guessed at: ${[...unrecognizedStatuses.entries()].map(([value, count]) => `${value} (${count})`).join(", ")}.`]
+      : []),
     ...(datedFromSentOn > 0
       ? [`${datedFromSentOn} hire(s) carried no resolved_at and were dated from sent_on instead — an approximation of the hire date, labeled on each row as dated_from: "sent_on".`]
       : []),
