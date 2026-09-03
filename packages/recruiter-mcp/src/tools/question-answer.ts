@@ -325,6 +325,21 @@ export async function runRecruitingQuestionAnswer(
     return auditDenied ?? result;
   }
 
+  // P3-router: the question's own time window reaches the recipes. "this month" was parsed for
+  // the planned-domain path only, so a RECIPE question carrying the same phrase silently answered
+  // over the recipe's default lookback — an all-time-ish number under a month-shaped question. A
+  // phrase the recruiter said out loud is a stated intent and runs exactly like an explicit
+  // window, uncapped: maxLookbackDays exists only to bound the FUZZY default (limits.ts:475-480),
+  // is applied in memory after a full read, and so guards no API cost.
+  const appliedTimeWindow = resolveQuestionTimeWindow(question, params, runtime.now());
+  if (appliedTimeWindow?.origin === "question") {
+    params = {
+      ...params,
+      window_start: appliedTimeWindow.window_start,
+      window_end: appliedTimeWindow.window_end,
+    };
+  }
+
   const selected = selectRecipes(question, params);
   if (selected.length === 0) {
     // No recognized domain and no recipe matched: an unrecognized question. Degrade honestly to
@@ -519,6 +534,7 @@ export async function runRecruitingQuestionAnswer(
         completeness_status: headlineCompleteness,
         data_domains: plan.requiredEndpoints,
         projection_profile: plan.requiredProjectionProfile,
+        applied_time_window: appliedTimeWindow,
         plan,
         scope_boundary: "All recipe reads run through the recruiter scopedRead surface; no raw Greenhouse client access or model-supplied actor ids are used.",
         ...(scopeHeader ? { scope: scopeHeader } : {}),
@@ -752,6 +768,40 @@ export function parseQuestionTimeWindow(
   return null;
 }
 
+export interface AppliedTimeWindow {
+  label: string | null;
+  window_start: string | null;
+  window_end: string | null;
+  origin: "question" | "explicit";
+}
+
+/**
+ * What time window this answer actually ran over, and where it came from. Either explicit bound is
+ * a deliberate instruction, so its PRESENCE blocks parsing entirely — reading the sentence on top
+ * of it would silently overwrite half of what the caller asked for. A one-sided explicit window is
+ * reported as exactly that; no second bound is invented, because each recipe's own summary already
+ * states the interval it resolved.
+ */
+export function resolveQuestionTimeWindow(
+  question: string,
+  params: Record<string, unknown>,
+  nowMs: number
+): AppliedTimeWindow | null {
+  const explicitStart = typeof params.window_start === "string" ? params.window_start : null;
+  const explicitEnd = typeof params.window_end === "string" ? params.window_end : null;
+  if (explicitStart !== null || explicitEnd !== null) {
+    return { label: null, window_start: explicitStart, window_end: explicitEnd, origin: "explicit" };
+  }
+  const parsed = parseQuestionTimeWindow(question, nowMs);
+  if (!parsed) return null;
+  return {
+    label: parsed.label,
+    window_start: new Date(parsed.startMs).toISOString(),
+    window_end: new Date(parsed.endMs).toISOString(),
+    origin: "question",
+  };
+}
+
 async function executePlannedDomain(
   runtime: RecruiterToolRuntime,
   question: string,
@@ -871,6 +921,17 @@ async function executePlannedDomain(
         rows_read: read.rawRowsRead,
         rows_considered: (scopedFactResult.facts as unknown[]).length,
         completeness_status: completeness,
+        // The same disclosure the recipe path carries. This path runs BEFORE the router forwards a
+        // phrase window, so its origin is read from the caller's own params: a phrase keeps its own
+        // label ("this month"), never the "explicit window params" wording.
+        applied_time_window: appliedWindow
+          ? {
+              label: appliedWindow.label,
+              window_start: new Date(appliedWindow.startMs).toISOString(),
+              window_end: new Date(appliedWindow.endMs).toISOString(),
+              origin: Number.isFinite(explicitStart) && Number.isFinite(explicitEnd) ? "explicit" : "question",
+            }
+          : null,
         data_domains: missingDomain.requiredEndpoints,
         projection_profile: missingDomain.requiredProjectionProfile,
         scope_boundary: scopeIds && binding.factJobIdField

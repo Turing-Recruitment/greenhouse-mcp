@@ -537,3 +537,138 @@ describe("recruiting question planner", () => {
     assert.equal(auditSink.events[0]?.denialCode, "INVALID_REQUEST");
   });
 });
+
+// ---------------------------------------------------------------------------
+// P3-router: a question's own time window reaches the recipes.
+// "this month" used to be parsed for the planned-domain path only; a recipe question
+// carrying the same phrase silently answered over the recipe's default lookback.
+// ---------------------------------------------------------------------------
+
+const NOW_MS = Date.parse("2026-06-23T12:00:00.000Z");
+
+function windowReader() {
+  return fakeScopedReader((toolName) => {
+    if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+    if (toolName === "list_applications") {
+      return scopedSuccess(toolName, [
+        { id: 100, candidate_id: 1000, job_id: 10, source_id: 1, referrer_id: 2, status: "active", applied_at: "2026-06-10T00:00:00.000Z", last_activity_at: "2026-06-11T00:00:00.000Z", stage_id: 7, stage_name: "Phone Screen", current_stage_at: "2026-06-10T00:00:00.000Z" },
+      ]);
+    }
+    if (toolName === "list_application_stages") {
+      return scopedSuccess(toolName, [
+        { id: 4001, application_id: 100, job_interview_stage_id: 7, entered_at: "2026-06-10T00:00:00.000Z", exited_at: null, days_in_stage: 13, current: true },
+      ]);
+    }
+    if (toolName === "list_sources") return scopedSuccess(toolName, [{ id: 1, name: "LinkedIn", type: { id: 2, name: "Job Board" } }]);
+    if (toolName === "list_referrers") return scopedSuccess(toolName, [{ id: 2, name: "Alice Referrer" }]);
+    throw new Error(`unexpected scoped tool ${toolName}`);
+  });
+}
+
+describe("recruiting question planner — the question's own time window", () => {
+  it("A12: forwards a phrase window to every selected recipe and discloses it", async () => {
+    const reader = windowReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "How many candidates did we source from LinkedIn this month?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.deepStrictEqual(data.summary.selected_recipes, ["source_quality"]);
+    assert.deepStrictEqual(data.summary.applied_time_window, {
+      label: "this month",
+      window_start: "2026-06-01T00:00:00.000Z",
+      window_end: "2026-06-23T12:00:00.000Z",
+      origin: "question",
+    });
+    assert.equal(data.analyses[0].params.window_start, "2026-06-01T00:00:00.000Z");
+    assert.equal(data.analyses[0].params.window_end, "2026-06-23T12:00:00.000Z");
+  });
+
+  it("A12b: a phrase window runs UNCAPPED — a stated intent is not a fuzzy default", async () => {
+    const reader = windowReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What did our source quality look like over the last 400 days?",
+    });
+
+    // maxLookbackDays (365) exists only to bound the FUZZY default window (limits.ts:475-480).
+    // A window the recruiter stated out loud must not be denied by it.
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.applied_time_window.label, "last 400 days");
+    assert.equal(data.summary.applied_time_window.origin, "question");
+    assert.equal(data.summary.applied_time_window.window_start, new Date(NOW_MS - 400 * 86_400_000).toISOString());
+    assert.equal(data.analyses[0].status, "ok", "an explicitly asked 400-day window must not be denied");
+    assert.deepStrictEqual(data.denials, []);
+  });
+
+  it("A13: ONE explicit bound blocks parsing and is reported one-sided, not completed into an interval", async () => {
+    const reader = windowReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "How is source quality trending last quarter?",
+      window_start: "2026-05-01T00:00:00.000Z",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.deepStrictEqual(data.summary.applied_time_window, {
+      label: null,
+      window_start: "2026-05-01T00:00:00.000Z",
+      window_end: null,
+      origin: "explicit",
+    });
+    assert.equal(data.analyses[0].params.window_start, "2026-05-01T00:00:00.000Z");
+    assert.equal(data.analyses[0].params.window_end, undefined, "the phrase must not fill in the missing bound");
+  });
+
+  it("A14: no phrase and no explicit bound means no window params and no claim of one", async () => {
+    const reader = windowReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "Where are the stage latency bottlenecks?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.applied_time_window, null);
+    assert.equal(data.analyses[0].params.window_start, undefined);
+    assert.equal(data.analyses[0].params.window_end, undefined);
+  });
+
+  it("A14b: the planned-domain path discloses the phrase label, not 'explicit window params'", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") {
+        return scopedSuccess(toolName, [
+          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01" },
+          { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-06-02" },
+        ]);
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is the offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "planned_metric");
+    assert.deepStrictEqual(data.summary.applied_time_window, {
+      label: "this month",
+      window_start: "2026-06-01T00:00:00.000Z",
+      window_end: "2026-06-23T12:00:00.000Z",
+      origin: "question",
+    });
+    assert.ok((data.answer.omissions as string[]).some((line) => line.includes("this month")));
+    assert.ok(!(data.answer.omissions as string[]).some((line) => line.includes("explicit window params")));
+  });
+});
