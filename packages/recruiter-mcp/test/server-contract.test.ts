@@ -160,7 +160,7 @@ describe("recruiter MCP server contract", () => {
     assert.equal("match_mode" in resolveSchema, false);
   });
 
-  it("marks every recruiter MCP tool as read-only and non-destructive", () => {
+  it("marks every recruiter MCP tool as read-only and non-destructive, and titles it", () => {
     const scopedReader = fakeScopedReader((toolName) => scopedSuccess(toolName, []));
     const { runtime } = testRuntime(scopedReader);
     const annotations = new Map<string, Record<string, unknown>>();
@@ -174,7 +174,20 @@ describe("recruiter MCP server contract", () => {
 
     assert.equal(registered.length, RECRUITER_TOOL_DEFINITIONS.length);
     for (const name of registered) {
-      assert.deepStrictEqual(annotations.get(name), RECRUITER_READ_ONLY_TOOL_ANNOTATIONS);
+      const emitted = annotations.get(name);
+      assert.ok(emitted, `${name} registered without annotations`);
+      // The SAFETY TRIPLE is the contract the container self-check and the distribution validator
+      // read; it must still be exactly the read-only one. A deep-equal against the shared constant
+      // can no longer express that, because each registration now carries its own `title` — a
+      // per-tool value that cannot live on a shared frozen object.
+      assert.equal(emitted!.readOnlyHint, RECRUITER_READ_ONLY_TOOL_ANNOTATIONS.readOnlyHint, name);
+      assert.equal(emitted!.destructiveHint, RECRUITER_READ_ONLY_TOOL_ANNOTATIONS.destructiveHint, name);
+      assert.equal(emitted!.idempotentHint, RECRUITER_READ_ONLY_TOOL_ANNOTATIONS.idempotentHint, name);
+      assert.equal(emitted!.openWorldHint, RECRUITER_READ_ONLY_TOOL_ANNOTATIONS.openWorldHint, name);
+      assert.equal(typeof emitted!.title, "string", `${name} must carry a human-readable title`);
+      assert.ok(String(emitted!.title).length > 0, `${name} must carry a non-empty title`);
+      // And the shared constant itself must never have been mutated into carrying one.
+      assert.equal((RECRUITER_READ_ONLY_TOOL_ANNOTATIONS as { title?: unknown }).title, undefined);
     }
   });
 

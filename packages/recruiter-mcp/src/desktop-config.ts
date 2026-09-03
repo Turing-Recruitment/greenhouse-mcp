@@ -87,7 +87,7 @@ export interface DesktopConfigFileManifest {
 }
 
 const DEFAULT_SERVER_NAME = "greenhouse-recruiter";
-const DEFAULT_SERVER_DESCRIPTION = "Recruiter-scoped Greenhouse read and analysis tools.";
+const DEFAULT_SERVER_DESCRIPTION = "Recruiter-scoped Greenhouse evidence and analysis; write actions appear only for entitled sessions.";
 const SENSITIVE_DIR_MODE = 0o700;
 const SENSITIVE_FILE_MODE = 0o600;
 const SENSITIVE_ARTIFACT_EXISTS_MESSAGE = "Refusing to overwrite existing sensitive recruiter artifact; choose an empty output directory.";

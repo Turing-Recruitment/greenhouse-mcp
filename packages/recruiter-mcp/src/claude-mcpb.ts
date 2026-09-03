@@ -88,7 +88,7 @@ export async function buildClaudeMcpb(options: BuildClaudeMcpbOptions): Promise<
       name: safeMcpbName(serverName),
       display_name: "Greenhouse Recruiting Assistant",
       version: "1.0.0",
-      description: "Read-only, recruiter-scoped Greenhouse evidence and analysis.",
+      description: "Recruiter-scoped Greenhouse evidence and analysis; write actions appear only for entitled sessions.",
       long_description: "Private pilot extension connecting Claude Desktop to the hosted recruiter-scoped Greenhouse MCP.",
       author: { name: "Talent Operations" },
       server: {
