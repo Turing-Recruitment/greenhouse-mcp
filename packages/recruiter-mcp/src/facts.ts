@@ -397,8 +397,32 @@ export interface HireFact {
   custom_fields?: Record<string, unknown>;
 }
 
-/** Greenhouse's offer status for an accepted offer, matched exactly (never by substring). */
+/** The value the /v3/offers `status` filter is sent, verbatim, on the hire read's wire request. */
 export const HIRE_ACCEPTED_OFFER_STATUS = "Accepted";
+
+/**
+ * What an offer row's status MEANS, decided in exactly one place.
+ *
+ * Before this there were two answers in one report: the hire count matched `Accepted` exactly while
+ * the acceptance mix matched case-insensitively on a substring, so on a tenant that writes
+ * "accepted" or "Accepted - verbal" the lead sentence and the rate beneath it counted different
+ * offers and neither said so. Offer status vocabulary is TENANT-DEFINED (this tenant capitalizes:
+ * Accepted / Rejected / Created / Deprecated), so the tolerant reading is the correct one — but it
+ * has to be the ONLY one.
+ *
+ * `superseded` is checked first: a Deprecated row is a previous version of an offer, not an
+ * outcome, and it must never land in a rate's denominator.
+ */
+export type OfferStatusClass = "accepted" | "rejected" | "superseded" | "outstanding" | "unknown";
+
+export function classifyOfferStatus(status: unknown): OfferStatusClass {
+  const normalized = typeof status === "string" ? status.trim().toLowerCase() : "";
+  if (normalized.length === 0) return "unknown";
+  if (normalized.includes("deprecat")) return "superseded";
+  if (normalized.includes("reject") || normalized.includes("declin")) return "rejected";
+  if (normalized.includes("accept")) return "accepted";
+  return "outstanding";
+}
 
 /**
  * Build hire facts from /v3/offers rows.
@@ -428,7 +452,7 @@ export function buildHireFacts(
       continue;
     }
     const status = stringField(row.status);
-    if (status !== HIRE_ACCEPTED_OFFER_STATUS) {
+    if (classifyOfferStatus(status) !== "accepted") {
       notAccepted += 1;
       continue;
     }

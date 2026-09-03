@@ -14,6 +14,7 @@ import type {
   ScorecardFact,
   ScorecardQuestionAnswerFact,
 } from "./facts.js";
+import { classifyOfferStatus } from "./facts.js";
 import type { RecruiterProjectionProfileName } from "./types.js";
 
 export type MetricFactName =
@@ -305,6 +306,10 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     requiredFacts: ["offer_fact"],
     requiredFields: ["status"],
     requiredRoleProfile: "recruiter_default",
+    // The clock this metric's window actually moves on — the same one the planner applies
+    // (question-answer.ts, `factWindowField`). Declared here so a caller reading the capability
+    // output can see it rather than inferring which of the offer row's three dates was used.
+    windowField: "resolved_at",
     defaultTimeWindow: "last_90_days",
     scopeBehavior: "job_set",
     exclusions: ["groups offers by their v3 status verbatim; no acceptance-rate is derived unless resolved statuses are present"],
@@ -315,12 +320,27 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     id: "hire_count",
     displayName: "Hires (accepted offers)",
     requiredFacts: ["hire_fact"],
-    // MINIMAL on purpose. METRIC_IDS_BY_REQUIRED_FIELD (evidence-projection.ts) is a GLOBAL
-    // field -> metric-id map, so every field named here starts blocking answers on every endpoint
-    // projection that drops it. "status" is the one field without which a hire cannot be
-    // identified at all, and it is already a required field of five registered metrics, so naming
-    // it adds no new key to that map. The hire DATE is deliberately absent: a hire missing
-    // resolved_at is dated from sent_on and labeled (buildHireFacts), never fail-closed.
+    // DECISION (fold item 10): hire_count KEEPS "status" in requiredFields.
+    //
+    // The reviewer's correction is right on the mechanism and wrong on the conclusion. The earlier
+    // claim here — "naming it adds no new key to that map, so nothing changes" — was true about
+    // the KEY SET and false about the OUTPUT: buildProjectionMetadata (evidence-projection.ts)
+    // pushes one requiredFieldOmission PER METRIC ID per omitted field, so a projection that drops
+    // `status` now emits a `hire_count` blocks_answer entry beside the five that were already
+    // there. metrics.test.ts locks the actual projection output now, not just the key set.
+    //
+    // Keeping it is still correct, because the alternative is worse in the one direction that
+    // matters. `status` is not merely derivable from the fact builder's filter — the filter IS a
+    // read of that field (buildHireFacts, classifyOfferStatus(row.status) !== "accepted"). Drop
+    // `status` from a projection and every offer row classifies as not-a-hire, so hire_count
+    // returns a confident, complete ZERO. Naming the field is what turns that silent zero into an
+    // incomplete_projection the answer discloses. The cost of keeping it is one extra disclosure
+    // line on projections that were ALREADY marked incompleteProjection for the same field and the
+    // same reason; the cost of dropping it is a fabricated hire count, which is the one line this
+    // build does not cross.
+    //
+    // The hire DATE stays absent: a hire missing resolved_at is dated from sent_on and labeled
+    // (buildHireFacts), never fail-closed.
     requiredFields: ["status"],
     requiredRoleProfile: "recruiter_default",
     windowField: "resolved_at",
@@ -576,11 +596,12 @@ function computeOfferResolutionMix(context: MetricComputeContext): MetricResult 
     total += 1;
     const key = fact.status ?? "unknown";
     byStatus.set(key, (byStatus.get(key) ?? 0) + 1);
-    // Status vocab is tenant-defined (this tenant capitalizes: Accepted/Rejected/Created/Deprecated),
-    // so classify case-insensitively; anything else is unresolved and excluded from the rate.
-    const normalized = key.toLowerCase();
-    if (normalized.includes("accept")) accepted += 1;
-    else if (normalized.includes("reject") || normalized.includes("declin")) rejected += 1;
+    // ONE classifier for the whole answer (facts.ts). The mix used to read a status
+    // case-insensitively while the hire count beside it matched `Accepted` exactly, so the two
+    // numbers in the same paragraph could disagree about which offers were accepted.
+    const offerClass = classifyOfferStatus(key);
+    if (offerClass === "accepted") accepted += 1;
+    else if (offerClass === "rejected") rejected += 1;
   }
   const resolved = accepted + rejected;
   // The offers that were sent and have not come back. Windowing on `resolved_at` — the clock every

@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { classifyOfferCompensationPrivacy } from "../src/tools/hire-probes.js";
 import { hireReconciliationSummary, reconciliationLine } from "../src/tools/hire-facts.js";
-import { fakeScopedReader, scopedSuccess, testRuntime, type ScopedCall } from "./test-helpers.js";
+import { fakeScopedReader, scopedDenial, scopedSuccess, testRuntime, type ScopedCall } from "./test-helpers.js";
 
 const WINDOW = { start: "2026-04-01T00:00:00.000Z", end: "2026-06-30T23:59:59.999Z", label: "Q2 2026" };
 const SCOPE = { label: "all 45 reqs you can see in Greenhouse" };
@@ -25,6 +25,10 @@ const ACCEPTED_OFFERS = Array.from({ length: 10 }, (_, index) => ({
 
 const HIRED_APPLICATION_IDS = new Set([100, 101, 102, 103, 104, 105, 106, 107]);
 
+// Every way a closed opening can fail to be a hire, so neither half of the discriminator can be
+// deleted and stay green: a resolvable NON-hire reason with an application on it (603), and a hire
+// reason with nobody attached to it (604). Plus the rows the read's own filters must exclude: one
+// still open (605) and one closed outside the window (606).
 const CLOSED_OPENINGS = [
   ...Array.from({ length: 8 }, (_, index) => ({
     id: 500 + index,
@@ -37,6 +41,13 @@ const CLOSED_OPENINGS = [
   { id: 600, job_id: 10, application_id: 108, open: false, closed_at: "2026-05-12T00:00:00.000Z" },
   { id: 601, job_id: 10, application_id: 109, open: false, closed_at: "2026-05-12T00:00:00.000Z" },
   { id: 602, job_id: 10, application_id: 110, open: false, closed_at: "2026-05-13T00:00:00.000Z", close_reason_id: 9999 },
+  { id: 603, job_id: 10, application_id: 111, open: false, closed_at: "2026-05-14T00:00:00.000Z", close_reason_id: 91 },
+  { id: 604, job_id: 10, open: false, closed_at: "2026-05-14T00:00:00.000Z", close_reason_id: 90 },
+  { id: 605, job_id: 10, application_id: 113, open: true, close_reason_id: 90 },
+  { id: 606, job_id: 10, application_id: 114, open: false, closed_at: "2026-08-14T00:00:00.000Z", close_reason_id: 90 },
+  // No closed_at at all. On the fallback leg the local window cannot place it, and it is COUNTED
+  // as unplaceable rather than quietly widening or narrowing the hire count.
+  { id: 607, job_id: 10, application_id: 115, open: false, close_reason_id: 90 },
 ];
 
 interface WithheldByTool {
@@ -56,7 +67,18 @@ function reconciliationReader(withheld: WithheldByTool = {}) {
       return withPrivacy(toolName, rows, withheld.list_applications ?? 0);
     }
     if (toolName === "list_openings") {
-      return withPrivacy(toolName, CLOSED_OPENINGS, withheld.list_openings ?? 0);
+      // Answer the way Greenhouse would: honour open=false and, when the caller sent them, the
+      // closed_at brackets. A fake that hands back every row whatever was asked cannot tell a
+      // server-side filter that works from one that was silently dropped.
+      const brackets = params?.["closed_at[gte]"] !== undefined;
+      const rows = CLOSED_OPENINGS.filter((row) => {
+        if (params?.open === false && row.open !== false) return false;
+        if (!brackets) return true;
+        const closedAt = typeof row.closed_at === "string" ? row.closed_at : null;
+        if (closedAt === null) return false;
+        return closedAt >= String(params?.["closed_at[gte]"]) && closedAt <= String(params?.["closed_at[lte]"]);
+      });
+      return withPrivacy(toolName, rows, withheld.list_openings ?? 0);
     }
     if (toolName === "list_close_reasons") {
       return scopedSuccess(toolName, [
@@ -223,6 +245,252 @@ describe("H2 reconciliationLine — three counts, three clocks, three privacy re
 });
 
 // ---------------------------------------------------------------------------
+// H2b: the line counts HIRES, not returned rows.
+//
+// Before this the count was `hireSet.hires.length` — whatever the read handed
+// back. buildHireFacts is where "what is a hire" is defined, so a stray
+// non-accepted row was counted as a hire and a hire dated off `sent_on` was
+// reported as dated on `resolved_at`. One definition, used everywhere.
+// ---------------------------------------------------------------------------
+describe("H2b reconciliationLine — one definition of a hire", () => {
+  function offersReader(offers: Array<Record<string, unknown>>) {
+    return fakeScopedReader((toolName, params) => {
+      if (toolName === "list_offers") {
+        // Answer each leg the way Greenhouse would: a `resolved_at` range filter cannot return a
+        // row that has no resolved_at, and the `sent_on` leg filters on sent_on.
+        const field = params?.["resolved_at[gte]"] !== undefined
+          ? "resolved_at"
+          : params?.["sent_on[gte]"] !== undefined
+            ? "sent_on"
+            : null;
+        if (field === null) return scopedSuccess(toolName, offers);
+        const gte = String(params?.[`${field}[gte]`]);
+        const lte = String(params?.[`${field}[lte]`]);
+        return scopedSuccess(
+          toolName,
+          offers.filter((row) => {
+            const value = row[field];
+            return typeof value === "string" && value >= gte && value <= lte;
+          })
+        );
+      }
+      if (toolName === "list_applications") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return scopedSuccess(toolName, ids.map((id) => ({ id, job_id: 10, status: "hired" })));
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+  }
+
+  it("does not count a stray non-Accepted row the read handed back", async () => {
+    const reader = offersReader([
+      ...ACCEPTED_OFFERS,
+      { id: 99, job_id: 10, application_id: 199, candidate_id: 1099, status: "Created", sent_on: "2026-05-01", resolved_at: "2026-05-10T12:00:00.000Z" },
+    ]);
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    assert.equal(result.line.accepted_current_offers.value, 10, "the Created row is not a hire, whatever the read returned");
+    assert.ok(
+      result.line.accepted_current_offers.notes.some((note) => /not Accepted/.test(note)),
+      `the exclusion is disclosed, got ${JSON.stringify(result.line.accepted_current_offers.notes)}`
+    );
+    // And it never reaches the bridge either: an id that is not a hire has no business in the
+    // count of "how many of THESE hires does Greenhouse call hired".
+    const bridged = reader.calls.find((call) => call.toolName === "list_applications");
+    assert.ok(!String(bridged?.params?.ids ?? "").split(",").includes("199"));
+  });
+
+  it("labels the hires it could only date from the send date, in the count and in the sentence", async () => {
+    const reader = offersReader([
+      ...ACCEPTED_OFFERS.slice(0, 9),
+      { id: 10, job_id: 10, application_id: 109, candidate_id: 1009, status: "Accepted", sent_on: "2026-05-05" },
+    ]);
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    assert.equal(result.line.accepted_current_offers.value, 10, "a hire with no resolved_at is still a hire");
+    assert.equal(result.line.accepted_current_offers.dated_from_fallback, 1);
+    assert.match(
+      hireReconciliationSummary(result.line),
+      /1 of which dated from the send date because the accepted date was missing/
+    );
+  });
+
+  it("says offer rows per hire is undefined, not null, when the window holds no hires", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_offers") return scopedSuccess(toolName, []);
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, { includeChain: true });
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    assert.equal(result.line.offer_rows_per_hire.value, null);
+    const rendered = hireReconciliationSummary(result.line);
+    assert.match(rendered, /no hires in this window, so offer rows per hire is undefined/i);
+    assert.ok(!/null offer rows per hire/.test(rendered), "a rendered 'null' is a bug leaking into a sentence");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H2c: the openings count's own disclosures reach the answer.
+//
+// readOpeningsClosedByHire computed windowAppliedLocally / dateParamsRejected /
+// rowsMissingField and threw all three away, so the count always arrived with
+// `notes: []` — a locally-windowed number over an unfiltered read presented as a
+// clean server-side one.
+// ---------------------------------------------------------------------------
+describe("H2c reconciliationLine — the openings read discloses what it did", () => {
+  it("says the closed_at filter was rejected and how many closed openings carried no closed_at", async () => {
+    const base = reconciliationReader();
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_openings" && params?.["closed_at[gte]"] !== undefined) {
+        throw new Error("Greenhouse API error: 422 Unprocessable Entity (/openings) [correlation_id=test]");
+      }
+      return base.scopedRead(undefined as never, toolName, params, undefined);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, { includeOpenings: true });
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    const count = result.line.openings_closed_by_hire;
+    assert.equal(count.value, 8, "the local window keeps the same eight hire-closed seats");
+    assert.ok(
+      count.notes.some((note) => /rejected the closed_at filter/.test(note) && /closed_at\[gte\]/.test(note)),
+      `the fallback must be named, got ${JSON.stringify(count.notes)}`
+    );
+    assert.ok(
+      count.notes.some((note) => /1 closed opening\(s\) carried no closed_at/.test(note)),
+      `the unplaceable seat is counted, got ${JSON.stringify(count.notes)}`
+    );
+  });
+
+  it("keeps the line when the openings read is denied outright, rather than losing the other two counts", async () => {
+    const base = reconciliationReader();
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_openings") return scopedDenial(toolName, "TOOL_NOT_AVAILABLE");
+      return base.scopedRead(undefined as never, toolName, params, undefined);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, { includeOpenings: true });
+
+    assert.equal(result.kind, "line", "one denied population must not destroy two computed counts");
+    if (result.kind !== "line") return;
+    assert.equal(result.line.accepted_current_offers.value, 10);
+    assert.equal(result.line.accepted_offer_applications_marked_hired.value, 8);
+    assert.equal(result.line.openings_closed_by_hire.not_read, true);
+    assert.ok(result.line.openings_closed_by_hire.notes.some((note) => /TOOL_NOT_AVAILABLE/.test(note)));
+  });
+
+  it("keeps the accepted count when the applications bridge is denied", async () => {
+    const base = reconciliationReader();
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_applications") return scopedDenial(toolName, "TOOL_NOT_AVAILABLE");
+      return base.scopedRead(undefined as never, toolName, params, undefined);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(runtime, "test_tool", SCOPE, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    assert.equal(result.line.accepted_current_offers.value, 10, "the read that succeeded still answers");
+    assert.equal(result.line.accepted_offer_applications_marked_hired.not_read, true);
+    assert.match(hireReconciliationSummary(result.line), /10 accepted current offers/);
+  });
+
+  it("chunks an explicit 120-req scope on the openings and all-time reads, and verifies status in memory", async () => {
+    const jobIds = Array.from({ length: 120 }, (_, index) => 9_000_000 + index);
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_offers") return scopedSuccess(toolName, []);
+      if (toolName === "list_openings") return scopedSuccess(toolName, []);
+      if (toolName === "list_close_reasons") return scopedSuccess(toolName, []);
+      if (toolName === "list_applications" && params?.status === "hired") {
+        // A server-side filter this count used to TRUST: two of these rows are not hired.
+        return scopedSuccess(toolName, [
+          { id: 1, job_id: 10, status: "hired" },
+          { id: 2, job_id: 10, status: "in_process" },
+          { id: 3, job_id: 10, status: "rejected" },
+        ]);
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(
+      runtime,
+      "test_tool",
+      { jobIds, label: "120 named reqs" },
+      WINDOW,
+      undefined,
+      { includeOpenings: true, includeAllTimeHiredApplications: true }
+    );
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    const chunkSizes = (toolName: string, predicate: (params?: Record<string, unknown>) => boolean) =>
+      reader.calls
+        .filter((call) => call.toolName === toolName && predicate(call.params))
+        .map((call) => String(call.params?.job_ids ?? "").split(",").filter(Boolean).length);
+    assert.deepStrictEqual(
+      chunkSizes("list_openings", (params) => params?.["closed_at[gte]"] !== undefined),
+      [50, 50, 20],
+      "120 explicit reqs are not sent to /openings as one job_ids string"
+    );
+    assert.deepStrictEqual(
+      chunkSizes("list_applications", (params) => params?.status === "hired"),
+      [50, 50, 20],
+      "nor to the all-time /applications read"
+    );
+    // 3 chunks x 3 rows = 9 returned, of which 3 actually carry status=hired.
+    assert.equal(result.line.applications_status_hired_scope_all_time?.value, 3, "the returned status is re-checked, not trusted");
+    assert.ok(
+      result.line.applications_status_hired_scope_all_time?.notes.some((note) => /do not carry status=hired/.test(note))
+    );
+  });
+
+  it("reads NOTHING for an explicitly empty req set on any of the three counts", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_close_reasons") return scopedSuccess(toolName, []);
+      throw new Error(`an empty scope must not read ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await reconciliationLine(
+      runtime,
+      "test_tool",
+      { jobIds: [], label: "no reqs" },
+      WINDOW,
+      undefined,
+      { includeOpenings: true, includeAllTimeHiredApplications: true }
+    );
+
+    assert.equal(result.kind, "line");
+    if (result.kind !== "line") return;
+    assert.equal(result.line.accepted_current_offers.value, 0);
+    assert.equal(result.line.openings_closed_by_hire.value, 0);
+    assert.equal(result.line.applications_status_hired_scope_all_time?.value, 0);
+    assert.deepStrictEqual(
+      toolNames(reader.calls).filter((name) => name !== "list_close_reasons"),
+      [],
+      "an empty explicit scope reads no offers, no applications and no openings"
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // H6: the offer-compensation privacy probe classifies THREE ways. "Inconclusive"
 // is a real answer here — no match, conflicting matches, or a definition row that
 // never carried `private` all mean the same thing operationally: we do not know
@@ -238,13 +506,19 @@ describe("H6 classifyOfferCompensationPrivacy — tri-state", () => {
     assert.deepStrictEqual(probe.matched.map((row) => row.name), ["Base Salary"]);
   });
 
-  it("says available when every matching offer comp field is readable", () => {
+  it("says available when every matching offer comp field is readable, matching on name OR value_type", () => {
+    // Both halves of the match are load-bearing and each one alone deleted green before this: a
+    // tenant that renamed the field keeps the currency type, and a tenant that types comp as text
+    // keeps the compensation vocabulary. Rows 5 and 6 exercise exactly one half each.
     const probe = classifyOfferCompensationPrivacy([
       { id: 1, name: "Base Salary", field_type: "offer", value_type: "currency", private: false },
       { id: 3, name: "Bonus Target", field_type: "offer", value_type: "currency", private: false },
+      { id: 5, name: "Base Salary", field_type: "offer", value_type: "short_text", private: false },
+      { id: 6, name: "Package", field_type: "offer", value_type: "currency", private: false },
     ]);
     assert.equal(probe.verdict, "available");
-    assert.equal(probe.matched.length, 2);
+    assert.equal(probe.matched.length, 4);
+    assert.deepStrictEqual(probe.matched.map((row) => row.id), [1, 3, 5, 6]);
   });
 
   it("says inconclusive when no offer field looks like compensation", () => {

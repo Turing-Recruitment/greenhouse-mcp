@@ -9,6 +9,7 @@ import {
 import { buildHireFacts } from "../src/facts.js";
 import { HIRE_FACTS_OFFER_READ_PARAM_NAMES } from "../src/limits.js";
 import { readHireSet } from "../src/tools/hire-facts.js";
+import { readAllWithDateFallback } from "../src/tools/read-with-date-fallback.js";
 import { computeMetric } from "../src/metrics.js";
 import { SCOPED_TOOL_SCOPE_POLICIES } from "../src/tools/scoped-endpoint-adapters.js";
 import type { AuthenticatedSession } from "../src/types.js";
@@ -49,6 +50,12 @@ describe("H1 readHireSet — the shared 422 date fallback", () => {
         offerRow(1, { resolved_at: "2026-05-10T12:00:00.000Z" }),
         offerRow(2, { resolved_at: "2026-07-10T12:00:00.000Z" }), // after the window
         offerRow(3, { resolved_at: "2026-03-10T12:00:00.000Z" }), // before the window
+        // The READ-layer sent_on fallback: Greenhouse never wrote a resolved_at for this hire, so
+        // the local window has to place it on sent_on rather than dropping it.
+        offerRow(4, { resolved_at: undefined, sent_on: "2026-05-05" }),
+        // Neither clock. It cannot be placed in any window and is COUNTED as unplaceable rather
+        // than disappearing into the difference between two numbers.
+        offerRow(5, { resolved_at: undefined, sent_on: undefined }),
       ]);
     });
     const { runtime } = testRuntime(reader);
@@ -57,7 +64,12 @@ describe("H1 readHireSet — the shared 422 date fallback", () => {
 
     assert.equal(result.kind, "rows");
     if (result.kind !== "rows") return;
-    assert.deepStrictEqual(result.hires.map((row) => row.id), [1], "only the hire resolved inside the window survives");
+    assert.deepStrictEqual(
+      result.hires.map((row) => row.id),
+      [1, 4],
+      "the hire dated only by sent_on survives the local window beside the resolved_at one"
+    );
+    assert.equal(result.read.rowsMissingField, 1, "the row with neither clock is counted, not silently absorbed");
 
     // Leg one: the native bracket attempt, with the hire filters beside it.
     const first = reader.calls[0]!.params as Record<string, unknown>;
@@ -77,17 +89,113 @@ describe("H1 readHireSet — the shared 422 date fallback", () => {
     assert.deepStrictEqual(result.read.dateParamsRejected.sort(), ["resolved_at[gte]", "resolved_at[lte]"]);
   });
 
-  it("sends no second read when the native date filter is accepted", async () => {
-    const reader = fakeScopedReader((toolName) => scopedSuccess(toolName, [offerRow(1)]));
+  it("asks the accepted native filter for the sent_on-dated hires too, so both legs return the same set", async () => {
+    // A resolved_at range filter can never return a row that has no resolved_at. Before this the
+    // 422 leg counted a sent_on-dated hire and the native leg silently did not, so the same
+    // question got two different answers depending on an upstream behaviour nobody could see.
+    const reader = fakeScopedReader((toolName, params) => {
+      if (params?.["sent_on[gte]"] !== undefined) {
+        return scopedSuccess(toolName, [
+          offerRow(4, { resolved_at: undefined, sent_on: "2026-05-05" }),
+          // Already returned by the resolved_at leg: it carries the primary field, so this leg
+          // must NOT count it a second time.
+          offerRow(1),
+        ]);
+      }
+      return scopedSuccess(toolName, [offerRow(1)]);
+    });
     const { runtime } = testRuntime(reader);
 
     const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {});
 
     assert.equal(result.kind, "rows");
     if (result.kind !== "rows") return;
-    assert.equal(reader.calls.length, 1, "the native filter is the first and only attempt when it works");
+    assert.deepStrictEqual(result.hires.map((row) => row.id), [1, 4], "no double count, no dropped fallback hire");
+    assert.equal(reader.calls.length, 2, "one native leg per declared window field, never a full unfiltered read");
+    const second = reader.calls[1]!.params as Record<string, unknown>;
+    assert.equal(second["sent_on[gte]"], WINDOW.start);
+    assert.equal(second["sent_on[lte]"], WINDOW.end);
+    assert.equal(second["resolved_at[gte]"], undefined, "the primary field's brackets are swapped out, not stacked");
+    assert.equal(second.status, "Accepted", "every other filter is kept");
     assert.equal(result.read.windowAppliedLocally, false);
     assert.deepStrictEqual(result.read.dateParamsRejected, []);
+  });
+
+  // The self-heal must fire on a DATE 422 and nothing else. A test-honesty mutation proved the
+  // status check was unlocked: deleting it left 1609/1609 green because no fixture ever threw
+  // anything but a 422 on the bracket leg. A fallback on any error would turn an auth failure or a
+  // tenant outage into a silent full unfiltered read.
+  for (const [label, thrown] of [
+    ["a 401", new Error("Greenhouse API error: 401 Unauthorized (/offers) [correlation_id=test]")],
+    ["a 500", new Error("Greenhouse API error: 500 Internal Server Error (/offers) [correlation_id=test]")],
+  ] as const) {
+    it(`rethrows ${label} on the bracket leg instead of re-reading without the window`, async () => {
+      const reader = fakeScopedReader(() => {
+        throw thrown;
+      });
+      const { runtime } = testRuntime(reader);
+
+      await assert.rejects(
+        () => readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {}),
+        (error: unknown) => error === thrown
+      );
+      assert.equal(reader.calls.length, 1, "exactly one upstream call — no bracket-free re-read");
+    });
+  }
+
+  it("returns a denial, and makes no bracket-free re-read, when the bracket leg times out", async () => {
+    const reader = fakeScopedReader(() => {
+      throw new Error("SCOPED_GREENHOUSE_TOOL_TIMEOUT:deadline");
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "denial");
+    if (result.kind !== "denial") return;
+    assert.equal(result.result.ok === false && result.result.denial.code, "TOOL_TIMEOUT");
+    assert.equal(reader.calls.length, 1, "a deadline is not a date 422; nothing is re-read unwindowed");
+  });
+
+  it("rethrows a 422 that carries none of this window's bracket params", async () => {
+    // readAllWithDateFallback is shared. A caller passing no date window of its own must not have a
+    // 422 about (say) a malformed job_ids list 'healed' into a full unfiltered read of the tenant.
+    const thrown = new Error("Greenhouse API error: 422 Unprocessable Entity (/offers) [correlation_id=test]");
+    const reader = fakeScopedReader(() => {
+      throw thrown;
+    });
+    const { runtime } = testRuntime(reader);
+
+    await assert.rejects(
+      () => readAllWithDateFallback(runtime, "test_tool", "list_offers", { job_ids: "1,2" }, [
+        { field: "resolved_at", gte: WINDOW.start, lte: WINDOW.end },
+      ]),
+      (error: unknown) => error === thrown
+    );
+    assert.equal(reader.calls.length, 1);
+  });
+
+  it("strips only the bracket params it added, keeping an unrelated range filter on the re-read", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (params?.["resolved_at[gte]"] !== undefined) {
+        throw new Error("Greenhouse API error: 422 Unprocessable Entity (/offers) [correlation_id=test]");
+      }
+      return scopedSuccess(toolName, [offerRow(1)]);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const outcome = await readAllWithDateFallback(
+      runtime,
+      "test_tool",
+      "list_offers",
+      { "resolved_at[gte]": WINDOW.start, "resolved_at[lte]": WINDOW.end, "salary[gte]": "100000" },
+      [{ field: "resolved_at", gte: WINDOW.start, lte: WINDOW.end }]
+    );
+
+    assert.equal(outcome.windowAppliedLocally, true);
+    const second = reader.calls[1]!.params as Record<string, unknown>;
+    assert.equal(second["salary[gte]"], "100000", "a range filter this window never added survives the re-read");
+    assert.deepStrictEqual(outcome.dateParamsRejected, ["resolved_at[gte]", "resolved_at[lte]"]);
   });
 
   it("carries current_only / status / resolved_at through the read-param allowlist", () => {
@@ -111,9 +219,33 @@ describe("H1b readHireSet — chunking only on an explicit job set", () => {
 
     await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {});
 
+    // One leg per declared window field (resolved_at, then its sent_on fallback) — never one read
+    // per permitted req. The chunking question is about job_ids, so it is counted on the primary leg.
     const offerCalls = reader.calls.filter((call) => call.toolName === "list_offers");
-    assert.equal(offerCalls.length, 1, "a permission-wide read is one read, not one per permitted job");
-    assert.equal(offerCalls[0]!.params?.job_ids, undefined, "no job_ids are invented for a permission-wide scope");
+    const primaryLeg = offerCalls.filter((call) => call.params?.["resolved_at[gte]"] !== undefined);
+    assert.equal(primaryLeg.length, 1, "a permission-wide read is one read, not one per permitted job");
+    assert.equal(offerCalls.length, 2, "and its sent_on fallback leg, which is per-scope too");
+    for (const call of offerCalls) {
+      assert.equal(call.params?.job_ids, undefined, "no job_ids are invented for a permission-wide scope");
+    }
+  });
+
+  it("reads NOTHING for an explicitly EMPTY job set, and never widens it to permission-wide", async () => {
+    // `undefined` and `[]` are different scopes. Collapsing them meant a caller that resolved a
+    // scope to zero reqs — a filter that matched nothing — got a count over the whole tenant.
+    const reader = fakeScopedReader((toolName) => scopedSuccess(toolName, [offerRow(1)]));
+    const { runtime } = testRuntime(reader);
+
+    const result = await readHireSet(runtime, "test_tool", { jobIds: [], label: "no reqs" }, WINDOW, undefined, {
+      includeChain: true,
+      includeCandidates: true,
+    });
+
+    assert.equal(result.kind, "rows");
+    if (result.kind !== "rows") return;
+    assert.deepStrictEqual(result.hires, [], "zero reqs hire zero people");
+    assert.equal(reader.calls.length, 0, "an empty explicit scope costs no upstream read at all");
+    assert.equal(result.read.complete, true, "and it is a complete answer, not an incomplete one");
   });
 
   it("issues 3 offer reads for an explicit 120-job scope, 50 ids at a time", async () => {
@@ -123,7 +255,8 @@ describe("H1b readHireSet — chunking only on an explicit job set", () => {
 
     await readHireSet(runtime, "test_tool", { jobIds, label: "120 named reqs" }, WINDOW, undefined, {});
 
-    const offerCalls = reader.calls.filter((call) => call.toolName === "list_offers");
+    const offerCalls = reader.calls
+      .filter((call) => call.toolName === "list_offers" && call.params?.["resolved_at[gte]"] !== undefined);
     assert.equal(offerCalls.length, 3, "120 explicit ids chunk into 50 + 50 + 20");
     const sent = offerCalls.map((call) => String(call.params?.job_ids ?? "").split(",").filter(Boolean).length);
     assert.deepStrictEqual(sent, [50, 50, 20]);
@@ -170,7 +303,7 @@ describe("H1c readHireSet — the candidate bridge", () => {
     const named = result.hires.find((row) => row.id === 2) as Record<string, unknown>;
     assert.deepStrictEqual(named.candidate, { id: 1002, first_name: "First1002", last_name: "Hire" });
     const withheldHire = result.hires.find((row) => row.id === 1) as Record<string, unknown>;
-    assert.equal(withheldHire.candidate, undefined, "a withheld candidate is absent, never invented");
+    assert.ok(!("candidate" in withheldHire), "a withheld candidate is absent, never invented — no key at all");
   });
 
   it("reads the version chain keyed by the accepted set's application_ids when asked", async () => {
@@ -267,44 +400,81 @@ describe("H4 buildHireFacts — dating a hire honestly", () => {
 // H-cost: on the privacy-only branches every offer batch also walks
 // application_id AND candidate_id upstream. The guard has to count UPSTREAM
 // reads (pagination and the privacy walk included), not scoped-tool calls.
+//
+// The fixture 422s the bracketed request, because that is what the LIVE
+// /v3/offers endpoint does and therefore the only path this cost is ever paid
+// on. Measuring the native-filter path measured a route production never takes.
+//
+// MEASURED for one org-wide 500-hire read by an UNATTESTED actor: 22 upstream
+// reads — 1 rejected bracket attempt, 1 bracket-free /offers page, 10
+// /applications batches and 10 /candidates batches, the privacy walk paying 50
+// ids at a time for each of the offer row's two carriers. The per-endpoint
+// breakdown is asserted EXACTLY as well as against the ceiling: a ceiling alone
+// stayed green when the privacy walk was deleted entirely (one /offers call
+// still returns 500 hires), which is the one regression this test exists to
+// catch. The ceiling is stated too, and loosely enough that a batching
+// IMPROVEMENT does not fail the suite.
 // ---------------------------------------------------------------------------
-// MEASURED for one org-wide 500-hire read by an UNATTESTED actor: 21 upstream
-// reads — 1 offers page, 10 /applications batches and 10 /candidates batches,
-// the privacy walk paying 50 ids at a time for each of the offer row's two
-// carriers. Stated as a ceiling rather than an equality so a batching
-// IMPROVEMENT does not fail the suite, and tight enough that a regression does:
-// dropping to 25-id batches costs 41, and losing the batching altogether (a read
-// per row) costs a thousand.
 const ORG_WIDE_500_HIRE_UPSTREAM_READ_CEILING = 30;
 
+// The 422 branch's own cost, which is the expensive one and the one live traffic
+// pays. The fallback re-reads UNWINDOWED, so the privacy walk is paid over every
+// row in scope and not just the ones the window keeps: 2,000 accepted offers in
+// scope of which 500 land in the window cost 82 upstream reads — 1 rejected
+// bracket attempt, 1 /offers page, 40 /applications and 40 /candidates batches —
+// i.e. 16.4 reads per 100 rows the caller actually gets back.
+//
+// KNOWN AND DELIBERATELY NOT FIXED HERE: the structural fix is to apply the local
+// window INSIDE scoped-core's privacy-only branch, before the carrier walk, so
+// the walk pays for the windowed set rather than the scoped one. That is a
+// scoped-core change and a follow-up, not this fold. The live blast radius is
+// bounded because an ATTESTED actor takes the raw fast path and never walks at
+// all; only unattested all-access actors pay this.
+const UNWINDOWED_2000_ROW_UPSTREAM_READ_CEILING = 90;
+
+function countingOfferReader(offers: Array<Record<string, unknown>>) {
+  const calls: Array<{ path: string; params?: ReadParams }> = [];
+  const rawReader: RawReadClient = {
+    async read<T>(path: string, params?: ReadParams): Promise<ApiResponse<T>> {
+      calls.push({ path, params });
+      if (path === "/offers") {
+        // The live behaviour: every date filter the vendored contract advertises is rejected.
+        if (Object.keys(params ?? {}).some((key) => /\[(gte|lte|gt|lt)\]$/.test(key))) {
+          throw new Error("Greenhouse API error: 422 Unprocessable Entity (/offers) [correlation_id=test]");
+        }
+        return { data: offers as T, nextCursor: null };
+      }
+      if (path === "/applications") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return { data: ids.map((id) => ({ id, job_id: 10, candidate_id: id + 900 })) as T, nextCursor: null };
+      }
+      if (path === "/candidates") {
+        const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
+        return { data: ids.map((id) => ({ id, private: false })) as T, nextCursor: null };
+      }
+      return { data: [] as unknown as T, nextCursor: null };
+    },
+  };
+  // The unattested direct-operator branch: no attestation lookup at all, which is the
+  // fail-closed direction, and the branch that pays for the whole privacy walk.
+  const scopedReader = createScopedGreenhouseReader<AuthenticatedSession>({
+    rawReader,
+    actorResolver: { resolveActor: () => 100 },
+    permissionProvider: { getPermittedJobIds: async () => new Set<number>([10]) },
+    operatorActorIds: new Set([100]),
+    scopePolicyRegistry: SCOPED_TOOL_SCOPE_POLICIES,
+  });
+  return { calls, scopedReader };
+}
+
+function byPath(calls: Array<{ path: string }>): Record<string, number> {
+  return calls.reduce<Record<string, number>>((acc, call) => ({ ...acc, [call.path]: (acc[call.path] ?? 0) + 1 }), {});
+}
+
 describe("H-cost readHireSet — upstream read cost for an org-wide hire read", () => {
-  it("keeps a 500-offer org-wide read under the stated upstream-read ceiling", async () => {
+  it("keeps a 500-offer org-wide read under the stated upstream-read ceiling, walking every carrier", async () => {
     const offers = Array.from({ length: 500 }, (_, index) => offerRow(index + 1));
-    const calls: Array<{ path: string; params?: ReadParams }> = [];
-    const rawReader: RawReadClient = {
-      async read<T>(path: string, params?: ReadParams): Promise<ApiResponse<T>> {
-        calls.push({ path, params });
-        if (path === "/offers") return { data: offers as T, nextCursor: null };
-        if (path === "/applications") {
-          const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
-          return { data: ids.map((id) => ({ id, job_id: 10, candidate_id: id + 900 })) as T, nextCursor: null };
-        }
-        if (path === "/candidates") {
-          const ids = String(params?.ids ?? "").split(",").filter(Boolean).map(Number);
-          return { data: ids.map((id) => ({ id, private: false })) as T, nextCursor: null };
-        }
-        return { data: [] as unknown as T, nextCursor: null };
-      },
-    };
-    // The unattested direct-operator branch: no attestation lookup at all, which is the
-    // fail-closed direction, and the branch that pays for the whole privacy walk.
-    const scopedReader = createScopedGreenhouseReader<AuthenticatedSession>({
-      rawReader,
-      actorResolver: { resolveActor: () => 100 },
-      permissionProvider: { getPermittedJobIds: async () => new Set<number>([10]) },
-      operatorActorIds: new Set([100]),
-      scopePolicyRegistry: SCOPED_TOOL_SCOPE_POLICIES,
-    });
+    const { calls, scopedReader } = countingOfferReader(offers);
     const { runtime } = testRuntime(scopedReader, { session: testSession() });
 
     const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {});
@@ -312,11 +482,45 @@ describe("H-cost readHireSet — upstream read cost for an org-wide hire read", 
     assert.equal(result.kind, "rows");
     if (result.kind !== "rows") return;
     assert.equal(result.hires.length, 500, "every hire survives a walk that finds no private candidate");
+    assert.equal(result.read.windowAppliedLocally, true, "the measured path is the live one: the bracket attempt 422'd");
+    assert.deepStrictEqual(
+      byPath(calls),
+      { "/offers": 2, "/applications": 10, "/candidates": 10 },
+      "the privacy walk is 50 ids at a time over BOTH carriers; deleting it would show as 1 offers call and nothing else"
+    );
     assert.ok(
       calls.length <= ORG_WIDE_500_HIRE_UPSTREAM_READ_CEILING,
-      `500 org-wide hires cost ${calls.length} upstream reads, over the ${ORG_WIDE_500_HIRE_UPSTREAM_READ_CEILING} ceiling: ` +
-        JSON.stringify(calls.reduce<Record<string, number>>((acc, call) => ({ ...acc, [call.path]: (acc[call.path] ?? 0) + 1 }), {}))
+      `500 org-wide hires cost ${calls.length} upstream reads, over the ${ORG_WIDE_500_HIRE_UPSTREAM_READ_CEILING} ceiling: ${JSON.stringify(byPath(calls))}`
     );
-    assert.ok(calls.filter((call) => call.path === "/offers").length >= 1);
+  });
+
+  it("states the 422 branch's cost over the UNWINDOWED set, which is larger than the window", async () => {
+    // 2,000 accepted offers in scope; only 500 resolved inside Q2. The fallback leg reads all
+    // 2,000 (the window cannot be pushed down), so the privacy walk is priced on 2,000 rows.
+    const offers = Array.from({ length: 2000 }, (_, index) =>
+      offerRow(index + 1, index < 500 ? {} : { resolved_at: "2026-01-10T12:00:00.000Z" })
+    );
+    const { calls, scopedReader } = countingOfferReader(offers);
+    const { runtime } = testRuntime(scopedReader, { session: testSession() });
+
+    const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "rows");
+    if (result.kind !== "rows") return;
+    assert.equal(result.hires.length, 500, "the local window keeps a quarter of what the walk paid for");
+    assert.deepStrictEqual(
+      byPath(calls),
+      { "/offers": 2, "/applications": 40, "/candidates": 40 },
+      "the walk is priced on the UNWINDOWED set — this is the cost the scoped-core follow-up removes"
+    );
+    assert.ok(
+      calls.length <= UNWINDOWED_2000_ROW_UPSTREAM_READ_CEILING,
+      `${calls.length} upstream reads is over the ${UNWINDOWED_2000_ROW_UPSTREAM_READ_CEILING} ceiling: ${JSON.stringify(byPath(calls))}`
+    );
+    const perHundredReturned = (calls.length / result.hires.length) * 100;
+    assert.ok(
+      perHundredReturned <= 20,
+      `${perHundredReturned.toFixed(1)} upstream reads per 100 rows returned is over the stated 20`
+    );
   });
 });

@@ -13,7 +13,7 @@ import {
 } from "../read-all.js";
 import type { RecruiterToolRuntime, ToolDeadline } from "../runtime.js";
 import type { RecruiterToolResult } from "../types.js";
-import { HIRE_ACCEPTED_OFFER_STATUS } from "../facts.js";
+import { buildHireFacts, HIRE_ACCEPTED_OFFER_STATUS } from "../facts.js";
 import { chunks } from "./application-job-lookup.js";
 import {
   bracketParamsForWindows,
@@ -84,6 +84,12 @@ export interface HireReadStatus {
   privacyWithheld: number;
   windowAppliedLocally: boolean;
   dateParamsRejected: string[];
+  /**
+   * Rows the LOCAL window dropped because they carried neither `resolved_at` nor the declared
+   * `sent_on` fallback. Surfaced rather than swallowed: it is the only number that says how much of
+   * the scoped set the fallback leg could not place on any clock at all.
+   */
+  rowsMissingField: number;
   warnings: string[];
 }
 
@@ -130,9 +136,13 @@ export async function readHireSet(
   options: HireSetOptions = {}
 ): Promise<HireSetResult> {
   const spec = hireWindowSpec(window);
-  const jobChunks: Array<number[] | null> = scope.jobIds && scope.jobIds.length > 0
-    ? chunks([...new Set(scope.jobIds)], HIRE_JOB_ID_CHUNK_SIZE)
-    : [null];
+  // `undefined` and `[]` are DIFFERENT scopes and always were: undefined means "whatever my
+  // Greenhouse permissions reach" (one unfiltered read), `[]` means "these zero reqs" — an
+  // explicit empty set a caller froze. Treating the empty set as permission-wide silently WIDENED
+  // it to the whole tenant, which is the one direction a scope must never move on its own.
+  const jobChunks: Array<number[] | null> = scope.jobIds === undefined
+    ? [null]
+    : chunks([...new Set(scope.jobIds)], HIRE_JOB_ID_CHUNK_SIZE);
 
   const hires: Array<Record<string, unknown>> = [];
   const statuses: ReadAllStatus[] = [];
@@ -140,7 +150,9 @@ export async function readHireSet(
   let pagesRead = 0;
   let rawRowsRead = 0;
   let privacyWithheld = 0;
+  let rowsMissingField = 0;
   let windowAppliedLocally = false;
+  let completedChunks = 0;
   const dateParamsRejected = new Set<string>();
 
   for (const jobChunk of jobChunks) {
@@ -164,18 +176,30 @@ export async function readHireSet(
     );
     if (outcome.read.kind === "denial") {
       const truncation = denialTruncationStatus(outcome.read.result);
-      // A budget/deadline denial on a LATER chunk is truncation, not failure: the hires already
+      // A budget/deadline denial on a LATER chunk is truncation, not failure: the chunks already
       // read are real and the answer says the set is short. A permission/upstream denial is a real
-      // error at any point, and so is any denial on the first chunk (nothing was read).
-      if (truncation === null || hires.length === 0) return { kind: "denial", result: outcome.read.result };
+      // error at any point, and so is any denial before ANY chunk completed.
+      //
+      // COMPLETED CHUNKS, not returned rows: a scope whose first two reqs genuinely hired nobody
+      // returns zero rows, and reading that as "nothing was read" turned a third-chunk timeout
+      // into a hard denial over two reads that had succeeded.
+      if (truncation === null || completedChunks === 0) return { kind: "denial", result: outcome.read.result };
       statuses.push(truncation);
       warnings.push("the hire read stopped before every explicit req chunk was read");
       break;
     }
+    completedChunks += 1;
     foldRead(outcome.read, hires, statuses, warnings);
     pagesRead += outcome.read.pagesRead;
     rawRowsRead += outcome.read.rawRowsRead;
     privacyWithheld += outcome.read.privacyWithheld;
+    rowsMissingField += outcome.rowsMissingField;
+    // Its own number, never added to the primary leg's: the two legs' populations overlap.
+    if (outcome.fallbackFieldPrivacyWithheld > 0) {
+      warnings.push(
+        `a further ${outcome.fallbackFieldPrivacyWithheld} row(s) were withheld as private candidates on the ${outcome.fallbackFieldsQueried.join(", ")} leg of this window; that figure is reported separately because it overlaps the resolved_at leg's and the two must not be added`
+      );
+    }
     if (outcome.windowAppliedLocally) windowAppliedLocally = true;
     for (const rejected of outcome.dateParamsRejected) dateParamsRejected.add(rejected);
   }
@@ -186,6 +210,7 @@ export async function readHireSet(
     pagesRead,
     rawRowsRead,
     privacyWithheld,
+    rowsMissingField,
     windowAppliedLocally,
     dateParamsRejected: [...dateParamsRejected].sort(),
     warnings,
@@ -194,20 +219,39 @@ export async function readHireSet(
   const applicationIds = uniquePositiveIds(hires, "application_id");
   const candidateIds = uniquePositiveIds(hires, "candidate_id");
 
+  // The hire read has already happened and its rows are real. Both bridges below are OPTIONAL
+  // enrichments — a version chain and a set of names — so a denial on either reduces what the
+  // answer can say and is disclosed, but it never destroys the count that was already computed.
+  // Returning the bridge's denial here converted a complete hire read into "we cannot tell you
+  // anything", which is the worse answer by every measure.
   let chain: Array<Record<string, unknown>> | undefined;
   let chainRead: HireReadStatus | undefined;
   if (options.includeChain) {
     const chainResult = await readOfferChain(runtime, exposedToolName, applicationIds, deadline);
-    if (chainResult.kind === "denial") return chainResult;
-    chain = chainResult.rows;
-    chainRead = chainResult.read;
+    if (chainResult.kind === "denial") {
+      read.warnings.push(denialWarning("the offer version chain", chainResult.result));
+    } else {
+      chain = chainResult.rows;
+      chainRead = chainResult.read;
+    }
   }
 
   let candidates: HireCandidateRow[] | undefined;
   let candidatesRead: HireReadStatus | undefined;
   if (options.includeCandidates) {
     const bridged = await readHireCandidates(runtime, exposedToolName, candidateIds, deadline);
-    if (bridged.kind === "denial") return bridged;
+    if (bridged.kind === "denial") {
+      read.warnings.push(denialWarning("the candidate name bridge", bridged.result));
+      return {
+        kind: "rows",
+        hires,
+        ...(chain ? { chain } : {}),
+        read,
+        ...(chainRead ? { chainRead } : {}),
+        scope,
+        window,
+      };
+    }
     candidates = bridged.candidates;
     candidatesRead = bridged.read;
     const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
@@ -321,6 +365,7 @@ export async function readIdChunks(
         pagesRead: 0,
         rawRowsRead: 0,
         privacyWithheld: 0,
+        rowsMissingField: 0,
         windowAppliedLocally: false,
         dateParamsRejected: [],
         warnings,
@@ -328,6 +373,7 @@ export async function readIdChunks(
     };
   }
 
+  let completedBatches = 0;
   for (const batch of chunks(ids, HIRE_ID_BRIDGE_CHUNK_SIZE)) {
     const outcome = await readAllWithDateFallback<Record<string, unknown>>(
       runtime,
@@ -339,11 +385,15 @@ export async function readIdChunks(
     );
     if (outcome.read.kind === "denial") {
       const truncation = denialTruncationStatus(outcome.read.result);
-      if (truncation === null || rows.length === 0) return { kind: "denial", result: outcome.read.result };
+      // Completed BATCHES, not returned rows: a first batch of ids that legitimately matches
+      // nothing is a successful read, and counting it as "nothing was read" turned a later
+      // deadline expiry into a hard denial over work that had actually succeeded.
+      if (truncation === null || completedBatches === 0) return { kind: "denial", result: outcome.read.result };
       statuses.push(truncation);
       warnings.push(`the ${scopedToolName} bridge stopped before every id batch was read`);
       break;
     }
+    completedBatches += 1;
     foldRead(outcome.read, rows, statuses, warnings);
     pagesRead += outcome.read.pagesRead;
     rawRowsRead += outcome.read.rawRowsRead;
@@ -359,11 +409,18 @@ export async function readIdChunks(
       pagesRead,
       rawRowsRead,
       privacyWithheld,
+      rowsMissingField: 0,
       windowAppliedLocally: false,
       dateParamsRejected: [],
       warnings,
     },
   };
+}
+
+/** What an optional bridge's denial says on the answer that survived it. */
+function denialWarning(what: string, result: RecruiterToolResult): string {
+  const code = result.ok ? "UNKNOWN" : result.denial.code;
+  return `${what} could not be read (${code}), so the counts that depend on it are not reported; the hire read itself stands.`;
 }
 
 function foldRead(
@@ -400,6 +457,13 @@ export interface ReconciliationCount {
   scope_label: string;
   /** Rows Greenhouse's private-candidate permission withheld from THIS read alone. */
   privacy_withheld: number;
+  /**
+   * Of `value`, how many rows this count could only date from a FALLBACK field (a hire whose
+   * `resolved_at` Greenhouse never wrote, placed by `sent_on` instead). A labeled approximation,
+   * carried on the count so the sentence can say it out loud rather than presenting an
+   * approximated date as the real one.
+   */
+  dated_from_fallback: number;
   notes: string[];
 }
 
@@ -457,27 +521,45 @@ export async function reconciliationLine(
   const warnings = [...hireSet.read.warnings];
   const base = { window_label: window.label, scope_label: scope.label };
 
+  // ONE definition of a hire for the whole line. Counting `hireSet.hires.length` counted RETURNED
+  // ROWS, which is a different thing: a row the server-side `status=Accepted` filter let through
+  // in some other casing, or a stray non-accepted row from the bracket-free fallback leg, was
+  // counted as a hire, and a hire dated off `sent_on` was reported as dated on `resolved_at`.
+  // buildHireFacts is where that definition lives, so the line goes through it too.
+  const hireFacts = buildHireFacts(hireSet.hires);
+  const datedFromSentOn = hireFacts.facts.filter((fact) => fact.dated_from === "sent_on").length;
+
   const accepted_current_offers: ReconciliationCount = {
     ...base,
-    value: hireSet.hires.length,
+    value: hireFacts.facts.length,
     not_read: false,
     clock: "offers.resolved_at",
     privacy_withheld: hireSet.read.privacyWithheld,
-    notes: hireSet.read.windowAppliedLocally
-      ? ["the upstream rejected the resolved_at filter, so the window was applied locally to the complete scoped set"]
-      : [],
+    dated_from_fallback: datedFromSentOn,
+    notes: [
+      ...(hireSet.read.windowAppliedLocally
+        ? ["the upstream rejected the resolved_at filter, so the window was applied locally to the complete scoped set"]
+        : []),
+      ...(hireSet.read.rowsMissingField > 0
+        ? [`${hireSet.read.rowsMissingField} offer row(s) carried neither resolved_at nor sent_on, so no clock could place them in the window`]
+        : []),
+      ...hireFacts.omissions,
+    ],
   };
 
   const offer_rows_per_hire: ReconciliationCount = hireSet.chain
     ? {
         ...base,
-        value: hireSet.hires.length > 0
-          ? Number((hireSet.chain.length / hireSet.hires.length).toFixed(2))
+        value: hireFacts.facts.length > 0
+          ? Number((hireSet.chain.length / hireFacts.facts.length).toFixed(2))
           : null,
         not_read: false,
         clock: "offers.resolved_at (accepted set), counted across every version",
         privacy_withheld: hireSet.chainRead?.privacyWithheld ?? 0,
-        notes: [],
+        dated_from_fallback: 0,
+        notes: hireFacts.facts.length > 0
+          ? []
+          : ["there are no hires in this window, so offer rows per hire has no denominator"],
       }
     : {
         ...base,
@@ -485,13 +567,17 @@ export async function reconciliationLine(
         not_read: true,
         clock: "offers.resolved_at (accepted set), counted across every version",
         privacy_withheld: 0,
+        dated_from_fallback: 0,
         notes: ["superseded versions were not read"],
       };
   if (hireSet.chainRead) statuses.push(hireSet.chainRead.status);
 
   // Count B: the SAME hires, asked of the application row. Greenhouse only sets status=hired once
   // somebody calls the hire endpoint, so this legitimately trails the accepted-offer count.
-  const applicationIds = uniquePositiveIds(hireSet.hires, "application_id");
+  // Keyed off the FACTS, not the returned rows: a row buildHireFacts refused as not-a-hire has no
+  // business contributing an application id to the count of "how many of THESE hires does
+  // Greenhouse call hired".
+  const applicationIds = uniquePositiveIds(hireFacts.facts as unknown as Array<Record<string, unknown>>, "application_id");
   const bridged = await readIdChunks(
     runtime,
     exposedToolName,
@@ -504,67 +590,104 @@ export async function reconciliationLine(
     ),
     deadline
   );
-  if (bridged.kind === "denial") return bridged;
-  statuses.push(bridged.read.status);
-  warnings.push(...bridged.read.warnings);
-
-  const accepted_offer_applications_marked_hired: ReconciliationCount = {
-    ...base,
-    value: bridged.rows.filter((row) => normalizedText(row.status) === "hired").length,
-    not_read: false,
-    // Deliberately NOT dated: /v3/applications carries no hire timestamp, so this count is a
-    // snapshot of the accepted set's applications as they stand right now.
-    clock: "applications.status (point-in-time, not dated)",
-    privacy_withheld: bridged.read.privacyWithheld,
-    notes: ["Greenhouse sets status=hired only once the hire endpoint has fired, so this count trails the accepted-offer count rather than contradicting it"],
-  };
+  // A bridge failure costs this ONE count, not the line. The accepted-offer count above is already
+  // computed off a completed read; discarding it because a second population could not be read
+  // would answer "we cannot tell you anything" to a question one read had already answered.
+  const accepted_offer_applications_marked_hired: ReconciliationCount = bridged.kind === "denial"
+    ? {
+        ...base,
+        value: null,
+        not_read: true,
+        clock: "applications.status (point-in-time, not dated)",
+        privacy_withheld: 0,
+        dated_from_fallback: 0,
+        notes: [denialWarning("the accepted set's applications", bridged.result)],
+      }
+    : {
+        ...base,
+        value: bridged.rows.filter((row) => normalizedText(row.status) === "hired").length,
+        not_read: false,
+        // Deliberately NOT dated: /v3/applications carries no hire timestamp, so this count is a
+        // snapshot of the accepted set's applications as they stand right now.
+        clock: "applications.status (point-in-time, not dated)",
+        privacy_withheld: bridged.read.privacyWithheld,
+        dated_from_fallback: 0,
+        notes: ["Greenhouse sets status=hired only once the hire endpoint has fired, so this count trails the accepted-offer count rather than contradicting it"],
+      };
+  if (bridged.kind === "denial") {
+    warnings.push(denialWarning("the accepted set's applications", bridged.result));
+  } else {
+    statuses.push(bridged.read.status);
+    warnings.push(...bridged.read.warnings);
+  }
 
   let applications_status_hired_scope_all_time: ReconciliationCount | undefined;
   if (options.includeAllTimeHiredApplications) {
-    const allTime = await readAllWithDateFallback<Record<string, unknown>>(
-      runtime,
-      exposedToolName,
-      "list_applications",
-      sanitizeReadParams(
-        { status: "hired", ...(scope.jobIds && scope.jobIds.length > 0 ? { job_ids: scope.jobIds.join(",") } : {}) },
-        runtime.limits,
-        { allowedParamNames: APPLICATION_ANALYSIS_READ_PARAM_NAMES }
-      ),
-      [],
-      deadline
-    );
-    if (allTime.read.kind === "denial") return { kind: "denial", result: allTime.read.result };
-    statuses.push(allTime.read.status);
-    warnings.push(...allTime.read.warnings);
-    applications_status_hired_scope_all_time = {
-      value: allTime.read.rows.length,
-      not_read: false,
-      clock: "applications.status (point-in-time, not dated)",
-      window_label: "all time",
-      scope_label: scope.label,
-      privacy_withheld: allTime.read.privacyWithheld,
-      notes: ["this count is NOT windowed — it is every hired application in scope, whenever it was hired"],
-    };
+    const allTime = await readAllTimeHiredApplications(runtime, exposedToolName, scope, deadline);
+    if (allTime.kind === "denial") {
+      warnings.push(denialWarning("the all-time hired-application count", allTime.result));
+      applications_status_hired_scope_all_time = {
+        value: null,
+        not_read: true,
+        clock: "applications.status (point-in-time, not dated)",
+        window_label: "all time",
+        scope_label: scope.label,
+        privacy_withheld: 0,
+        dated_from_fallback: 0,
+        notes: [denialWarning("the all-time hired-application count", allTime.result)],
+      };
+    } else {
+      statuses.push(allTime.read.status);
+      warnings.push(...allTime.read.warnings);
+      applications_status_hired_scope_all_time = {
+        value: allTime.hired,
+        not_read: false,
+        clock: "applications.status (point-in-time, not dated)",
+        window_label: "all time",
+        scope_label: scope.label,
+        privacy_withheld: allTime.read.privacyWithheld,
+        dated_from_fallback: 0,
+        notes: [
+          "this count is NOT windowed — it is every hired application in scope, whenever it was hired",
+          ...(allTime.rowsNotHired > 0
+            ? [`${allTime.rowsNotHired} row(s) the status=hired filter returned do not carry status=hired and were excluded here`]
+            : []),
+        ],
+      };
+    }
   }
 
   const openings = options.includeOpenings
     ? await readOpeningsClosedByHire(runtime, exposedToolName, scope, window, deadline)
     : null;
-  if (openings && openings.kind === "denial") return openings;
-  if (openings) {
+  if (openings && openings.kind === "counts") {
     statuses.push(openings.status);
     warnings.push(...openings.warnings);
   }
-  const openings_closed_by_hire: OpeningsClosedByHireCount = openings
+  if (openings && openings.kind === "denial") {
+    warnings.push(denialWarning("the closed-openings count", openings.result));
+  }
+  const openings_closed_by_hire: OpeningsClosedByHireCount = openings?.kind === "counts"
     ? {
         ...base,
         value: openings.hireClosed,
         not_read: false,
         clock: "openings.closed_at",
         privacy_withheld: openings.privacyWithheld,
+        dated_from_fallback: 0,
         closed_with_no_reason: openings.closedWithNoReason,
         closed_reason_unresolved: openings.closedReasonUnresolved,
-        notes: [],
+        // The openings read's OWN disclosures. They used to be computed and thrown away, so a count
+        // that had silently fallen back to a local window over an unfiltered read read as a clean
+        // server-side number.
+        notes: [
+          ...(openings.windowAppliedLocally
+            ? [`the upstream rejected the closed_at filter (${openings.dateParamsRejected.join(", ")}), so the window was applied locally to the complete scoped set of closed openings`]
+            : []),
+          ...(openings.rowsMissingField > 0
+            ? [`${openings.rowsMissingField} closed opening(s) carried no closed_at, so no clock could place them in the window`]
+            : []),
+        ],
       }
     : {
         ...base,
@@ -572,9 +695,12 @@ export async function reconciliationLine(
         not_read: true,
         clock: "openings.closed_at",
         privacy_withheld: 0,
+        dated_from_fallback: 0,
         closed_with_no_reason: 0,
         closed_reason_unresolved: 0,
-        notes: ["openings closed by a hire were not read"],
+        notes: openings?.kind === "denial"
+          ? [denialWarning("the closed-openings count", openings.result)]
+          : ["openings closed by a hire were not read"],
       };
 
   const status = combineReadStatuses(statuses);
@@ -615,6 +741,9 @@ async function readOpeningsClosedByHire(
       closedWithNoReason: number;
       closedReasonUnresolved: number;
       privacyWithheld: number;
+      windowAppliedLocally: boolean;
+      dateParamsRejected: string[];
+      rowsMissingField: number;
       status: ReadAllStatus;
       warnings: string[];
     }
@@ -623,23 +752,60 @@ async function readOpeningsClosedByHire(
   // Whether /v3/openings honours closed_at[gte] live is UNPROVEN, so this read goes through the
   // same 422 fallback the offer read does rather than assuming either answer.
   const spec: DateWindowSpec = { field: "closed_at", gte: window.start, lte: window.end };
-  const outcome = await readAllWithDateFallback<Record<string, unknown>>(
-    runtime,
-    exposedToolName,
-    "list_openings",
-    sanitizeReadParams(
-      {
-        open: false,
-        ...(scope.jobIds && scope.jobIds.length > 0 ? { job_ids: scope.jobIds.join(",") } : {}),
-        ...bracketParamsForWindows([spec]),
-      },
-      runtime.limits,
-      { allowedParamNames: HIRE_FACTS_OPENING_READ_PARAM_NAMES }
-    ),
-    [spec],
-    deadline
-  );
-  if (outcome.read.kind === "denial") return { kind: "denial", result: outcome.read.result };
+  // Same two rules as the hire read: `undefined` is permission-wide (one read, no job_ids), an
+  // explicit set chunks at 50 rather than being sent whole, and an explicit EMPTY set is zero reqs.
+  const jobChunks: Array<number[] | null> = scope.jobIds === undefined
+    ? [null]
+    : chunks([...new Set(scope.jobIds)], HIRE_JOB_ID_CHUNK_SIZE);
+
+  const rows: Array<Record<string, unknown>> = [];
+  const statuses: ReadAllStatus[] = [];
+  const warnings: string[] = [];
+  let privacyWithheld = 0;
+  let rowsMissingField = 0;
+  let windowAppliedLocally = false;
+  let completedChunks = 0;
+  const dateParamsRejected = new Set<string>();
+
+  for (const jobChunk of jobChunks) {
+    const outcome = await readAllWithDateFallback<Record<string, unknown>>(
+      runtime,
+      exposedToolName,
+      "list_openings",
+      sanitizeReadParams(
+        {
+          open: false,
+          ...(jobChunk ? { job_ids: jobChunk.join(",") } : {}),
+          ...bracketParamsForWindows([spec]),
+        },
+        runtime.limits,
+        { allowedParamNames: HIRE_FACTS_OPENING_READ_PARAM_NAMES }
+      ),
+      [spec],
+      deadline
+    );
+    if (outcome.read.kind === "denial") {
+      const truncation = denialTruncationStatus(outcome.read.result);
+      if (truncation === null || completedChunks === 0) return { kind: "denial", result: outcome.read.result };
+      statuses.push(truncation);
+      warnings.push("the closed-openings read stopped before every explicit req chunk was read");
+      break;
+    }
+    completedChunks += 1;
+    rows.push(...outcome.read.rows);
+    statuses.push(outcome.read.status);
+    warnings.push(...outcome.read.warnings);
+    privacyWithheld += outcome.read.privacyWithheld;
+    rowsMissingField += outcome.rowsMissingField;
+    // Its own number, never added to the primary leg's: the two legs' populations overlap.
+    if (outcome.fallbackFieldPrivacyWithheld > 0) {
+      warnings.push(
+        `a further ${outcome.fallbackFieldPrivacyWithheld} row(s) were withheld as private candidates on the ${outcome.fallbackFieldsQueried.join(", ")} leg of this window; that figure is reported separately because it overlaps the resolved_at leg's and the two must not be added`
+      );
+    }
+    if (outcome.windowAppliedLocally) windowAppliedLocally = true;
+    for (const rejected of outcome.dateParamsRejected) dateParamsRejected.add(rejected);
+  }
 
   const reasons = await readAllWithDateFallback<Record<string, unknown>>(
     runtime,
@@ -658,7 +824,7 @@ async function readOpeningsClosedByHire(
   let hireClosed = 0;
   let closedWithNoReason = 0;
   let closedReasonUnresolved = 0;
-  for (const row of outcome.read.rows) {
+  for (const row of rows) {
     const reasonId = row.close_reason_id;
     if (typeof reasonId !== "number") {
       closedWithNoReason += 1;
@@ -670,6 +836,8 @@ async function readOpeningsClosedByHire(
       continue;
     }
     // A seat closed by a hire has BOTH: a hire close reason and the application it was filled by.
+    // Both conjuncts are load-bearing — a "Not Filling - Budget" close with an application on it
+    // is not a hire, and a hire-reason close with no application names nobody it hired.
     if (name.startsWith(HIRE_CLOSE_REASON_PREFIX) && typeof row.application_id === "number") hireClosed += 1;
   }
 
@@ -678,9 +846,89 @@ async function readOpeningsClosedByHire(
     hireClosed,
     closedWithNoReason,
     closedReasonUnresolved,
-    privacyWithheld: outcome.read.privacyWithheld,
-    status: combineReadStatuses([outcome.read.status, reasons.read.status]),
-    warnings: [...outcome.read.warnings, ...reasons.read.warnings],
+    privacyWithheld,
+    windowAppliedLocally,
+    dateParamsRejected: [...dateParamsRejected].sort(),
+    rowsMissingField,
+    status: combineReadStatuses([...statuses, reasons.read.status]),
+    warnings: [...warnings, ...reasons.read.warnings],
+  };
+}
+
+/**
+ * Every hired application in scope, over all time.
+ *
+ * Chunked like every other explicit job set (a 120-req scope sent as one `job_ids` string is a URL
+ * Greenhouse will not answer), and the returned `status` is re-checked in memory exactly as the
+ * sibling count at the accepted-set bridge does: a count that trusts a server-side filter it never
+ * verified is a count with no evidence behind it.
+ */
+async function readAllTimeHiredApplications(
+  runtime: RecruiterToolRuntime,
+  exposedToolName: string,
+  scope: HireScope,
+  deadline: ToolDeadline | undefined
+): Promise<
+  | { kind: "counts"; hired: number; rowsNotHired: number; read: HireReadStatus }
+  | { kind: "denial"; result: RecruiterToolResult }
+> {
+  const jobChunks: Array<number[] | null> = scope.jobIds === undefined
+    ? [null]
+    : chunks([...new Set(scope.jobIds)], HIRE_JOB_ID_CHUNK_SIZE);
+
+  const rows: Array<Record<string, unknown>> = [];
+  const statuses: ReadAllStatus[] = [];
+  const warnings: string[] = [];
+  let pagesRead = 0;
+  let rawRowsRead = 0;
+  let privacyWithheld = 0;
+  let completedChunks = 0;
+
+  for (const jobChunk of jobChunks) {
+    const outcome = await readAllWithDateFallback<Record<string, unknown>>(
+      runtime,
+      exposedToolName,
+      "list_applications",
+      sanitizeReadParams(
+        { status: "hired", ...(jobChunk ? { job_ids: jobChunk.join(",") } : {}) },
+        runtime.limits,
+        { allowedParamNames: APPLICATION_ANALYSIS_READ_PARAM_NAMES }
+      ),
+      [],
+      deadline
+    );
+    if (outcome.read.kind === "denial") {
+      const truncation = denialTruncationStatus(outcome.read.result);
+      if (truncation === null || completedChunks === 0) return { kind: "denial", result: outcome.read.result };
+      statuses.push(truncation);
+      warnings.push("the all-time hired-application read stopped before every explicit req chunk was read");
+      break;
+    }
+    completedChunks += 1;
+    rows.push(...outcome.read.rows);
+    statuses.push(outcome.read.status);
+    warnings.push(...outcome.read.warnings);
+    pagesRead += outcome.read.pagesRead;
+    rawRowsRead += outcome.read.rawRowsRead;
+    privacyWithheld += outcome.read.privacyWithheld;
+  }
+
+  const hired = rows.filter((row) => normalizedText(row.status) === "hired").length;
+  return {
+    kind: "counts",
+    hired,
+    rowsNotHired: rows.length - hired,
+    read: {
+      status: combineReadStatuses(statuses),
+      complete: combineReadStatuses(statuses) === "complete",
+      pagesRead,
+      rawRowsRead,
+      privacyWithheld,
+      rowsMissingField: 0,
+      windowAppliedLocally: false,
+      dateParamsRejected: [],
+      warnings,
+    },
   };
 }
 
@@ -694,11 +942,11 @@ export function hireReconciliationSummary(line: HireReconciliationLine): string 
   sentences.push(
     line.accepted_current_offers.not_read
       ? "Accepted current offers were not read."
-      : `${line.accepted_current_offers.value} accepted current offers${withheldClause(line.accepted_current_offers)}, dated on ${line.accepted_current_offers.clock} over ${line.window.label} across ${line.scope.label}.`
+      : `${line.accepted_current_offers.value} accepted current offers${withheldClause(line.accepted_current_offers)}, dated on ${line.accepted_current_offers.clock} over ${line.window.label} across ${line.scope.label}${datedFromFallbackClause(line.accepted_current_offers)}.`
   );
   sentences.push(
     line.accepted_offer_applications_marked_hired.not_read
-      ? "The accepted set's applications were not read."
+      ? `The accepted set's applications were not read${line.accepted_offer_applications_marked_hired.notes.length > 0 ? ` — ${line.accepted_offer_applications_marked_hired.notes[0]}` : "."}`
       : `${line.accepted_offer_applications_marked_hired.value} of those applications are marked hired in Greenhouse${withheldClause(line.accepted_offer_applications_marked_hired)} — ${line.accepted_offer_applications_marked_hired.clock}, so it trails the offer count until the hire endpoint fires.`
   );
   sentences.push(
@@ -709,15 +957,26 @@ export function hireReconciliationSummary(line: HireReconciliationLine): string 
   sentences.push(
     line.offer_rows_per_hire.not_read
       ? "Superseded versions were not read, so offer rows per hire is not reported."
-      : `${line.offer_rows_per_hire.value} offer rows per hire across every version${withheldClause(line.offer_rows_per_hire)}.`
+      : line.offer_rows_per_hire.value === null
+        ? "There are no hires in this window, so offer rows per hire is undefined rather than zero."
+        : `${line.offer_rows_per_hire.value} offer rows per hire across every version${withheldClause(line.offer_rows_per_hire)}.`
   );
   if (line.applications_status_hired_scope_all_time) {
     sentences.push(
-      `Separately, and over all time rather than ${line.window.label}: ${line.applications_status_hired_scope_all_time.value} applications in scope carry status=hired${withheldClause(line.applications_status_hired_scope_all_time)}.`
+      line.applications_status_hired_scope_all_time.not_read
+        ? "The all-time hired-application count was asked for but could not be read."
+        : `Separately, and over all time rather than ${line.window.label}: ${line.applications_status_hired_scope_all_time.value} applications in scope carry status=hired${withheldClause(line.applications_status_hired_scope_all_time)}.`
     );
   }
   sentences.push("These count different populations on different clocks; they are not expected to match, and no total across them is meaningful.");
   return sentences.join(" ");
+}
+
+/** The labeled approximation, said out loud: N of these hires are dated off the send date. */
+function datedFromFallbackClause(count: ReconciliationCount): string {
+  return count.dated_from_fallback > 0
+    ? `, ${count.dated_from_fallback} of which dated from the send date because the accepted date was missing`
+    : "";
 }
 
 function withheldClause(count: ReconciliationCount): string {
