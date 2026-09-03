@@ -1,6 +1,6 @@
 import { type RecruiterToolRuntime, type ToolDeadline } from "../runtime.js";
 import { isIdentityParamName } from "../limits.js";
-import { loadJobInventory, type JobInventoryRecord } from "../resolvers/job-scope/inventory.js";
+import { loadJobInventory, type JobInventory, type JobInventoryRecord } from "../resolvers/job-scope/inventory.js";
 import { resolveScopeSigner } from "../resolvers/job-scope/signer.js";
 import { scopeHashOf } from "../resolvers/job-scope/scope-handle.js";
 import type { AnalysisContextHeader, AnalysisContextResolution } from "./types.js";
@@ -104,14 +104,14 @@ export async function resolveAnalysisContext(
     return applyResolvedJobIds(params, validated);
   }
 
-  // No explicit scope. A narrow recruiter is already bounded to their permitted
-  // jobs by the scoped core, so a scope-less analysis stays safely narrow and
-  // keeps today's behavior. A broad-access actor (operator/site-admin/all) would
-  // otherwise read org-wide silently, so require an explicit scope first — an
-  // operator/all-scope analysis is never run silently. This mirrors the planner
-  // gate in answer_my_recruiting_question (resolvePlannerScope).
+  // No explicit scope. CLO-274: BOTH actor kinds get an answer over exactly what the scoped core
+  // already lets them read — a narrow recruiter over their permitted book, a broad-visibility actor
+  // org-wide — and the header NAMES which. The former fail-closed for broad-access actors bought no
+  // access control (the scoped core is the permission floor either way; a confirmation round-trip
+  // cannot make an org-wide read narrower) and cost the operator their answer. What survives is the
+  // disclosure: no unscoped analysis returns without saying what it ran over.
   if (runtime.scopeContextResolved) {
-    // An upstream planner already resolved and gated scope before invoking this
+    // An upstream planner already resolved, disclosed and gated scope before invoking this
     // recipe, so re-probing the permission-scoped inventory here is redundant.
     return { ok: true, params: { ...params }, header: null, warnings: [] };
   }
@@ -119,28 +119,56 @@ export async function resolveAnalysisContext(
   if (!load.ok) {
     return { ok: false, code: load.code, message: load.message };
   }
-  if (load.inventory.scopeKind !== "jobs") {
-    return {
-      ok: false,
-      code: "INVALID_REQUEST",
-      message:
-        "Broad-access analysis requires an explicit scope. Resolve a scope_handle with resolve_job_scope (or pass exact job_ids) before running analysis; org-wide analysis is never run silently.",
-    };
-  }
 
-  // The inventory is already in hand on this branch, so build provenance job anchors over the
-  // recruiter's whole permitted set. The default no-scope call path is the most common real
-  // usage and previously carried NO anchors, so the predate-requisition provenance signal was
-  // silently inert exactly where most questions run (audit: honesty bug inside the honesty layer).
+  // One success return for both actor kinds; only the header differs. The inventory is already in
+  // hand here, so provenance job anchors are built over the whole readable set. The default
+  // no-scope call path is the most common real usage and previously carried NO anchors for a
+  // recruiter and no answer at all for an operator, so the predate-requisition provenance signal
+  // was silently inert exactly where most questions run (audit: honesty bug inside the honesty
+  // layer). Anchors are now built on every unscoped analysis, whichever kind the actor is.
   return {
     ok: true,
     params: { ...params },
-    header: null,
+    header: buildPermissionScopeHeader(load.inventory),
     warnings: [],
     jobAnchors: buildJobAnchors(
       load.inventory.records,
       load.inventory.records.map((record) => record.greenhouse_job_id)
     ),
+  };
+}
+
+/**
+ * The disclosure header for an UNBOUNDED read: the analysis ran over everything this actor's
+ * Greenhouse permissions return, and the label says which set that is and how big it is. A
+ * truncated index is disclosed as a floor rather than presented as a total, and no scope_hash is
+ * minted — there is no frozen id list to hash. Shared by the direct analyze_* path and the
+ * question planner so a recruiter reads the same sentence wherever the answer came from.
+ */
+export function buildPermissionScopeHeader(
+  inventory: JobInventory,
+  extraWarnings: string[] = []
+): AnalysisContextHeader {
+  const count = inventory.records.length;
+  const orgWide = inventory.scopeKind !== "jobs";
+  const warnings = [...extraWarnings];
+  if (!inventory.complete) {
+    warnings.push(
+      `The job index is truncated (${count} req(s) enumerated), so the count in the scope label is a floor, not a total.`
+    );
+  }
+  return {
+    primary_scope_domain: "job_scope",
+    source: "permission_scope",
+    scope_label: orgWide
+      ? inventory.complete
+        ? `all ${count} jobs you can see in Greenhouse (org-wide)`
+        : `all jobs you can see in Greenhouse (org-wide; at least ${count} enumerated, index truncated)`
+      : inventory.complete
+        ? `all ${count} reqs you can see in Greenhouse`
+        : `all reqs you can see in Greenhouse (at least ${count} enumerated, index truncated)`,
+    job_count: count,
+    warnings,
   };
 }
 

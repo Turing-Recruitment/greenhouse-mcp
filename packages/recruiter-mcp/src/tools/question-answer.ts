@@ -8,11 +8,11 @@ import { SCORECARD_ACCOUNTABILITY_TOOL, runScorecardAccountability } from "./sco
 import { SOURCE_QUALITY_TOOL, runSourceQuality } from "./source-quality.js";
 import { REJECTION_REASON_DRIFT_TOOL, runRejectionReasonDrift } from "./rejection-reason-drift.js";
 import { STAGE_LATENCY_TOOL, runStageLatency } from "./stage-latency.js";
-import { resolveAnalysisContext } from "../resolution/analysis-context.js";
+import { buildPermissionScopeHeader, resolveAnalysisContext } from "../resolution/analysis-context.js";
 import type { AnalysisContextHeader } from "../resolution/types.js";
-import { loadJobInventory } from "../resolvers/job-scope/inventory.js";
+import { loadJobInventory, type JobInventory } from "../resolvers/job-scope/inventory.js";
 import { getRecruitingCapabilities } from "../resolvers/job-scope/capabilities.js";
-import { resolveJobScope, type ResolveJobScopeInput, type ResolveJobScopeOutput } from "../resolvers/job-scope/resolver.js";
+import { resolveJobScope, type ConfirmationReasonCode, type ResolveJobScopeInput, type ResolveJobScopeOutput } from "../resolvers/job-scope/resolver.js";
 import { resolveScopeSigner } from "../resolvers/job-scope/signer.js";
 import { resolveOwnerScope } from "./job-scope/tools.js";
 import { METRIC_REGISTRY_BY_ID, computeMetric, type MetricComputeContext, type MetricFactName } from "../metrics.js";
@@ -193,10 +193,12 @@ export async function runRecruitingQuestionAnswer(
     return auditDenied ?? result;
   }
 
-  // The planner must not silently broad-run on natural-language job intent. It
-  // prefers an explicit scope_handle or job_ids, otherwise resolves job/role
-  // intent and returns a confirmation-required response when scope is not yet
-  // pinned down.
+  // Scope resolution, CLO-274. An explicit scope_handle or job_ids still wins. Otherwise the
+  // question is probed against the job index: a req or role it NAMES becomes the scope, and a
+  // question that names none is answered across everything the actor's Greenhouse permissions
+  // return — org-wide for a broad-visibility actor — with that scope stated on the answer. A
+  // confirmation-required response is now reserved for genuine ambiguity (several real reqs, a
+  // collision alias, a duplicate requisition id).
   let plannerScope: Awaited<ReturnType<typeof resolvePlannerScope>>;
   try {
     plannerScope = await resolvePlannerScope(runtime, question, params, plannerDeadline);
@@ -542,11 +544,11 @@ function remainingPlannerTimeoutMs(deadline: ToolDeadline | undefined): number |
 }
 
 export function runtimeWithRemainingPlannerBudget(runtime: RecruiterToolRuntime, remainingMs: number | undefined): RecruiterToolRuntime {
-  // The planner resolves and gates scope (resolvePlannerScope) before any recipe
-  // runs, so recipes must not re-run the no-scope inventory probe. A broad-access
-  // actor never reaches a recipe with an unresolved scope — it is either forced to
-  // resolution_required or driven through the explicit job_ids path, which still
-  // revalidates permissions.
+  // The planner resolves and DISCLOSES scope (resolvePlannerScope) before any recipe runs, so
+  // recipes must not re-run the no-scope inventory probe. Every recipe therefore arrives either
+  // with explicit job_ids the planner validated, or deliberately unscoped for an actor whose own
+  // Greenhouse permissions are the boundary — a scope the planner has already named in the header
+  // it attaches to the answer.
   const base: RecruiterToolRuntime = { ...runtime, scopeContextResolved: true };
   if (remainingMs === undefined) return base;
   const wholeRemainingMs = Math.max(1, Math.floor(remainingMs));
@@ -1169,15 +1171,13 @@ async function resolvePlannerScope(
     return { ok: true, kind: "scoped", jobIds: readResolvedJobIds(scoped.params), header: scoped.header };
   }
 
-  // No explicit scope. Load the permission-scoped inventory once so we know the
-  // actor's scope kind. A narrow recruiter's generic question stays bounded to
-  // their own permitted jobs (today's behavior); an operator/all-access actor is
-  // never allowed to silently run org-wide — their question goes through the
-  // resolver, which forces confirmation. This determination must NOT rely on a
-  // phrase heuristic, which would leak on role-less generic admin questions.
+  // No explicit scope. Load the permission-scoped inventory once: it is what lets the answer NAME
+  // the scope it ran over, and its scopeKind ("jobs" vs operator/all) says whether an unscoped read
+  // is this actor's own book or the org. Eligibility for the org-wide default is a permission fact,
+  // never a phrase heuristic — the phrase only decides whether the population is open reqs.
   const load = await loadJobInventory(runtime, deadline);
   if (!load.ok) return { ok: false, code: load.code, message: load.message };
-  const isAdmin = load.inventory.scopeKind !== "jobs";
+  const orgWideEligible = load.inventory.scopeKind !== "jobs";
 
   // Possessive req intent always resolves the actor's recruiter/sourcer assignments, regardless of
   // whether their permission scope is narrow or org-wide. Empty/failing ownership never falls back
@@ -1196,8 +1196,12 @@ async function resolvePlannerScope(
     ownerScopedJobIds = owner.ownerScopedJobIds;
   }
 
-  if (!isAdmin && !ownerIntent && !hasResolverIntent(params) && !hasOrgBroadIntent(question)) {
-    return { ok: true, kind: "scoped", header: null };
+  // A narrow recruiter with no named job intent: the scoped core already bounds every read to
+  // their permitted jobs, so the reads are byte-identical to before. The only change is that the
+  // answer now says which set it covered — including for "across all my open reqs", which is a
+  // request for exactly that permitted set, not a job/role reference to resolve.
+  if (!orgWideEligible && !ownerIntent && !hasResolverIntent(params)) {
+    return { ok: true, kind: "scoped", header: buildPermissionScopeHeader(load.inventory) };
   }
 
   const { signer, ephemeral } = resolveScopeSigner(runtime);
@@ -1210,22 +1214,168 @@ async function resolvePlannerScope(
     ownerScopedJobIds: ownerScopedJobIds ?? null,
   });
   if (output.resolution_status === "resolved" && output.scope.job_ids.length > 0) {
+    return resolvedScopeOutcome(output, []);
+  }
+  if (!orgWideEligible) {
+    // A narrow recruiter who NAMED a job or role that did not resolve keeps today's behavior: the
+    // ask is about specific reqs, so answering across their whole book would answer a different
+    // question. Their unnamed questions never reach here (they took the permitted-set path above).
+    return { ok: true, kind: "resolution_required", resolution: output };
+  }
+  const decision = classifyScopeProbe(output, load.inventory);
+  if (decision.kind === "confirm") {
+    return { ok: true, kind: "resolution_required", resolution: output };
+  }
+  if (decision.kind === "use_scope" && output.scope.job_ids.length > 0) {
+    return resolvedScopeOutcome(output, decision.warnings);
+  }
+  return orgWideScopeOutcome(question, load.inventory, decision.warnings);
+}
+
+function resolvedScopeOutcome(output: ResolveJobScopeOutput, extraWarnings: string[]): PlannerScopeOutcome {
+  return {
+    ok: true,
+    kind: "scoped",
+    jobIds: output.scope.job_ids.join(","),
+    header: {
+      source: "scope_handle",
+      primary_scope_domain: "job_scope",
+      scope_label: output.scope.scope_label,
+      scope_hash: output.scope.scope_hash,
+      job_count: output.scope.job_ids.length,
+      expires_at: output.scope.expires_at,
+      warnings: [...output.warnings, ...extraWarnings],
+    },
+  };
+}
+
+/**
+ * The org-wide default (CLO-274). The question named no requisition, so the answer covers what the
+ * actor's Greenhouse permissions already return and says so. One population refinement: a question
+ * about OPEN reqs gets the open population rather than every job ever opened — that is scope
+ * correctness, not a clamp, and when the index is truncated the population cannot be enumerated, so
+ * the answer runs across everything and DISCLOSES that closed reqs are in it.
+ */
+function orgWideScopeOutcome(question: string, inventory: JobInventory, warnings: string[]): PlannerScopeOutcome {
+  const total = inventory.records.length;
+  const openIds = inventory.records
+    .filter((record) => record.status.trim().toLowerCase() === "open")
+    .map((record) => record.greenhouse_job_id);
+  const openOnly = wantsOpenReqPopulation(question);
+
+  if (openOnly && inventory.complete && openIds.length > 0) {
+    const excluded = total - openIds.length;
     return {
       ok: true,
       kind: "scoped",
-      jobIds: output.scope.job_ids.join(","),
+      jobIds: openIds.join(","),
       header: {
-        source: "scope_handle",
+        source: "permission_scope",
         primary_scope_domain: "job_scope",
-        scope_label: output.scope.scope_label,
-        scope_hash: output.scope.scope_hash,
-        job_count: output.scope.job_ids.length,
-        expires_at: output.scope.expires_at,
-        warnings: output.warnings,
+        scope_label: `all ${openIds.length} open jobs you can see in Greenhouse`,
+        job_count: openIds.length,
+        warnings: excluded > 0
+          ? [...warnings, `${excluded} non-open req(s) you can see were left out because the question asked about open reqs.`]
+          : warnings,
       },
     };
   }
-  return { ok: true, kind: "resolution_required", resolution: output };
+
+  const disclosures = [...warnings];
+  if (openOnly && !inventory.complete) {
+    disclosures.push(
+      "The question asked about open reqs, but the job index is truncated, so the open population could not be enumerated — this answer spans every job you can see, closed reqs included."
+    );
+  }
+  return { ok: true, kind: "scoped", header: buildPermissionScopeHeader(inventory, disclosures) };
+}
+
+/** "all open reqs", "our active roles" — a population statement, not a job reference. */
+function wantsOpenReqPopulation(question: string): boolean {
+  const normalized = ` ${question.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim()} `;
+  return / (open|active|current) (reqs?|requisitions?|roles?|jobs?|positions?|openings?|pipelines?) /.test(normalized);
+}
+
+export type ScopeProbeDecision =
+  | { kind: "use_scope"; warnings: string[] }
+  | { kind: "org_wide"; warnings: string[] }
+  | { kind: "confirm" };
+
+const NO_REQ_NAMED_WARNING =
+  "No specific requisition was named; answered across all jobs you can see. Name a req or role to narrow.";
+
+/**
+ * CLO-274, the whole org-wide default policy in one pure, TOTAL function: given the resolver's
+ * probe of the question, either use the scope it found, answer across the actor's permission floor,
+ * or ask which req they meant. Total over ResolutionStatus on purpose — an unhandled status must
+ * never quietly become a refusal, which is how the old planner turned every unnamed question into a
+ * dead end. Confirmation is reserved for ambiguity a default genuinely cannot settle: several real
+ * reqs matched, a collision alias, or one requisition id mapping to two jobs. Everything else
+ * (closed reqs, confidential reqs the actor is already on the hiring team for, a stale or truncated
+ * index, weak lexical confidence) is a DISCLOSURE, not a blocker.
+ */
+export function classifyScopeProbe(output: ResolveJobScopeOutput, inventory: JobInventory): ScopeProbeDecision {
+  const codes = new Set<ConfirmationReasonCode>(output.confirmation.reason_codes);
+  const band = output.confidence.band;
+
+  switch (output.resolution_status) {
+    case "resolved":
+      return { kind: "use_scope", warnings: [] };
+    case "forbidden":
+    case "error":
+      // A probe that could not be evaluated is not an answerable scope; keep today's handling
+      // rather than reading org-wide off the back of a failure.
+      return { kind: "confirm" };
+    case "no_match":
+      return { kind: "org_wide", warnings: [NO_REQ_NAMED_WARNING] };
+    case "incomplete":
+      return {
+        kind: "org_wide",
+        warnings: [
+          NO_REQ_NAMED_WARNING,
+          `The job index could not be read completely (${inventory.accessibleSeen} req(s) enumerated), so no named requisition could be confirmed from it. The answer itself does not depend on the index — it runs over what your Greenhouse permissions return.`,
+        ],
+      };
+    case "ambiguous":
+      return { kind: "confirm" };
+    case "needs_confirmation":
+      break;
+  }
+
+  if (codes.has("duplicate_req_id")) return { kind: "confirm" };
+
+  // A "named" selection is one the question actually pointed at: real matches, at a real lexical
+  // band, not the synthesized all-permitted set the resolver offers for a role-less question.
+  const namedSelection = !codes.has("broad_scope") && output.matches.length > 0 && (band === "high" || band === "medium");
+  if (namedSelection && codes.has("multiple_matches")) return { kind: "confirm" };
+
+  const warnings = probeDisclosures(output, codes);
+  if (namedSelection) return { kind: "use_scope", warnings };
+  return { kind: "org_wide", warnings: [NO_REQ_NAMED_WARNING, ...warnings] };
+}
+
+function probeDisclosures(output: ResolveJobScopeOutput, codes: Set<ConfirmationReasonCode>): string[] {
+  const warnings: string[] = [];
+  const closed = output.matches.filter((match) => match.status.trim().toLowerCase() !== "open").length;
+  if (codes.has("contains_closed_jobs") && closed > 0) {
+    warnings.push(`Scope includes ${closed} closed req(s).`);
+  }
+  const confidential = output.matches.filter((match) => match.confidential).length;
+  if (codes.has("contains_confidential_jobs") && confidential > 0) {
+    // Confidential reqs reach `matches` only when they are already in this actor's
+    // permission-filtered inventory, so naming the count reveals nothing new.
+    warnings.push(`Scope includes ${confidential} confidential req(s) you are on the hiring team for.`);
+  }
+  if (codes.has("stale_index")) {
+    warnings.push("The job index behind this scope is stale; re-resolve if a req opened or closed recently.");
+  }
+  if (codes.has("medium_confidence")) {
+    warnings.push(`Matched "${output.scope.scope_label}" at medium confidence — name the req or its requisition id to be certain.`);
+  }
+  if (codes.has("unmatched_material_terms")) {
+    warnings.push("Some words in the question matched no accessible job and were read as analysis wording, not scope.");
+  }
+  return warnings;
 }
 
 function explicitScopeParams(params: Record<string, unknown>): Record<string, unknown> {
@@ -1275,18 +1425,6 @@ function hasResolverIntent(params: Record<string, unknown>): boolean {
     stringArray(params.requisition_ids).length > 0 ||
     numberArray(params.greenhouse_job_ids).length > 0
   );
-}
-
-function hasOrgBroadIntent(question: string): boolean {
-  const q = ` ${question.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim()} `;
-  if (/ (org wide|orgwide|company wide|companywide|organization wide|every recruiter|all recruiters|across the (org|organization|company)) /.test(q)) {
-    return true;
-  }
-  const broad = / (all|every|each|entire) (open |active |current )?(jobs?|reqs?|requisitions?|roles?|positions?|openings?|pipelines?) /;
-  if (broad.test(q) && !/ (all|every|each|entire) (of )?(my|our) /.test(q)) {
-    return true;
-  }
-  return false;
 }
 
 function hasExactJobIds(value: unknown): boolean {

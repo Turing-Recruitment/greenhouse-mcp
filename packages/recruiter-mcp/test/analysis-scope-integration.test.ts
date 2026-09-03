@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createFixtureInventoryProvider, type JobScopeFixture } from "../src/resolvers/job-scope/inventory.js";
 import { createScopeSigner, scopeHashOf } from "../src/resolvers/job-scope/scope-handle.js";
+import { resolveAnalysisContext } from "../src/resolution/analysis-context.js";
 import { runScorecardAccountability } from "../src/tools/scorecard-accountability.js";
 import { runStageLatency } from "../src/tools/stage-latency.js";
 import { fakeScopedReader, scopedSuccess, testRuntime } from "./test-helpers.js";
@@ -281,5 +282,48 @@ describe("analysis tools — exact job_ids and rejection", () => {
     assert.equal(result.ok === false && result.denial.code, "INVALID_REQUEST");
     assert.match(result.ok === false ? result.denial.message : "", /future_job_text/);
     assert.equal(reader.calls.length, 0);
+  });
+});
+
+// A6 (CLO-274): resolveAnalysisContext is the direct analyze_* entry point. It used to FAIL CLOSED
+// for a broad-access actor with no explicit scope ("org-wide analysis is never run silently"). Both
+// actor kinds now share one success return; only the disclosed header differs, and BOTH carry the
+// provenance job anchors built from the inventory already loaded for permission validation.
+describe("resolveAnalysisContext — unscoped default carries a permission_scope header (A6)", () => {
+  it("answers a broad-access actor org-wide and says so, with anchors built", async () => {
+    const reader = fakeScopedReader(() => { throw new Error("resolveAnalysisContext must not read analysis data"); });
+    const { runtime } = runtimeWith(reader, "site_admin");
+    const resolution = await resolveAnalysisContext(runtime, {});
+    assert.equal(resolution.ok, true);
+    if (!resolution.ok) return;
+    assert.equal(resolution.header?.source, "permission_scope");
+    assert.equal(resolution.header?.job_count, 10);
+    assert.match(String(resolution.header?.scope_label), /org-wide/);
+    assert.equal(resolution.header?.scope_hash, undefined, "an unbounded read mints no scope hash");
+    assert.equal(resolution.jobAnchors?.length, 10, "provenance anchors must not be silently disabled");
+    assert.deepStrictEqual(resolution.params, {});
+  });
+
+  it("keeps a narrow recruiter's behavior and adds the permitted-set header", async () => {
+    const reader = fakeScopedReader(() => { throw new Error("resolveAnalysisContext must not read analysis data"); });
+    const { runtime } = runtimeWith(reader, "narrow_recruiter");
+    const resolution = await resolveAnalysisContext(runtime, {});
+    assert.equal(resolution.ok, true);
+    if (!resolution.ok) return;
+    assert.equal(resolution.header?.source, "permission_scope");
+    assert.equal(resolution.header?.job_count, 7);
+    assert.match(String(resolution.header?.scope_label), /all 7 reqs you can see in Greenhouse/);
+    assert.equal(resolution.jobAnchors?.length, 7);
+    assert.deepStrictEqual(resolution.params, {});
+  });
+
+  it("discloses a truncated index instead of blocking on it", async () => {
+    const reader = fakeScopedReader(() => { throw new Error("resolveAnalysisContext must not read analysis data"); });
+    const { runtime } = runtimeWith(reader, "site_admin", { complete: false });
+    const resolution = await resolveAnalysisContext(runtime, {});
+    assert.equal(resolution.ok, true);
+    if (!resolution.ok) return;
+    assert.match(String(resolution.header?.scope_label), /index truncated/);
+    assert.ok(resolution.header?.warnings.some((w) => /truncat/i.test(w)));
   });
 });

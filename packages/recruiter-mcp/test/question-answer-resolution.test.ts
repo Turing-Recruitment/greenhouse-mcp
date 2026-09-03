@@ -36,9 +36,18 @@ describe("answer_my_recruiting_question — scope resolution", () => {
     assert.equal(reader.calls.length, 0);
   });
 
-  it("does not silently run org-wide for a site admin broad phrase", async () => {
+  // INVERTED by CLO-274. This used to assert that a site admin's broad-phrase question was
+  // REFUSED until confirmed. Refusing it bought nothing — the scoped core is the permission
+  // floor either way — and cost the operator the answer they asked for. The property that
+  // still matters, and is asserted here, is that the org-wide scope is said OUT LOUD.
+  it("CLO-274: a site admin's broad-phrase question runs org-wide with the scope disclosed, not refused", async () => {
     const reader = fakeScopedReader((toolName) => {
-      throw new Error(`admin broad phrase must not silently run analysis (called ${toolName})`);
+      if (toolName === "list_applications") {
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 9001001, stage_id: 7, stage_name: "Phone Screen", status: "active", current_stage_at: "2026-06-01T00:00:00.000Z", last_activity_at: "2026-06-01T00:00:00.000Z" },
+        ]);
+      }
+      throw new Error(`unexpected ${toolName}`);
     });
     const { runtime } = testRuntime(reader, {
       scopeSigner: signer,
@@ -51,11 +60,17 @@ describe("answer_my_recruiting_question — scope resolution", () => {
 
     assert.equal(result.ok, true);
     const out = result.ok ? (result.data as any) : null;
-    assert.equal(out.summary.scope_resolution_required, true);
-    assert.equal(out.resolution.resolution_status, "needs_confirmation");
-    assert.ok(out.resolution.confirmation.reason_codes.includes("admin_scope"));
-    assert.ok(out.resolution.confirmation.reason_codes.includes("broad_scope"));
-    assert.equal(reader.calls.length, 0);
+    assert.equal(out.summary.scope_resolution_required, undefined, "the question is answered, not bounced");
+    assert.equal(out.summary.scope.source, "permission_scope");
+    // The question said "open jobs", so the population is the OPEN readable set (9 of 10 —
+    // 9001007 is closed) and the label says so rather than claiming the whole org.
+    assert.equal(out.summary.scope.job_count, 9);
+    assert.match(out.summary.scope.scope_label, /all 9 open jobs you can see/);
+    assert.ok(reader.calls.some((c) => c.toolName === "list_applications"), "the analysis actually ran");
+    assert.equal(
+      reader.calls.find((c) => c.toolName === "list_applications")?.params?.job_ids,
+      "9001001,9001002,9001003,9001004,9001005,9001006,9001008,9001009,9001010"
+    );
   });
 
   it("auto-confirms a unique narrow match and runs scoped recipes", async () => {
@@ -119,12 +134,17 @@ describe("answer_my_recruiting_question — scope resolution", () => {
     assert.ok(reader.calls.some((c) => c.toolName === "list_scorecards"));
   });
 
-  it("does not silently run org-wide for a site admin even on a role-less generic question", async () => {
-    // The dangerous case finding #1 flagged: no broad-phrase tokens, no structured
-    // intent — the planner must still gate an operator/all actor via the scope-kind
-    // probe, not a phrase heuristic.
+  // INVERTED by CLO-274. Formerly: a role-less generic admin question was gated by the
+  // scope-kind probe and refused. It is now ANSWERED across the actor's whole readable set,
+  // with the scope named on the answer and a warning that no req was named.
+  it("CLO-274: a role-less generic admin question is answered org-wide with a 'no req named' warning", async () => {
     const reader = fakeScopedReader((toolName) => {
-      throw new Error(`admin generic question must not run analysis silently (called ${toolName})`);
+      if (toolName === "list_applications") {
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 9001001, stage_id: 7, stage_name: "Phone Screen", status: "active", current_stage_at: "2026-06-01T00:00:00.000Z", last_activity_at: "2026-06-01T00:00:00.000Z" },
+        ]);
+      }
+      throw new Error(`unexpected ${toolName}`);
     });
     const { runtime } = testRuntime(reader, {
       scopeSigner: signer,
@@ -137,23 +157,38 @@ describe("answer_my_recruiting_question — scope resolution", () => {
 
     assert.equal(result.ok, true);
     const out = result.ok ? (result.data as any) : null;
-    assert.equal(out.summary.scope_resolution_required, true);
-    assert.notEqual(out.resolution.resolution_status, "resolved");
-    assert.ok(out.resolution.confirmation.reason_codes.includes("admin_scope"));
-    assert.equal(reader.calls.length, 0, "no analysis recipes run for an unconfirmed admin scope");
+    assert.equal(out.summary.scope_resolution_required, undefined);
+    assert.equal(out.summary.scope.source, "permission_scope");
+    assert.equal(out.summary.scope.job_count, 10, "every job the site admin can see");
+    assert.ok(
+      out.summary.scope.warnings.some((w: string) => /No specific requisition was named/i.test(w)),
+      `expected a 'no req named' warning, got ${JSON.stringify(out.summary.scope.warnings)}`
+    );
+    assert.ok(reader.calls.some((c) => c.toolName === "list_applications"));
   });
 
-  it("routes an ADMIN's possessive 'my reqs' question through owner resolution, not org-wide (audit D1)", async () => {
-    // site_admin (uid 7009000) has all-access, but "my reqs" must mean the reqs they OWN —
-    // previously the built owner-resolution was unreachable from NL and this broadened to an
-    // org-wide confirmation over the whole inventory.
-    const reader = fakeScopedReader((toolName) => {
+  // INVERTED by CLO-274. The owner-resolution routing (audit D1) still holds — "my reqs" means
+  // the reqs the admin OWNS, never the org inventory — but the answer no longer stops at a
+  // confirmation. A deterministic owner scope is exactly named by the actor, so it runs.
+  it("CLO-274: an ADMIN's possessive 'my reqs' question resolves through owner resolution and RUNS, no confirmation", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
       if (toolName === "list_job_owners") {
         return scopedSuccess(toolName, [
           { id: 1, job_id: 9001003, user_id: 7009000, responsible: true, type: "recruiter" },
         ]);
       }
-      throw new Error(`unexpected ${toolName} — admin 'my reqs' must not run analysis before confirmation`);
+      if (toolName === "list_applications") {
+        assert.equal(params?.job_ids, "9001003", "the owned req is the scope, not the org inventory");
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 9001003, stage_id: 7, stage_name: "Phone Screen", status: "active", current_stage_at: "2026-06-01T00:00:00.000Z", last_activity_at: "2026-06-01T00:00:00.000Z" },
+        ]);
+      }
+      if (toolName === "list_application_stages") {
+        return scopedSuccess(toolName, [
+          { id: 4001, application_id: 100, job_interview_stage_id: 7, entered_at: "2026-06-01T00:00:00.000Z", exited_at: null, days_in_stage: 22, current: true },
+        ]);
+      }
+      throw new Error(`unexpected ${toolName}`);
     });
     const { runtime } = testRuntime(reader, {
       scopeSigner: signer,
@@ -166,15 +201,12 @@ describe("answer_my_recruiting_question — scope resolution", () => {
 
     assert.equal(result.ok, true);
     const out = result.ok ? (result.data as any) : null;
-    // Owner resolution actually ran (the NL plumbing exists)...
     assert.ok(reader.calls.some((c) => c.toolName === "list_job_owners"), "owner resolution must run for admin 'my reqs'");
     assert.equal(reader.calls.some((c) => c.toolName === "list_job_hiring_managers"), false);
-    // ...and whatever the resolver proposes is the OWNED req, never the org inventory.
-    const proposed: number[] = out.resolution?.scope?.job_ids
-      ?? out.resolution?.confirmation?.proposed_scope?.job_ids
-      ?? [];
-    assert.ok(proposed.length <= 1, `proposed scope must be owner-narrowed, got ${proposed.length} jobs`);
-    if (proposed.length === 1) assert.equal(proposed[0], 9001003);
+    assert.equal(out.summary.scope_resolution_required, undefined, "an owned scope the actor named runs without a round-trip");
+    assert.equal(out.summary.scope.source, "scope_handle");
+    assert.equal(out.summary.scope.job_count, 1);
+    assert.ok(out.summary.scope.warnings.some((w: string) => /Owner filter applied/.test(w)));
   });
 
   it("resolves possessive req intent for a narrow recruiter before running recipes", async () => {
@@ -280,5 +312,286 @@ describe("answer_my_recruiting_question — scope resolution", () => {
 
     assert.equal(result.ok, true);
     assert.ok(reader.calls.some((c) => c.toolName === "list_scorecards"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CLO-274: an actor whose Greenhouse permissions already span the org gets an ANSWER,
+// with the scope it ran over stated on every answer. Naming a req still narrows.
+// ---------------------------------------------------------------------------
+
+// Inventory scopeKind distinguishes "operator" from "all"; eligibility for the org-wide
+// default is scopeKind !== "jobs", so BOTH kinds are exercised.
+const ALL_ACCESS_FIXTURE = {
+  ...fixture,
+  personas: [
+    ...fixture.personas,
+    {
+      id: "all_access_admin",
+      greenhouse_user_id: 7009001,
+      permission_scope_kind: "all",
+      risk_profile: "admin",
+      accessible_job_ids: "all" as const,
+      can_view_confidential: true,
+    },
+  ],
+} as JobScopeFixture;
+
+const ORG_WIDE_PERSONAS = ["site_admin", "all_access_admin"] as const;
+
+function offerReader() {
+  return fakeScopedReader((toolName) => {
+    if (toolName === "list_offers") {
+      return scopedSuccess(toolName, [
+        { id: 1, job_id: 9001001, application_id: 101, status: "Accepted", sent_on: "2026-06-01" },
+        { id: 2, job_id: 9001001, application_id: 102, status: "Rejected", sent_on: "2026-06-02" },
+        // 9001007 is CLOSED: an "open reqs" question must not count it.
+        { id: 3, job_id: 9001007, application_id: 103, status: "Accepted", sent_on: "2026-06-03" },
+      ]);
+    }
+    throw new Error(`unexpected ${toolName}`);
+  });
+}
+
+describe("answer_my_recruiting_question — org-wide default (CLO-274)", () => {
+  for (const personaId of ORG_WIDE_PERSONAS) {
+    it(`A1: ${personaId} gets an open-req answer with the scope said out loud`, async () => {
+      const reader = offerReader();
+      const { runtime } = testRuntime(reader, {
+        scopeSigner: signer,
+        jobInventory: createFixtureInventoryProvider(ALL_ACCESS_FIXTURE, personaId),
+      });
+
+      const result = await runRecruitingQuestionAnswer(runtime, {
+        question: "What is our offer acceptance rate this quarter across all open reqs?",
+      });
+
+      assert.equal(result.ok, true);
+      const out = result.ok ? (result.data as any) : null;
+      assert.equal(out.summary.scope_resolution_required, undefined, "an all-access actor gets an answer");
+      assert.equal(out.summary.scope.source, "permission_scope");
+      assert.equal(out.summary.scope.job_count, 9, "the 9 OPEN jobs, not all 10");
+      assert.match(out.summary.scope.scope_label, /all 9 open jobs you can see/);
+      assert.ok(
+        out.summary.scope.warnings.some((w: string) => /No specific requisition was named/i.test(w)),
+        `expected the 'no req named' warning, got ${JSON.stringify(out.summary.scope.warnings)}`
+      );
+      // The offer on the CLOSED req is excluded; without the open-req population it would be 2/3.
+      assert.equal(out.answer.mode, "planned_metric");
+      assert.equal(out.answer.metric.value, 0.5);
+      assert.equal(out.answer.metric.denominator, 2);
+    });
+  }
+
+  it("A1b: the same actor with no broad token (the probe returns no_match) still gets an org-wide answer", async () => {
+    const reader = offerReader();
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this quarter?",
+    });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope_resolution_required, undefined);
+    assert.equal(out.summary.scope.source, "permission_scope");
+    assert.equal(out.summary.scope.job_count, 10, "no open-req token, so the whole readable set");
+    assert.match(out.summary.scope.scope_label, /all 10 jobs you can see in Greenhouse \(org-wide\)/);
+    assert.equal(out.answer.mode, "planned_metric");
+  });
+
+  it("A1c: a TRUNCATED job index is disclosed, not blocking", async () => {
+    const reader = offerReader();
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "site_admin", { complete: false }),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this quarter across all open reqs?",
+    });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope_resolution_required, undefined, "a truncated index must not block the answer");
+    assert.equal(out.summary.scope.source, "permission_scope");
+    assert.match(out.summary.scope.scope_label, /org-wide; at least 10 enumerated, index truncated/);
+    assert.ok(
+      out.summary.scope.warnings.some((w: string) => /truncat/i.test(w)),
+      `expected a truncation warning, got ${JSON.stringify(out.summary.scope.warnings)}`
+    );
+    // The open-req population could not be enumerated, so that gap is disclosed too.
+    assert.ok(out.summary.scope.warnings.some((w: string) => /closed reqs included|open reqs/i.test(w)));
+  });
+
+  it("A2: possessive req intent for an admin resolves and runs, no confirmation", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_job_owners") {
+        return scopedSuccess(toolName, [{ id: 1, job_id: 9001003, user_id: 7009000, responsible: true, type: "recruiter" }]);
+      }
+      if (toolName === "list_applications") {
+        assert.equal(params?.job_ids, "9001003");
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 9001003, stage_id: 7, stage_name: "Phone Screen", status: "active", current_stage_at: "2026-06-01T00:00:00.000Z", last_activity_at: "2026-06-01T00:00:00.000Z" },
+        ]);
+      }
+      if (toolName === "list_application_stages") {
+        return scopedSuccess(toolName, [
+          { id: 4001, application_id: 100, job_interview_stage_id: 7, entered_at: "2026-06-01T00:00:00.000Z", exited_at: null, days_in_stage: 22, current: true },
+        ]);
+      }
+      throw new Error(`unexpected ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "Where are candidates stuck in my reqs right now?",
+    });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope_resolution_required, undefined);
+    assert.equal(out.summary.scope.source, "scope_handle");
+    assert.equal(out.summary.scope.job_count, 1);
+    assert.ok(out.summary.scope.warnings.some((w: string) => /Owner filter applied/.test(w)));
+    assert.ok(reader.calls.some((c) => c.toolName === "list_application_stages"), "the analysis ran");
+  });
+
+  it("A3: a title matching four jobs at a real band still asks which one", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      throw new Error(`a genuinely ambiguous title must not pick a scope for the operator (called ${toolName})`);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "How is Frontier Data doing?",
+    });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope_resolution_required, true);
+    assert.equal(out.answer.mode, "resolution_required");
+    assert.ok(out.resolution.matches.length >= 4, `expected four candidate reqs, got ${out.resolution.matches.length}`);
+    const codes: string[] = out.resolution.confirmation.reason_codes;
+    assert.ok(codes.includes("multiple_matches"), `expected multiple_matches in [${codes.join(", ")}]`);
+    assert.ok(codes.some((code) => code !== "admin_scope"), "admin_scope must not be the only reason to ask");
+    assert.equal(reader.calls.length, 0);
+  });
+
+  it("A3b: a named selection containing a CLOSED req runs, with the closed reqs disclosed", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_applications") {
+        assert.equal(params?.job_ids, "9001007", "the named closed req is the scope");
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 9001007, stage_id: 7, stage_name: "Phone Screen", status: "active", current_stage_at: "2026-06-01T00:00:00.000Z", last_activity_at: "2026-06-01T00:00:00.000Z" },
+        ]);
+      }
+      if (toolName === "list_application_stages") {
+        return scopedSuccess(toolName, [
+          { id: 4001, application_id: 100, job_interview_stage_id: 7, entered_at: "2026-06-01T00:00:00.000Z", exited_at: null, days_in_stage: 22, current: true },
+        ]);
+      }
+      throw new Error(`unexpected ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "Why is req SAIS-US-400 slow?",
+    });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope_resolution_required, undefined, "a closed req the operator NAMED is not a reason to refuse");
+    assert.equal(out.summary.scope.job_count, 1);
+    assert.ok(
+      out.summary.scope.warnings.some((w: string) => /1 closed req/i.test(w)),
+      `expected a closed-req disclosure, got ${JSON.stringify(out.summary.scope.warnings)}`
+    );
+  });
+
+  // A4 (LOCK). promoteExactIdentifierQuery already lifts a bare req id out of free text, so an
+  // org-wide-eligible actor who names a req in a sentence gets THAT req — before and after CLO-274.
+  // (A narrow recruiter's plain question never reaches the resolver at all, so the promotion is
+  // unreachable for them; see the report — that gap is a separate defect, not this lane's change.)
+  it("A4 (LOCK): an exact req id inside a natural question resolves to that job", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (toolName === "list_applications") {
+        assert.equal(params?.job_ids, "9001006");
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 9001006, stage_id: 7, stage_name: "Phone Screen", status: "active", current_stage_at: "2026-06-01T00:00:00.000Z", last_activity_at: "2026-06-01T00:00:00.000Z" },
+        ]);
+      }
+      if (toolName === "list_application_stages") {
+        return scopedSuccess(toolName, [
+          { id: 4001, application_id: 100, job_interview_stage_id: 7, entered_at: "2026-06-01T00:00:00.000Z", exited_at: null, days_in_stage: 22, current: true },
+        ]);
+      }
+      throw new Error(`unexpected ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "Why is req SAIS-US-401 slow?",
+    });
+
+    assert.equal(result.ok, true);
+    const out = result.ok ? (result.data as any) : null;
+    assert.equal(out.summary.scope_resolution_required, undefined);
+    assert.equal(out.summary.scope.job_count, 1);
+  });
+
+  it("A5: a narrow recruiter's reads are unchanged; only the disclosed header is new", async () => {
+    const broadPhrase = offerReader();
+    const { runtime: broadRuntime } = testRuntime(broadPhrase, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "narrow_recruiter"),
+    });
+    const broadResult = await runRecruitingQuestionAnswer(broadRuntime, {
+      question: "What is our offer acceptance rate this quarter across all open reqs?",
+    });
+
+    const plain = offerReader();
+    const { runtime: plainRuntime } = testRuntime(plain, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "narrow_recruiter"),
+    });
+    const plainResult = await runRecruitingQuestionAnswer(plainRuntime, {
+      question: "What is our offer acceptance rate this quarter?",
+    });
+
+    assert.equal(broadResult.ok, true);
+    assert.equal(plainResult.ok, true);
+    const broadOut = broadResult.ok ? (broadResult.data as any) : null;
+    const plainOut = plainResult.ok ? (plainResult.data as any) : null;
+
+    // Identical reads: the scoped core already bounds a narrow recruiter to their permitted jobs,
+    // so a broad phrase changes nothing about what is read.
+    assert.deepStrictEqual(
+      broadPhrase.calls.map((c) => ({ toolName: c.toolName, job_ids: c.params?.job_ids })),
+      plain.calls.map((c) => ({ toolName: c.toolName, job_ids: c.params?.job_ids }))
+    );
+    assert.deepStrictEqual(broadPhrase.calls.map((c) => c.toolName), ["list_offers"]);
+    for (const out of [broadOut, plainOut]) {
+      assert.equal(out.summary.scope_resolution_required, undefined);
+      assert.equal(out.summary.scope.source, "permission_scope");
+      assert.equal(out.summary.scope.job_count, 7);
+      assert.match(out.summary.scope.scope_label, /all 7 reqs you can see in Greenhouse/);
+      assert.equal(out.summary.scope.scope_hash, undefined, "an unbounded permitted-set read mints no scope hash");
+    }
   });
 });

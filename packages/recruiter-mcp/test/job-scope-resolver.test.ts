@@ -164,11 +164,35 @@ describe("job scope resolver — additional matrix cases", () => {
     assert.ok(output.scope.scope_handle);
   });
 
-  it("requires confirmation when a site admin uses a free-text single match (not exact id)", async () => {
+  // INVERTED by CLO-274 (A8b). Being a site admin was itself the reason a unique, high-confidence,
+  // open-req match was refused — a narrowing with no external constraint behind it: the match names
+  // ONE req the admin can already read. It now RESOLVES, and admin_scope moves from a blocker to a
+  // disclosure that rides resolved outputs too.
+  it("CLO-274: a site admin's unique high-confidence free-text match RESOLVES, with admin_scope disclosed", async () => {
     const output = await resolveCase("site_admin", { query: "Senior AI Solutions Engineer" });
-    assert.equal(output.resolution_status, "needs_confirmation");
-    assert.equal(output.scope.scope_handle, null);
-    assert.ok(output.confirmation.reason_codes.includes("admin_scope"));
+    assert.equal(output.resolution_status, "resolved");
+    assert.equal(output.scope.scope_status, "confirmed");
+    assert.deepStrictEqual(output.scope.job_ids, [9001006]);
+    assert.equal(output.confirmation.required, false);
+    assert.ok(output.scope.scope_handle, "a resolved scope mints a handle");
+    assert.ok(
+      output.confirmation.reason_codes.includes("admin_scope"),
+      `admin_scope must ride a RESOLVED admin output too, got [${output.confirmation.reason_codes.join(", ")}]`
+    );
+    assert.ok(
+      output.warnings.some((w) => /broad Greenhouse visibility/i.test(w)),
+      `expected a broad-visibility warning, got ${JSON.stringify(output.warnings)}`
+    );
+  });
+
+  it("CLO-274: a broad or multi-job admin scope still requires confirmation (the narrowing that survives)", async () => {
+    const broad = await resolveCase("site_admin", { query: "all open jobs" });
+    assert.equal(broad.resolution_status, "needs_confirmation");
+    assert.ok(broad.confirmation.reason_codes.includes("broad_scope"));
+
+    const multi = await resolveCase("site_admin", { query: "Frontier Data" });
+    assert.equal(multi.resolution_status, "needs_confirmation");
+    assert.ok(multi.confirmation.reason_codes.includes("multiple_matches"));
   });
 
   it("excludes confidential jobs from a narrow recruiter inventory entirely", async () => {

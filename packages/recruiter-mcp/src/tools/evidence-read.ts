@@ -860,7 +860,11 @@ function buildScopeEnvelope(scope: { jobIds: number[] | null; header: ScopeHeade
   const header = scope.header;
   return {
     applied: true,
-    ...(header?.source === "scope_handle" || header?.source === "exact_ids" ? { source: header.source } : {}),
+    // CLO-274: permission_scope joins the allowlist so an org-wide/permitted-set disclosure is
+    // carried into the evidence envelope rather than silently dropped (an unlisted source vanishes).
+    ...(header?.source === "scope_handle" || header?.source === "exact_ids" || header?.source === "permission_scope"
+      ? { source: header.source }
+      : {}),
     job_count: header?.job_count ?? scope.jobIds?.length ?? 0,
     ...(header?.scope_label !== undefined ? { scope_label: header.scope_label } : {}),
     ...(header?.scope_hash !== undefined ? { scope_hash: header.scope_hash } : {}),

@@ -114,7 +114,9 @@ export interface EvidenceReadEnvelope {
 
 export interface EvidenceScopeEnvelope {
   applied: boolean;
-  source?: "scope_handle" | "exact_ids";
+  // "permission_scope" (CLO-274): the read covered everything this actor's Greenhouse permissions
+  // return, disclosed rather than dropped. Kept in step with AnalysisContextHeader["source"].
+  source?: "scope_handle" | "exact_ids" | "permission_scope";
   job_count?: number;
   scope_label?: string | null;
   scope_hash?: string;

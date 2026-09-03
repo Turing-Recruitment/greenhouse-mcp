@@ -5,15 +5,25 @@ import { runSourceQuality } from "../src/tools/source-quality.js";
 import { analysisRuntime, fakeScopedReader, operatorInventory, scopedDenial, scopedSuccess } from "./test-helpers.js";
 
 describe("source quality analysis", () => {
-  it("denies a no-scope analysis for a broad-access operator without running an org-wide read", async () => {
-    const scopedReader = fakeScopedReader((toolName) => {
-      throw new Error(`operator no-scope analysis must not read org-wide (called ${toolName})`);
-    });
+  // INVERTED by CLO-274. This used to assert that an unscoped operator analysis was REFUSED
+  // ("org-wide analysis is never run silently"). The refusal cited no external constraint: the
+  // scoped core is the permission floor either way, so a confirmation round-trip could not make
+  // the read narrower — it only withheld the answer. What replaces it, and is asserted here, is
+  // that the org-wide scope is never SILENT: the response header names it.
+  it("CLO-274: an unscoped broad-access operator analysis runs org-wide and discloses the scope", async () => {
+    const scopedReader = fakeScopedReader((toolName) => scopedSuccess(toolName, []));
     const { runtime } = analysisRuntime(scopedReader, { jobInventory: operatorInventory() });
     const result = await runSourceQuality(runtime, {});
-    assert.equal(result.ok, false);
-    assert.equal(result.ok === false && result.denial.code, "INVALID_REQUEST");
-    assert.equal(scopedReader.calls.length, 0, "no scoped read runs for an unscoped operator analysis");
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.scope.source, "permission_scope");
+    assert.match(data.scope.scope_label, /org-wide/);
+    assert.ok(scopedReader.calls.some((call) => call.toolName === "list_applications"), "the analysis read actually runs");
+    assert.equal(
+      scopedReader.calls.find((call) => call.toolName === "list_applications")?.params?.job_ids,
+      undefined,
+      "the read is unscoped on purpose: the operator's own Greenhouse permissions are the boundary"
+    );
   });
 
   it("ranks scoped sources and referrers by quality and risk, resolving ids to reference names", async () => {

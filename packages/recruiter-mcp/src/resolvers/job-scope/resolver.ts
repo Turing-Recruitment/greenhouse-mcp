@@ -405,9 +405,12 @@ export function resolveJobScope(input: ResolveJobScopeInput, ctx: ResolverContex
   // un-fetched page; the req path therefore fails closed under truncation in
   // selectByRequisitionIds and never reaches here while incomplete.
   const frozenComplete = inventory.complete || hasIdPath;
+  // CLO-274: an operator/site admin's "my reqs" is the same deterministic, exactly-named set a
+  // narrow recruiter's is — job_owners rows for their own user id, already permitted-bounded and
+  // only ever a NARROWING. Excluding admins here forced a confirmation round-trip on the one scope
+  // the actor named precisely, which is the opposite of what a guardrail is for.
   const deterministicOwnerScope =
     ownerRequested &&
-    !isAdmin &&
     !(input.query ?? "").trim() &&
     (input.aliases?.length ?? 0) === 0 &&
     (input.role_families?.length ?? 0) === 0 &&
@@ -433,8 +436,12 @@ export function resolveJobScope(input: ResolveJobScopeInput, ctx: ResolverContex
       containsConfidential ||
       (!deterministicOwnerScope && selection.unmatchedMaterialTerms.length > 0) ||
       staleIndex ||
-      (!deterministicOwnerScope && (band === "low" || band === "none" || (band === "medium" && !exactPath))) ||
-      (isAdmin && !exactPath);
+      (!deterministicOwnerScope && (band === "low" || band === "none" || (band === "medium" && !exactPath)));
+    // CLO-274: `(isAdmin && !exactPath)` used to sit on the end of that list, so broad VISIBILITY
+    // alone blocked a unique, high-confidence, open-req match the admin can already read. It cited
+    // no external constraint — Greenhouse itself grants the read — and it is gone. Every genuine
+    // reason to ask (broad set, several matches, closed/confidential jobs, weak confidence, stale
+    // index) is still above and still asks.
     if (needsConfirmation) {
       status = "needs_confirmation";
       scopeStatus = "proposed";
@@ -446,6 +453,15 @@ export function resolveJobScope(input: ResolveJobScopeInput, ctx: ResolverContex
       scopeStatus = "confirmed";
       confirmationRequired = false;
       mintHandle = true;
+      // The admin label is a DISCLOSURE, not a gate, so it rides resolved outputs too. Previously
+      // admin_scope appeared only when the answer was blocked, which meant resolve_job_scope and
+      // the planner header stayed silent about broad visibility exactly when the scope ran.
+      if (isAdmin) {
+        reasonCodes.add("admin_scope");
+        warnings.push(
+          "You have broad Greenhouse visibility, so this scope was resolved across more than your own assigned reqs."
+        );
+      }
     }
   }
 
