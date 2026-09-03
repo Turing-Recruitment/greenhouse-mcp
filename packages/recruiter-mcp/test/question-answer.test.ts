@@ -1,8 +1,17 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_LIMITS } from "../src/limits.js";
-import { BROAD_DIAGNOSTIC_RECIPES, PLANNER_RECIPE_IDS, runRecruitingQuestionAnswer } from "../src/tools/question-answer.js";
-import { fakeScopedReader, scopedSuccess, scorecardWindowFilter, testRuntime } from "./test-helpers.js";
+import {
+  BROAD_DIAGNOSTIC_RECIPES,
+  DEFAULT_MAX_RECIPES,
+  PLANNER_RECIPE_IDS,
+  QUESTION_ANSWER_TOOL,
+  runRecruitingQuestionAnswer,
+} from "../src/tools/question-answer.js";
+import { createFixtureInventoryProvider, type JobScopeFixture } from "../src/resolvers/job-scope/inventory.js";
+import { fakeScopedReader, scopedDenial, scopedSuccess, scorecardWindowFilter, testRuntime } from "./test-helpers.js";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 // The inventory loader now issues four enrichment reads (offices/departments/job posts/post
 // locations — the multi-signal matching joins, 2026-07-02) alongside list_jobs; planner tests
@@ -31,6 +40,44 @@ describe("broad-diagnostic panel covers the full recipe set", () => {
         `${id} is a runnable recipe but is missing from BROAD_DIAGNOSTIC_RECIPES — a broad diagnostic would drop it`
       );
     }
+  });
+
+  // Item 17: the default ceiling is DERIVED from the registry. A hand-written 6 would silently
+  // select a seventh registered recipe out of every broad run, and no test would notice.
+  it("item 17: the default recipe ceiling equals the registered recipe count", () => {
+    assert.equal(DEFAULT_MAX_RECIPES, PLANNER_RECIPE_IDS.length);
+  });
+
+  // Item 14: the tool description must describe the contract the code actually implements.
+  it("item 14: the tool description states the approximate-composite contract", () => {
+    assert.equal(
+      /closest available analyses by name/.test(QUESTION_ANSWER_TOOL.description),
+      false,
+      "the old 'names only' refusal wording no longer describes what the planner does"
+    );
+    assert.match(QUESTION_ANSWER_TOOL.description, /approximat/i);
+  });
+});
+
+describe("item 17: an EXPLICIT broad-diagnostic request runs the whole panel", () => {
+  it("'give me a full diagnostic' selects every registered recipe", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_applications") {
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 10, source_id: 1, referrer_id: 2, status: "active", applied_at: "2026-06-10T00:00:00.000Z", last_activity_at: "2026-06-11T00:00:00.000Z", stage_id: 7, stage_name: "Phone Screen", current_stage_at: "2026-06-10T00:00:00.000Z" },
+        ]);
+      }
+      return scopedSuccess(toolName, []);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: "Give me a full diagnostic." });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.selected_recipe_count, PLANNER_RECIPE_IDS.length);
+    assert.deepStrictEqual([...data.summary.selected_recipes].sort(), [...PLANNER_RECIPE_IDS].sort());
+    assert.equal(data.answer.domain_recognized, true, "an explicit broad request is not an approximation");
   });
 });
 
@@ -160,26 +207,24 @@ describe("recruiting question planner", () => {
     assert.equal(data.denials.length, 0);
   });
 
-  it("returns missing_domain with domain_recognized=false for an unmatched, non-broad question — never a guessed broad composite (regression: silent fallback)", async () => {
-    const scopedReader = fakeScopedReader((toolName) => {
-      if (toolName === "list_jobs") {
-        return scopedSuccess(toolName, []);
-      }
-      throw new Error(`planner must not run a recipe read for an unmatched question (${toolName})`);
-    });
+  // INVERTED by CLO-275. This locked the planner into a dead end for anything outside the keyword
+  // vocabulary — the refusal was the whole answer. The property worth keeping is not the refusal
+  // but the LABEL: the broad panel may run, and it must never be dressed up as a confident answer
+  // to the specific question that was asked.
+  it("CLO-275: an unmatched, non-broad question gets a LABELLED approximation, never a confident composite", async () => {
+    const scopedReader = fakeScopedReader((toolName) => scopedSuccess(toolName, []));
     const { runtime } = testRuntime(scopedReader);
     const result = await runRecruitingQuestionAnswer(runtime, {
       question: "Which candidates are the best cultural fit?",
     });
     assert.equal(result.ok, true);
     const data = result.ok ? result.data as any : null;
-    assert.equal(data.answer.mode, "missing_domain");
+    assert.equal(data.answer.mode, "approximate_composite", "never composite_analysis: nothing matched this question");
     assert.equal(data.answer.domain_recognized, false);
     assert.equal(data.summary.domain_recognized, false);
-    assert.equal(data.summary.completeness_status, "missing_domain");
-    assert.deepStrictEqual(data.summary.selected_recipes, []);
-    assert.deepStrictEqual(data.analyses, []);
-    assert.deepStrictEqual(analysisToolCalls(scopedReader), ["list_jobs"]);
+    assert.deepStrictEqual(data.summary.selected_recipes, BROAD_DIAGNOSTIC_RECIPES);
+    assert.match(data.answer.message, /Treat this as an approximation and rephrase toward one of:/);
+    assert.ok(data.analyses.length > 0, "the panel ran rather than dead-ending");
   });
 
   it("executes job-post exposure via the fact-backed planner (job_post_exposure_by_post), not a broad composite (T3.2)", async () => {
@@ -542,5 +587,496 @@ describe("recruiting question planner", () => {
     assert.equal(scopedReader.calls.length, 0);
     assert.equal(auditSink.events[0]?.tool, "answer_my_recruiting_question");
     assert.equal(auditSink.events[0]?.denialCode, "INVALID_REQUEST");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P3-router: a question's own time window reaches the recipes.
+// "this month" used to be parsed for the planned-domain path only; a recipe question
+// carrying the same phrase silently answered over the recipe's default lookback.
+// ---------------------------------------------------------------------------
+
+const NOW_MS = Date.parse("2026-06-23T12:00:00.000Z");
+
+function windowReader() {
+  return fakeScopedReader((toolName) => {
+    if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+    if (toolName === "list_applications") {
+      return scopedSuccess(toolName, [
+        { id: 100, candidate_id: 1000, job_id: 10, source_id: 1, referrer_id: 2, status: "active", applied_at: "2026-06-10T00:00:00.000Z", last_activity_at: "2026-06-11T00:00:00.000Z", stage_id: 7, stage_name: "Phone Screen", current_stage_at: "2026-06-10T00:00:00.000Z" },
+      ]);
+    }
+    if (toolName === "list_application_stages") {
+      return scopedSuccess(toolName, [
+        { id: 4001, application_id: 100, job_interview_stage_id: 7, entered_at: "2026-06-10T00:00:00.000Z", exited_at: null, days_in_stage: 13, current: true },
+      ]);
+    }
+    if (toolName === "list_sources") return scopedSuccess(toolName, [{ id: 1, name: "LinkedIn", type: { id: 2, name: "Job Board" } }]);
+    if (toolName === "list_referrers") return scopedSuccess(toolName, [{ id: 2, name: "Alice Referrer" }]);
+    throw new Error(`unexpected scoped tool ${toolName}`);
+  });
+}
+
+function offerWindowReader() {
+  return fakeScopedReader((toolName) => {
+    if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+    if (toolName === "list_offers") {
+      return scopedSuccess(toolName, [
+        { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-05-10" },
+        { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-06-02" },
+        { id: 3, job_id: 10, application_id: 103, status: "Accepted", sent_on: "2026-06-10" },
+      ]);
+    }
+    throw new Error(`unexpected scoped tool ${toolName}`);
+  });
+}
+
+describe("recruiting question planner — the question's own time window", () => {
+  it("A12: forwards a phrase window to every selected recipe and discloses it", async () => {
+    const reader = windowReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "How many candidates did we source from LinkedIn this month?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.deepStrictEqual(data.summary.selected_recipes, ["source_quality"]);
+    assert.deepStrictEqual(data.summary.applied_time_window, {
+      label: "this month",
+      window_start: "2026-06-01T00:00:00.000Z",
+      window_end: "2026-06-23T12:00:00.000Z",
+      origin: "question",
+    });
+    assert.equal(data.analyses[0].params.window_start, "2026-06-01T00:00:00.000Z");
+    assert.equal(data.analyses[0].params.window_end, "2026-06-23T12:00:00.000Z");
+  });
+
+  it("A12b: a phrase window runs UNCAPPED — a stated intent is not a fuzzy default", async () => {
+    const reader = windowReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What did our source quality look like over the last 400 days?",
+    });
+
+    // maxLookbackDays (365) exists only to bound the FUZZY default window (limits.ts:475-480).
+    // A window the recruiter stated out loud must not be denied by it.
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.applied_time_window.label, "last 400 days");
+    assert.equal(data.summary.applied_time_window.origin, "question");
+    assert.equal(data.summary.applied_time_window.window_start, new Date(NOW_MS - 400 * 86_400_000).toISOString());
+    assert.equal(data.analyses[0].status, "ok", "an explicitly asked 400-day window must not be denied");
+    assert.deepStrictEqual(data.denials, []);
+    // Item 16: the disclosure is not the delivery. Assert the RECIPE received the 400-day bounds —
+    // a router that discloses a window it never forwards passes the disclosure assertion alone.
+    assert.equal(data.analyses[0].params.window_start, new Date(NOW_MS - 400 * 86_400_000).toISOString());
+    assert.equal(data.analyses[0].params.window_end, new Date(NOW_MS).toISOString());
+  });
+
+  it("A13: ONE explicit bound blocks parsing and is reported one-sided, not completed into an interval", async () => {
+    const reader = windowReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "How is source quality trending last quarter?",
+      window_start: "2026-05-01T00:00:00.000Z",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.deepStrictEqual(data.summary.applied_time_window, {
+      label: null,
+      window_start: "2026-05-01T00:00:00.000Z",
+      window_end: null,
+      origin: "explicit",
+    });
+    assert.equal(data.analyses[0].params.window_start, "2026-05-01T00:00:00.000Z");
+    assert.equal(data.analyses[0].params.window_end, undefined, "the phrase must not fill in the missing bound");
+  });
+
+  it("A14: no phrase and no explicit bound means no window params and no claim of one", async () => {
+    const reader = windowReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "Where are the stage latency bottlenecks?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.applied_time_window, null);
+    assert.equal(data.analyses[0].params.window_start, undefined);
+    assert.equal(data.analyses[0].params.window_end, undefined);
+  });
+
+  it("A14b: the planned-domain path discloses the phrase label, not 'explicit window params'", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") {
+        return scopedSuccess(toolName, [
+          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01" },
+          { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-06-02" },
+        ]);
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is the offer acceptance rate this month?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "planned_metric");
+    assert.deepStrictEqual(data.summary.applied_time_window, {
+      label: "this month",
+      window_start: "2026-06-01T00:00:00.000Z",
+      window_end: "2026-06-23T12:00:00.000Z",
+      origin: "question",
+    });
+    assert.ok((data.answer.omissions as string[]).some((line) => line.includes("this month")));
+    assert.ok(!(data.answer.omissions as string[]).some((line) => line.includes("explicit window params")));
+  });
+
+  // Item 20: the mirror of A14b — an explicit two-sided window on the planned-domain path.
+  it("A14c: the planned-domain path labels an EXPLICIT window as explicit", async () => {
+    const reader = offerWindowReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is the offer acceptance rate?",
+      window_start: "2026-06-01T00:00:00.000Z",
+      window_end: "2026-06-30T00:00:00.000Z",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "planned_metric");
+    assert.equal(data.summary.applied_time_window.origin, "explicit");
+    assert.equal(data.summary.applied_time_window.window_start, "2026-06-01T00:00:00.000Z");
+    assert.equal(data.summary.applied_time_window.window_end, "2026-06-30T00:00:00.000Z");
+    assert.ok((data.answer.omissions as string[]).some((line) => line.includes("explicit window params")));
+  });
+
+  // Items 4 + 6: one-sided explicit bounds. executePlannedDomain required BOTH keys, so
+  // window_start alone + "this month" in the sentence silently became June and dropped the May row.
+  it("item 6: ONE explicit bound on the planned-domain path is honored, and the phrase is not read on top of it", async () => {
+    const reader = offerWindowReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is the offer acceptance rate this month?",
+      window_start: "2026-05-01T00:00:00.000Z",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "planned_metric");
+    assert.equal(data.summary.applied_time_window.origin, "explicit", "an explicit bound is a deliberate instruction");
+    assert.equal(data.summary.applied_time_window.window_end, null, "no second bound is invented");
+    // The MAY offer is inside window_start..(unbounded) and must be counted; under the both-bounds
+    // rule the phrase silently reset the window to June and dropped it.
+    assert.equal(data.summary.rows_considered, 3, "every offer on or after 2026-05-01 is in scope");
+  });
+
+  it("item 6: a NON-STRING explicit bound is not silently replaced by the sentence's window", async () => {
+    const reader = offerWindowReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "How is source quality this month?",
+      window_start: 20260501,
+    });
+
+    // The bad value belongs to the recipe's own validator, not to a silent overwrite by the parser.
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.denial.code, "LIMIT_EXCEEDED");
+    assert.match(result.ok === false ? result.denial.message : "", /valid window_start and window_end/);
+  });
+
+  // Item 5: "last month"/"last quarter" ended at the START of the current period while every
+  // recipe filters inclusively (<= window_end), so a midnight-on-the-first event — and every
+  // date-only stamp, which parses to exactly midnight — landed in the wrong period.
+  it("item 5: 'last month' excludes a date-only event stamped on the first of THIS month", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") {
+        return scopedSuccess(toolName, [
+          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-05-15" },
+          { id: 2, job_id: 10, application_id: 102, status: "Rejected", sent_on: "2026-05-20" },
+          // June 1 is THIS month; an inclusive <= against a window_end of 2026-06-01T00:00 kept it.
+          { id: 3, job_id: 10, application_id: 103, status: "Accepted", sent_on: "2026-06-01" },
+        ]);
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What was the offer acceptance rate last month?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.applied_time_window.label, "last month");
+    assert.equal(data.summary.applied_time_window.window_end, "2026-05-31T23:59:59.999Z");
+    assert.equal(data.summary.rows_considered, 2, "the June 1 offer belongs to THIS month");
+  });
+
+  it("item 5: 'last quarter' ends at the final instant of the prior quarter", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") {
+        return scopedSuccess(toolName, [
+          { id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-02-15" },
+          { id: 2, job_id: 10, application_id: 102, status: "Accepted", sent_on: "2026-04-01" },
+        ]);
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What was the offer acceptance rate last quarter?",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.applied_time_window.window_end, "2026-03-31T23:59:59.999Z");
+    assert.equal(data.summary.rows_considered, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P6 (CLO-275): an unknown question gets a labeled composite instead of a refusal.
+// "No approved recipe matches this question" was a dead end for anything phrased outside
+// the keyword vocabulary. The broad panel already exists; running it and LABELLING the
+// result an approximation beats handing back nothing.
+// ---------------------------------------------------------------------------
+
+const SCOPE_FIXTURE = JSON.parse(
+  readFileSync(resolve("test/fixtures/job-scope-resolution.fixture.json"), "utf8")
+) as JobScopeFixture;
+
+const UNKNOWN_QUESTION = "how is recruiting going for the Brazil team";
+
+function panelReader() {
+  return fakeScopedReader((toolName) => {
+    if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+    if (toolName === "list_applications") {
+      return scopedSuccess(toolName, [
+        { id: 100, candidate_id: 1000, job_id: 10, source_id: 1, referrer_id: 2, status: "active", applied_at: "2026-06-10T00:00:00.000Z", last_activity_at: "2026-06-11T00:00:00.000Z", stage_id: 7, stage_name: "Phone Screen", current_stage_at: "2026-06-10T00:00:00.000Z" },
+      ]);
+    }
+    return scopedSuccess(toolName, []);
+  });
+}
+
+describe("recruiting question planner — unknown questions get a labeled composite (CLO-275)", () => {
+  it("A9: a narrow recruiter's unrecognized question runs the broad panel, labeled as an approximation", async () => {
+    const reader = panelReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: UNKNOWN_QUESTION });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "approximate_composite");
+    assert.equal(data.answer.domain_recognized, false);
+    assert.equal(data.summary.domain_recognized, false);
+    assert.ok(data.analyses.length > 0, "the panel actually ran");
+    const message: string = data.answer.message;
+    // Item 8: the FIRST sentence carries scope and the mismatch together (they used to be two),
+    // and the trailer names what to rephrase toward. The order is the contract.
+    assert.match(message, /^Answered over .+ — no single analysis matched this question, so the broad panel ran instead \(/);
+    assert.match(message, /Treat this as an approximation and rephrase toward one of:/);
+    const firstSentenceEnd = message.indexOf(". ");
+    assert.ok(
+      firstSentenceEnd === -1 || message.slice(0, firstSentenceEnd).includes("broad panel ran instead"),
+      `the mismatch clause must live in the first sentence, got ${JSON.stringify(message)}`
+    );
+  });
+
+  it("A9 (org-wide actor): the admin path reaches the composite too, not resolution_required", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_applications") {
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 9001001, source_id: 1, referrer_id: 2, status: "active", applied_at: "2026-06-10T00:00:00.000Z", last_activity_at: "2026-06-11T00:00:00.000Z", stage_id: 7, stage_name: "Phone Screen", current_stage_at: "2026-06-10T00:00:00.000Z" },
+        ]);
+      }
+      return scopedSuccess(toolName, []);
+    });
+    const { runtime } = testRuntime(reader, {
+      jobInventory: createFixtureInventoryProvider(SCOPE_FIXTURE, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: UNKNOWN_QUESTION });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.scope_resolution_required, undefined);
+    assert.equal(data.answer.mode, "approximate_composite");
+    assert.equal(data.answer.domain_recognized, false);
+    assert.match(data.answer.message, /org-wide/);
+  });
+
+  it("A10: the composite names every runnable recipe by iteration, never a hand-typed list", async () => {
+    const reader = panelReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: UNKNOWN_QUESTION });
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    const nextSteps: string[] = data.next_steps;
+    for (const id of PLANNER_RECIPE_IDS) {
+      assert.ok(nextSteps.some((step) => step.includes(id)), `next_steps must name ${id}`);
+      assert.ok(String(data.answer.message).includes(id), `the message must name ${id}`);
+    }
+  });
+
+  it("A11: a recognized planned domain still routes to planned_metric, never the composite", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") {
+        return scopedSuccess(toolName, [{ id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01" }]);
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+    const result = await runRecruitingQuestionAnswer(runtime, { question: "What is the offer acceptance rate this quarter?" });
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "planned_metric");
+  });
+
+  it("A11b: a deadline that kills the first recipe still returns the labeled composite, marked incomplete", async () => {
+    let now = 0;
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") {
+        now = 60;
+        return scopedSuccess(toolName, []);
+      }
+      throw new Error(`no recipe read should run past the deadline (${toolName})`);
+    });
+    const { runtime } = testRuntime(reader, {
+      limits: { ...DEFAULT_LIMITS, maxToolDurationMs: 50, maxAnalysisDurationMs: 50 },
+      now: () => now,
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: UNKNOWN_QUESTION });
+
+    assert.equal(result.ok, true, "an all-denied panel must not collapse back into a bare refusal");
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "approximate_composite");
+    assert.equal(data.summary.completeness_status, "incomplete");
+    assert.equal(data.denials[0].denial.code, "TOOL_TIMEOUT");
+    assert.equal(data.analyses[0].status, "denied");
+    assert.ok(String(data.answer.message).length > 0);
+  });
+
+  it("A11c: a mixed success/denial panel reports both and stays incomplete", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_scorecards") return scopedDenial(toolName, "ACTOR_DENIED");
+      if (toolName === "list_applications") {
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 10, source_id: 1, referrer_id: 2, status: "active", applied_at: "2026-06-10T00:00:00.000Z", last_activity_at: "2026-06-11T00:00:00.000Z", stage_id: 7, stage_name: "Phone Screen", current_stage_at: "2026-06-10T00:00:00.000Z" },
+        ]);
+      }
+      return scopedSuccess(toolName, []);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: UNKNOWN_QUESTION });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "approximate_composite");
+    assert.ok(data.analyses.some((entry: any) => entry.status === "ok"), "the recipes that could run are reported");
+    assert.ok(data.analyses.some((entry: any) => entry.status === "denied"), "the recipes that could not are reported too");
+    assert.equal(data.summary.completeness_status, "incomplete");
+    // Item 8: an invoked-but-DENIED recipe used to vanish from the message, which read as though
+    // the panel had run clean. Both halves are named.
+    const message = String(data.answer.message);
+    const firstSentence = message.slice(0, message.indexOf(". ") + 1);
+    assert.match(firstSentence, /pipeline_quality/, "a recipe that ran is named");
+    assert.match(firstSentence, /scorecard_accountability/, "a recipe that was invoked and denied is named too");
+    assert.match(firstSentence, /could not run/);
+  });
+
+  it("item 8: a panel cut short by the deadline says how many analyses were never attempted", async () => {
+    let now = 0;
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") {
+        now = 60;
+        return scopedSuccess(toolName, []);
+      }
+      throw new Error(`no recipe read should run past the deadline (${toolName})`);
+    });
+    const { runtime } = testRuntime(reader, {
+      limits: { ...DEFAULT_LIMITS, maxToolDurationMs: 50, maxAnalysisDurationMs: 50 },
+      now: () => now,
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: UNKNOWN_QUESTION });
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.match(
+      String(data.answer.message),
+      new RegExp(`${PLANNER_RECIPE_IDS.length - 1} further analyses were not attempted`),
+      "an answer that names only the one recipe it tried overstates the panel"
+    );
+  });
+
+  // Item 8: the composition contract is not composite-only — every answer that has a message
+  // states the same things in the same order.
+  it("item 8: a MATCHED-recipe answer carries the same scope-first message", async () => {
+    const reader = panelReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: "Where are the stage latency bottlenecks?" });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "single_recipe_analysis");
+    assert.match(String(data.answer.message), /^Answered over .+ — ran stage_latency\./);
+  });
+
+  it("item 8: a PLANNED-domain answer carries one too", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") {
+        return scopedSuccess(toolName, [{ id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01" }]);
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: "What is the offer acceptance rate this month?" });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "planned_metric");
+    assert.match(String(data.answer.message), /^Answered over .+ — computed offer_resolution\./);
+    assert.match(String(data.answer.message), /Time window: this month/);
+  });
+
+  // Item 2: the composite bypassed selectRecipes entirely, so an explicit max_recipes — the one
+  // control a caller has over panel cost — was ignored on exactly the path that runs everything.
+  it("item 2: an explicit max_recipes bounds the approximate composite too", async () => {
+    const reader = panelReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: UNKNOWN_QUESTION, max_recipes: 2 });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "approximate_composite");
+    assert.equal(data.summary.selected_recipe_count, 2);
+    assert.equal(data.summary.selected_recipes.length, 2);
   });
 });

@@ -116,7 +116,10 @@ describe("product eval prompts", () => {
   });
 });
 
-function assertAnswerMetadata(data: any, expectedMetrics: string[], expectedEndpoints: string[], expectedScope = "recruiter_permitted_jobs") {
+// CLO-274: every planner answer now carries a scope header, so requestedScope always reports the
+// job_scope domain — the old "recruiter_permitted_jobs" default meant "no header was attached",
+// which is exactly the silence this lane removed.
+function assertAnswerMetadata(data: any, expectedMetrics: string[], expectedEndpoints: string[], expectedScope = "job_scope") {
   assert.ok(data.summary.plan);
   assert.equal(data.summary.plan.requestedScope.primary_scope_domain, expectedScope);
   assert.equal(data.summary.plan.requiredProjectionProfile, "recruiter_default");

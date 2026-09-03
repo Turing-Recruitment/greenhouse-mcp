@@ -288,6 +288,30 @@ describe("application-backed evidence reads auto-bridge a confirmed scope (L1)",
     assert.equal(result.ok && result.scope?.applied, false);
     assert.ok(result.ok && typeof result.scope?.note === "string" && result.scope.note.includes("scope_handle"));
     assert.equal(reader.calls.filter((call) => call.toolName === "list_applications").length, 0, "an unscoped read issues no bridge");
+    // Item 15 (CLO-274): the permission_scope allowlist entry was unreachable — the unscoped path
+    // carried a note and nothing else, so the evidence envelope never NAMED the set it spanned.
+    // The disclosure now matches the analysis header: the scope is stated, not merely gestured at.
+    assert.equal(result.ok && result.scope?.source, "permission_scope");
+    assert.equal(result.ok && result.scope?.job_count, 2, "the permitted job count the scoped read itself reported");
+    assert.match(String(result.ok ? result.scope?.scope_label : ""), /reqs you can see in Greenhouse/);
+  });
+
+  it("item 15: an ORG-WIDE actor's unscoped evidence read names the org-wide scope and mints no count it does not have", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_application_stages") {
+        return scopedSuccess(toolName, STAGE_UNIVERSE, null, { permissionScope: { kind: "operator", permittedJobCount: null } });
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = scopedRuntime(reader);
+
+    const result = await runEvidenceTool(runtime, "search_my_application_stages", {});
+
+    assert.equal(result.ok, true);
+    assert.equal(result.ok && result.scope?.applied, false);
+    assert.equal(result.ok && result.scope?.source, "permission_scope");
+    assert.match(String(result.ok ? result.scope?.scope_label : ""), /org-wide/);
+    assert.equal(result.ok && result.scope?.job_count, undefined, "an org-wide read has no permitted-job count to state");
   });
 
   it("never widens past the scope: intersects a caller application_ids (incl. an id OUTSIDE the scope) and drops a candidate_ids filter", async () => {

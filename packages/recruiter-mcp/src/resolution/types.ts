@@ -115,9 +115,15 @@ export interface ResolutionMetadata {
 
 export interface AnalysisContextHeader {
   primary_scope_domain: "job_scope";
-  source: "scope_handle" | "exact_ids";
+  // "permission_scope" (CLO-274): the analysis ran over exactly what this actor's Greenhouse
+  // permissions already return — org-wide for a broad-visibility actor, the permitted book for a
+  // narrow recruiter. It is a DISCLOSURE of an unbounded read, not a frozen selection.
+  source: "scope_handle" | "exact_ids" | "permission_scope";
   scope_label: string | null;
-  scope_hash: string;
+  // Only a frozen ("scope_handle") or explicitly named ("exact_ids") job set has a hash to carry.
+  // A permission_scope header deliberately mints none: hashing an unbounded, permission-derived
+  // read would invent an identity for a set that was never pinned.
+  scope_hash?: string;
   job_count: number;
   frozen_job_count?: number;
   resolved_at?: string | null;

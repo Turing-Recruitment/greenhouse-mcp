@@ -133,8 +133,12 @@ describe("job-scope framework adapter", () => {
   });
 
   it("maps confirmation-required and fail-closed error outputs without claiming resolution", () => {
+    // CLO-274: a site admin's UNIQUE high-confidence match now resolves, so the
+    // confirmation-required shape is exercised with a genuinely multi-req query instead — the
+    // mapping under test is "confirmation required is not claimed as resolution", not the policy
+    // that decides when confirmation is required.
     const needsConfirmation = adaptJobScopeResolution(
-      resolveFixture("site_admin", { query: "Senior AI Solutions Engineer" }),
+      resolveFixture("site_admin", { query: "Frontier Data" }),
       { nowMs: NOW }
     );
     assert.equal(needsConfirmation.status, "needs_confirmation");

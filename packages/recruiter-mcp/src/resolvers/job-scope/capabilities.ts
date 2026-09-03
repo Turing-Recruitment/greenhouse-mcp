@@ -432,13 +432,14 @@ export function getRecruitingCapabilities(
       ? { model_visible_tools: [...new Set([...modelVisibleTools, ...grantedNames])].sort() }
       : {}),
     scope_resolution: {
-      required_before_analysis: true,
-      flow: ["resolve_job_scope", "confirm_job_scope (when required)", "scope_handle", "analyze_* / answer_my_recruiting_question"],
+      required_before_analysis: false,
+      flow: ["ask the question", "resolve_job_scope (to narrow, or when several reqs match)", "confirm_job_scope (when required)", "scope_handle", "analyze_*"],
       tools: ["resolve_job_scope", "confirm_job_scope", "get_job_scope"].filter(visible),
       notes: [
-        "Resolve natural-language or requisition references with resolve_job_scope before analysis when job intent is fuzzy.",
-        "Analysis tools accept a scope_handle or exact greenhouse job_ids only; they reject free-text job_query/role/alias inputs.",
-        "answer_my_recruiting_question resolves scope internally and will return a confirmation-required response instead of silently broad-running.",
+        "answer_my_recruiting_question answers without a pre-resolved scope: a req or role the question NAMES becomes the scope, and a question that names none is answered across every job the caller can see, with that scope stated on the answer.",
+        "Resolve first with resolve_job_scope when you want to pin a scope explicitly, reuse one across calls, or the question matched several requisitions.",
+        "Analysis tools accept a scope_handle or exact greenhouse job_ids only; they reject free-text job_query/role/alias inputs. Called with neither, they analyze everything the caller can see and disclose that scope in the response header.",
+        "A scope the question NAMED but that resolved to nothing is never widened: \"my reqs\" with no recruiter/sourcer assignment, or \"all open reqs\" where none are open, answers an explicit empty scope rather than substituting a different population.",
       ],
     },
     user_modes: [
@@ -449,16 +450,19 @@ export function getRecruitingCapabilities(
         guardrails: [
           "Auto-confirms only unique, high-confidence, active-job matches over a complete inventory.",
           "Ambiguous role-family or multi-job matches require confirmation.",
+          "A question that names no req is answered across the recruiter's permitted book, and the answer's scope header names that set.",
+          "A req or requisition id named inside the QUESTION narrows the answer to it when it matches one job at high confidence; a weaker or ambiguous match keeps the permitted-book default rather than asking.",
         ],
       },
       {
         mode: "operator_site_admin",
         description: "Broad-visibility operator/site admin.",
-        auto_confirm_allowed: false,
+        auto_confirm_allowed: true,
         guardrails: [
-          "Fuzzy, multi-job, broad, or all-org scopes always require confirmation.",
-          "Partial/truncated inventory blocks analysis.",
-          "Every answer carries a scope header.",
+          "A question that names no req is answered org-wide by default; every answer's scope header states the scope it ran over and warns that no req was named.",
+          "Naming a req, role, or requisition id narrows the answer to it.",
+          "Confirmation is still required for genuine ambiguity: several requisitions matched at a real band, a collision alias, or one requisition id mapping to two jobs.",
+          "A truncated job index is disclosed on the answer, not treated as a blocker — the analysis reads do not depend on the index.",
         ],
       },
     ],
@@ -478,7 +482,7 @@ export function getRecruitingCapabilities(
     ],
     limitations: [
       "Resolver matching is deterministic lexical/alias matching over a permission-scoped job index; it does not use embeddings in v1.",
-      "Operator inventories can exceed the pagination cap and return inventory_complete=false, which blocks analysis until the scope is narrowed.",
+      "Operator inventories can exceed the pagination cap and return inventory_complete=false. Analysis still runs (the reads do not depend on the index), but a job COUNT in a scope label is then a floor rather than a total, and a named requisition cannot be confirmed against the index.",
       "Scope handles are signed, session-bound, and short-lived; they are not persisted or shareable.",
     ],
   };
