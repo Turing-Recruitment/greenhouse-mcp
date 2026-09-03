@@ -157,6 +157,7 @@ const EVIDENCE_TOOL_ENDPOINT_PAIRS = [
   ["search_my_scorecard_question_candidate_attributes", "/v3/scorecard_question_candidate_attributes"],
   ["search_my_user_emails", "/v3/user_emails"],
   ["search_my_bulk_requests", "/v3/bulk_requests"],
+  ["get_my_bulk_request", "/v3/bulk_requests/{bulk_action_uuid}"],
   ["search_my_blocked_spam_sources", "/v3/blocked_spam_sources"],
   ["search_my_job_board_custom_locations", "/v3/job_board_custom_locations"],
 ] as const;
@@ -472,11 +473,20 @@ export function getHiddenModelParametersForEndpoint(path: string): HiddenModelPa
 
 export function getModelParamNamesForEvidenceTool(toolName: string): ReadonlySet<string> {
   if (toolName.startsWith("get_")) {
-    return new Set(["id"]);
+    // Most single-record reads select by numeric id through the endpoint's `ids` filter. One selects
+    // by a PATH parameter instead (/v3/bulk_requests/{bulk_action_uuid}), and hard-coding "id" for
+    // every get_ tool stripped that parameter before the read and made the tool unusable.
+    const pathParams = getPathParametersForEvidenceTool(toolName);
+    return pathParams.length > 0 ? new Set(pathParams.map((param) => param.name)) : new Set(["id"]);
   }
   const entry = getHarvestEndpointForEvidenceTool(toolName);
   if (!entry) return new Set();
   return new Set(getModelExposedParametersForEndpoint(entry.path).map((param) => param.name));
+}
+
+/** The path parameters (if any) a single-record evidence tool selects its row by. */
+export function getPathParametersForEvidenceTool(toolName: string): ParameterSpec[] {
+  return (getHarvestEndpointForEvidenceTool(toolName)?.parameters ?? []).filter((param) => param.in === "path");
 }
 
 function hiddenModelParameterMap(path: string): Map<string, string> {

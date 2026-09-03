@@ -144,6 +144,7 @@
     "search_my_scorecard_question_candidate_attributes",
     "search_my_job_board_custom_locations",
     "search_my_bulk_requests",
+    "get_my_bulk_request",
     "search_my_blocked_spam_sources",
     "search_my_interviewer_tags",
     "search_my_candidate_tags",

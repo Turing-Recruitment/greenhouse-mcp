@@ -364,7 +364,14 @@ describe("Harvest v3 endpoint registry", () => {
       const schema = schemas.get(toolName);
       assert.ok(schema, `missing registered schema for ${toolName}`);
       if (toolName.startsWith("get_")) {
-        assert.deepStrictEqual(Object.keys(schema), ["id"]);
+        // A single-record read selects by numeric id THROUGH the endpoint's `ids` filter — except
+        // where v3 puts the selector in the path, which is exactly one endpoint
+        // (/v3/bulk_requests/{bulk_action_uuid}). The schema follows the contract's own parameter,
+        // so the tool asks for the value the endpoint actually takes.
+        const pathParams = (getHarvestEndpointForEvidenceTool(toolName)?.parameters ?? [])
+          .filter((parameter) => parameter.in === "path")
+          .map((parameter) => parameter.name);
+        assert.deepStrictEqual(Object.keys(schema), pathParams.length > 0 ? pathParams : ["id"]);
         continue;
       }
       const endpoint = getHarvestEndpointForEvidenceTool(toolName);

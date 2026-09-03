@@ -111,7 +111,7 @@ export async function runEvidenceListRead(
     }
 
     const { translated, windowSpecs } = translateRangeParams(params, allowedParamNames);
-    const safeParams = sanitizeReadParams(translated, runtime.limits, { allowedParamNames });
+    const safeParams = sanitizeReadParams(translated, runtime.limits, { allowedParamNames, endpointPath: adapter.endpointPath });
     let windowAppliedLocally: { fields: string[]; rows_missing_field: number; note: string } | undefined;
 
     let rows: RowsResult;

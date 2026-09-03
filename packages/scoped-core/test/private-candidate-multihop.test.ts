@@ -886,6 +886,9 @@ describe("the privacy tool sets are checked against the registry's endpoints, no
       "/future_job_permissions",
       "/user_emails",
       "/bulk_requests",
+      // R2e fold. The single bulk request, read by uuid: the same org-diagnostic row as the list,
+      // plus signed result-file URLs the projection drops. No applicant appears on it.
+      "/bulk_requests/{bulk_action_uuid}",
       "/blocked_spam_sources",
       "/job_board_custom_locations",
     ]);

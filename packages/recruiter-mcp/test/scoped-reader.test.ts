@@ -316,7 +316,7 @@ describe("production scoped reader configuration", () => {
             { id: 1, jobs: [{ id: 111 }], candidate_id: 501 },
             { id: 2, jobs: [{ id: 222 }], candidate_id: 502 },
           ]);
-          assert.deepEqual(result.permissionScope, { kind: "all", permittedJobCount: null });
+          assert.deepEqual(result.permissionScope, { kind: "all", permittedJobCount: null, siteAdmin: true });
           assert.equal(result.scoped, false);
         } else {
           assert.deepEqual(result.data, [{ id: 1, jobs: [{ id: 111 }], candidate_id: 501 }],
@@ -325,6 +325,9 @@ describe("production scoped reader configuration", () => {
             kind: "all",
             permittedJobCount: null,
             privateCandidatesWithheld: true,
+            // Unattested for private candidates and STILL a proven site admin: the two are separate
+            // permissions, and the projection's admin view keys off this flag rather than the kind.
+            siteAdmin: true,
           });
           assert.equal(result.scoped, true);
           assert.equal(result.rowCounts.privacyWithheld, 1);

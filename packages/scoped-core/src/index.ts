@@ -100,6 +100,23 @@ export type PermissionScope =
        * external constraint behind it.
        */
       privateCapableJobIds?: ReadonlySet<number>;
+      /**
+       * PROOF that this org-wide scope came from a Greenhouse site-admin role, rather than from an
+       * all-jobs grant an ordinary job admin can hold.
+       *
+       * `kind: "all"` answers two different questions with one word. The site-admin wrapper
+       * (`recruiter-mcp/src/site-admin-permission.ts`) returns it after reading `/v3/users.site_admin`
+       * — a proven role. The base provider returns the SAME shape for a NON-site-admin who holds an
+       * all-jobs marker on `/v3/user_job_permissions` (`rowGrantsAllJobAccess` below) — a job-access
+       * grant that says nothing about administering the staff directory. Anything downstream that
+       * keys a ROLE decision off `kind` therefore hands the second actor the first actor's view.
+       *
+       * So the role signal is carried explicitly and stamped in exactly one place. Only `=== true`
+       * counts; absent means "not established", which is the fail-closed direction — an actor whose
+       * site-admin status nobody proved reads every row their jobs give them and none of the rows
+       * Greenhouse restricts to site admins.
+       */
+      siteAdmin?: boolean;
     }
   | {
       kind: "jobs";
@@ -120,7 +137,7 @@ export type PermissionLookupResult = ReadonlySet<number> | PermissionScope;
 
 export type AppliedPermissionScope =
   | { kind: "operator"; permittedJobCount: null; privateCandidatesWithheld?: true }
-  | { kind: "all"; permittedJobCount: null; privateCandidatesWithheld?: true }
+  | { kind: "all"; permittedJobCount: null; privateCandidatesWithheld?: true; siteAdmin?: true }
   | { kind: "jobs"; permittedJobCount: number };
 
 /**
@@ -803,7 +820,7 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
         return deny(toolName, "TOOL_NOT_AVAILABLE", actorId, actAsUserId);
       }
 
-      const safeParams = sanitizeReadParams(params);
+      const safeParams = sanitizeReadParams(params, registration.endpoint);
 
       if (isOperator && actAsUserId === undefined) {
         options.onPermissionScopeResolved?.({ kind: "operator" });
@@ -905,7 +922,11 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
           actorId,
           effectiveActorId,
           scoped: false,
-          permissionScope: { kind: "all", permittedJobCount: null },
+          permissionScope: {
+            kind: "all",
+            permittedJobCount: null,
+            ...(permissionScope.siteAdmin === true ? { siteAdmin: true as const } : {}),
+          },
           rowCounts,
           data: response.data,
           nextCursor: response.nextCursor,
@@ -955,7 +976,12 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
           effectiveActorId,
           response,
           scoped: true,
-          appliedScope: { kind: "all", permittedJobCount: null, privateCandidatesWithheld: true },
+          appliedScope: {
+            kind: "all",
+            permittedJobCount: null,
+            privateCandidatesWithheld: true,
+            ...(permissionScope.siteAdmin === true ? { siteAdmin: true as const } : {}),
+          },
           context: privacyOnlyContext(
             config,
             applicationTerminal,
@@ -1062,6 +1088,7 @@ export function createScopedGreenhouseReader<SessionIdentity = unknown>(
               kind: "all",
               permittedJobCount: null,
               ...(allAccessAttested ? {} : { privateCandidatesWithheld: true as const }),
+              ...(permissionScope.siteAdmin === true ? { siteAdmin: true as const } : {}),
             }
           : { kind: "jobs", permittedJobCount: permissionScope.jobIds.size },
         rowCounts,
@@ -2548,6 +2575,11 @@ export const DEFAULT_FILTER_REGISTRY: ReadonlyMap<string, ToolRegistration> =
     ["list_future_job_permissions", globalReferenceListTool("/future_job_permissions")],
     ["list_user_emails", globalReferenceListTool("/user_emails")],
     ["list_bulk_requests", globalReferenceListTool("/bulk_requests")],
+    // R2e. The single bulk request, fetched by its uuid. Same rows as the list read filtered by
+    // bulk_action_uuid, plus the signed result files' URLs — which the projection drops, exactly as
+    // it drops a signed attachment URL. Bound because "did the bulk update I ran an hour ago
+    // finish, and what failed" is a question with a uuid in hand and no list filter needed.
+    ["get_bulk_request", pathParamGetTool("/bulk_requests", "bulk_action_uuid")],
     ["list_blocked_spam_sources", globalReferenceListTool("/blocked_spam_sources")],
     ["list_job_board_custom_locations", globalReferenceListTool("/job_board_custom_locations")],
     ["list_pay_input_ranges", policyListTool("/pay_input_ranges")],
@@ -2598,10 +2630,34 @@ function permissionLookupFailureMessage(error: unknown): string {
   return "Scoped Greenhouse read denied: permissions could not be resolved for this actor.";
 }
 
-function sanitizeReadParams(params: Record<string, unknown>): Record<string, unknown> {
+/**
+ * Endpoint query filters that COLLIDE with an actor-identity parameter name.
+ *
+ * The identity guard below drops `email` (and the other actor-naming keys) unconditionally, because
+ * on every other endpoint such a param is an attempt to say WHO the read runs as — and the actor is
+ * resolved from the session, never from params. On these two endpoints `email` is not that: it is
+ * the endpoint's own documented filter over its own rows (`/v3/user_emails` filters the staff
+ * directory it returns; `/v3/candidates` filters candidates by their address, which is how
+ * "where is jane@example.com in process" is answered). Dropping it there silently returned the whole
+ * directory to an admin who asked for one colleague, and silently ignored the filter the
+ * `search_my_candidates` description tells the model to use.
+ *
+ * Exact endpoint+param pairs only, so a new endpoint cannot inherit the exemption, and the actor
+ * cannot be re-named through it: nothing here decides WHOSE permissions the read runs under.
+ */
+const ENDPOINT_QUERY_FILTER_PARAMS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["/user_emails", new Set(["email"])],
+  ["/candidates", new Set(["email"])],
+]);
+
+function isEndpointQueryFilterParam(endpoint: string | undefined, key: string): boolean {
+  return endpoint !== undefined && (ENDPOINT_QUERY_FILTER_PARAMS.get(endpoint)?.has(key) ?? false);
+}
+
+function sanitizeReadParams(params: Record<string, unknown>, endpoint?: string): Record<string, unknown> {
   const safe: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(params)) {
-    if (isIdentityParamName(key)) continue;
+    if (isIdentityParamName(key) && !isEndpointQueryFilterParam(endpoint, key)) continue;
     // Drop a model/caller-supplied `fields` selector at the reader boundary. Several row filters scope
     // through a structural FK on the row (an attachment's application_id, a note's visibility, an
     // application's job_id); a `fields` projection that omitted that FK would blind the filter and could
@@ -2921,6 +2977,46 @@ function globalReferenceListTool(path: string): ToolRegistration {
       };
     },
     endpoint: path,
+  };
+}
+
+/**
+ * A single-record read whose id lives in the PATH rather than in an `ids` filter.
+ *
+ * `/v3/bulk_requests/{bulk_action_uuid}` is the only such endpoint bound today. The id is validated
+ * against a strict character class before it is interpolated — a path segment assembled from caller
+ * input is exactly where a `..%2f` would reach another resource — and the read carries no query
+ * params at all, so nothing else can ride along.
+ */
+function pathParamGetTool(basePath: string, paramName: string): ToolRegistration {
+  const endpoint = `${basePath}/{${paramName}}`;
+  return {
+    async execute(rawReader, params, signal) {
+      const raw = params[paramName];
+      const id = typeof raw === "string" ? raw.trim() : "";
+      if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(id)) {
+        throw new Error(`Scoped Greenhouse read requires a valid ${paramName} for ${endpoint}.`);
+      }
+      const response = await rawReader.read<unknown>(`${basePath}/${id}`, {}, undefined, signal);
+      return {
+        ...response,
+        data: isRecord(response.data) ? response.data : null,
+        nextCursor: null,
+      };
+    },
+    async filter(response) {
+      const data = isRecord(response.data) ? response.data : null;
+      return {
+        response: { ...response, data },
+        outcomes: {
+          permitted: data ? 1 : 0,
+          notPermitted: 0,
+          missingParent: 0,
+          parentReadFailed: 0,
+        },
+      };
+    },
+    endpoint,
   };
 }
 
@@ -3409,6 +3505,9 @@ function clonePermissionScope(scope: PermissionScope): PermissionScope {
     return {
       kind: "all",
       ...(scope.excludedJobIds ? { excludedJobIds: new Set(scope.excludedJobIds) } : {}),
+      // The proven-site-admin signal is a field the reader never sees unless it is named here.
+      // Dropping it would silently demote every site admin to the non-admin projection.
+      ...(scope.siteAdmin === true ? { siteAdmin: true } : {}),
       ...(scope.privateCandidatesAttested === undefined
         ? {}
         : { privateCandidatesAttested: scope.privateCandidatesAttested }),
@@ -3443,6 +3542,11 @@ function isPermissionScope(value: unknown): value is PermissionScope {
     // `privateCandidatesAttested: "true"` (a string out of a JSON config) must not be read as
     // attested, and `=== true` is the only thing the gate accepts anywhere.
     if (value.privateCandidatesAttested !== undefined && typeof value.privateCandidatesAttested !== "boolean") {
+      return false;
+    }
+    // Same rule for the site-admin proof: a provider answering `siteAdmin: "true"` out of a JSON
+    // config must not be read as a site admin.
+    if (value.siteAdmin !== undefined && typeof value.siteAdmin !== "boolean") {
       return false;
     }
     return value.privateCapableJobIds === undefined || isSetLike(value.privateCapableJobIds);

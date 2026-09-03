@@ -47,6 +47,31 @@ export interface RecruiterToolConfig {
 
 export interface SanitizeReadParamsOptions {
   allowedParamNames?: ReadonlySet<string>;
+  /**
+   * The Harvest endpoint this read targets, so a documented query filter whose NAME collides with an
+   * actor-identity parameter is kept instead of dropped (see ENDPOINT_QUERY_FILTER_PARAMS).
+   */
+  endpointPath?: string;
+}
+
+/**
+ * Documented endpoint filters that share a name with an actor-identity parameter.
+ *
+ * `isIdentityParamName` drops `email` everywhere, because naming the actor in params is how a caller
+ * would try to read as someone else — and the actor comes from the session, never from params. On
+ * these two endpoints `email` is the endpoint's own filter over its own rows, and dropping it made
+ * two tools lie: `search_my_user_emails` returned the whole staff directory to an admin who asked
+ * for one colleague, and `search_my_candidates` — whose description says "Filter by email to find a
+ * specific person" — ignored the filter entirely. Mirrors the same exact-pair exemption at the
+ * scoped-reader boundary, which is the security boundary and enforces it independently.
+ */
+const ENDPOINT_QUERY_FILTER_PARAMS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["/v3/user_emails", new Set(["email"])],
+  ["/v3/candidates", new Set(["email"])],
+]);
+
+export function isEndpointQueryFilterParam(endpointPath: string | undefined, key: string): boolean {
+  return endpointPath !== undefined && (ENDPOINT_QUERY_FILTER_PARAMS.get(endpointPath)?.has(key) ?? false);
 }
 
 export interface AnalysisWindow {
@@ -354,7 +379,7 @@ export function sanitizeReadParams(
   const safe: Record<string, string | number | boolean | undefined> = {};
   const allowedParamNames = options.allowedParamNames;
   for (const [key, value] of Object.entries(params)) {
-    if (isIdentityParamName(key)) {
+    if (isIdentityParamName(key) && !isEndpointQueryFilterParam(options.endpointPath, key)) {
       continue;
     }
     // v3 range filters arrive as bracket params (resolved_at[gte]=...) after translation; a

@@ -79,6 +79,7 @@ describe("recruiter MCP server contract", () => {
       "search_my_scorecard_question_candidate_attributes",
       "search_my_user_emails",
       "search_my_bulk_requests",
+      "get_my_bulk_request",
       "search_my_blocked_spam_sources",
       "search_my_job_board_custom_locations",
       "search_my_email_templates",

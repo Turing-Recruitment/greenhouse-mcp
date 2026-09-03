@@ -6,6 +6,7 @@ import {
   getHarvestEndpointForEvidenceTool,
   getModelExposedParametersForEndpoint,
   getModelParamNamesForEvidenceTool,
+  getPathParametersForEvidenceTool,
   type HarvestScopeClass,
   type ParameterSpec,
 } from "../harvest-v3-registry.js";
@@ -26,6 +27,18 @@ const EVIDENCE_TOOL_PARAM_NAMES = new Map<string, ReadonlySet<string>>(
 
 export function evidenceToolParamsSchema(toolName: string): Record<string, z.ZodTypeAny> {
   if (toolName.startsWith("get_")) {
+    const pathParams = getPathParametersForEvidenceTool(toolName);
+    if (pathParams.length > 0) {
+      // One endpoint selects its row by a path segment rather than a numeric id
+      // (/v3/bulk_requests/{bulk_action_uuid}). Advertising `id: number` for it would have asked the
+      // model for a value the endpoint has no use for.
+      return Object.fromEntries(
+        pathParams.map((param) => [
+          param.name,
+          z.string().min(1).describe(describeParameter(param)),
+        ])
+      );
+    }
     return {
       id: z.number().int().positive().describe("Greenhouse record id."),
     };
@@ -131,6 +144,7 @@ export const EVIDENCE_TOOL_DEFINITIONS: RecruiterToolDefinition[] = [
   { name: "search_my_scorecard_question_candidate_attributes", kind: "evidence", description: "Search which rubric question maps to which focused attribute (scorecard_question_id, focus_candidate_attribute_id). Domain class: join_backed; bounded through the rubric question and its interview kit to a permitted job. The link between a scorecard question and the trait it scores." },
   { name: "search_my_user_emails", kind: "evidence", description: "Search the staff email directory (user_id, email, verified). Domain class: sensitive_personal; returned to site admins and allowlisted operators only, who administer the directory — a job-scoped recruiter gets an empty result. Use search_my_users for a colleague's name and id." },
   { name: "search_my_bulk_requests", kind: "evidence", description: "Search the org's bulk API requests and their outcomes (bulk_action_uuid, api_endpoint, status, record_count, success_count, failure_count, requested_by_user_id, timestamps). Domain class: global_reference; not job-filtered and it carries no candidate data. Whether a bulk job ran, when, and how much of it failed. Signed result-file URLs are not exposed." },
+  { name: "get_my_bulk_request", kind: "evidence", description: "Get one bulk API request by its bulk_action_uuid, with the same outcome counts search_my_bulk_requests returns. Domain class: admin_reference; not job-filtered and it carries no candidate data. Use it when you already hold the uuid of a bulk update and want its status. The signed result-file URLs are not exposed — download them from Greenhouse." },
   { name: "search_my_blocked_spam_sources", kind: "evidence", description: "Search the org's blocked spam sources (source_type, value, note). Domain class: global_reference; not job-filtered. The IPs, CIDR blocks, email addresses and domains the org blocks from applying — spammers, not colleagues or candidates. Explains an application that never arrived." },
   { name: "search_my_job_board_custom_locations", kind: "evidence", description: "Search the custom location labels a job board offers (greenhouse_job_board_id, value, active). Domain class: global_reference; the row carries no job_id and is board configuration, not a requisition row. Pair with search_my_job_boards." },
   { name: "search_my_email_templates", kind: "evidence", description: "Search the org's email templates (id, name, subject, body, email_type, from_type, user_id). Domain class: global_reference; not job-filtered. The company copy a rejection, an availability request or a scorecard reminder sends, and the template id such a send needs. Colleague addresses in `recipients` are returned to site admins and operators only." },

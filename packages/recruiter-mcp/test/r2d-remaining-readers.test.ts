@@ -30,6 +30,9 @@ const BOUND = [
   ["search_my_scorecard_question_candidate_attributes", "/v3/scorecard_question_candidate_attributes", "list_scorecard_question_candidate_attributes"],
   ["search_my_user_emails", "/v3/user_emails", "list_user_emails"],
   ["search_my_bulk_requests", "/v3/bulk_requests", "list_bulk_requests"],
+  // R2e fold (Codex attack #8): the single read was deferred as "redundant", but it adds two signed
+  // result-file URLs no guard caught. It is bound, with those URLs dropped like any signed URL.
+  ["get_my_bulk_request", "/v3/bulk_requests/{bulk_action_uuid}", "get_bulk_request"],
   ["search_my_blocked_spam_sources", "/v3/blocked_spam_sources", "list_blocked_spam_sources"],
   ["search_my_job_board_custom_locations", "/v3/job_board_custom_locations", "list_job_board_custom_locations"],
 ] as const;
@@ -61,10 +64,6 @@ describe("R2d the remaining endpoints are bound, or the deferral is cited", () =
       "/v3/demographic_question_sets",
       "/v3/demographic_questions",
       "/v3/eeoc",
-      // Redundant, not withheld: the single-record read returns the same row the list returns
-      // filtered by bulk_action_uuid, plus four expiring signed result URLs the projection would
-      // drop anyway (the same rule that keeps signed attachment URLs out of listings).
-      "/v3/bulk_requests/{bulk_action_uuid}",
       // Redundant: /v3/rejection_reasons already returns every row this fetches by id.
       "/v3/rejection_reasons/{id}",
     ].sort());

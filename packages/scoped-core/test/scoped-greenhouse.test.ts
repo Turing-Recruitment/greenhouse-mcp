@@ -1471,6 +1471,75 @@ describe("scoped Greenhouse read wrapper", () => {
     });
   });
 
+  it("refuses a path-parameter single read whose id is not a plain uuid-shaped token", async () => {
+    // The one bound endpoint that selects by a PATH segment (/v3/bulk_requests/{bulk_action_uuid})
+    // interpolates caller input into the URL, which is exactly where a traversal would reach another
+    // resource. The read must never be attempted for anything but the documented token shape.
+    for (const uuid of ["../applications", "abc/../../users", "", "abc def", "a".repeat(65)]) {
+      const raw = rawReader(() => []);
+      const scoped = createScopedGreenhouseReader({
+        actorResolver: actorResolver(),
+        permissionProvider: permissionProvider(new Map([[100, [1]]])),
+        rawReader: raw,
+      });
+      await assert.rejects(
+        scoped.scopedRead(100, "get_bulk_request", { bulk_action_uuid: uuid }),
+        /valid bulk_action_uuid/,
+        `${JSON.stringify(uuid)} must not reach the raw reader`
+      );
+      assert.equal(raw.calls.length, 0);
+    }
+
+    const raw = rawReader(() => ({ id: 5, bulk_action_uuid: "abc-123" }));
+    const scoped = createScopedGreenhouseReader({
+      actorResolver: actorResolver(),
+      permissionProvider: permissionProvider(new Map([[100, [1]]])),
+      rawReader: raw,
+    });
+    const result = await scoped.scopedRead(100, "get_bulk_request", { bulk_action_uuid: "abc-123" });
+    assert.equal(result.ok, true);
+    assert.equal(raw.calls[0]?.path, "/bulk_requests/abc-123");
+    assert.deepStrictEqual(raw.calls[0]?.params, {});
+  });
+
+  it("keeps an endpoint's OWN email filter while still dropping the actor-naming ones", async () => {
+    // `email` is an actor-identity name on every endpoint but two, where it is the endpoint's own
+    // documented filter over its own rows. Dropping it there returned the whole staff directory to
+    // an admin who asked for one colleague, and ignored the candidate filter the recruiter surface
+    // tells the model to use — while the identity params that COULD re-name the actor still go.
+    for (const [toolName, path] of [
+      ["list_user_emails", "/user_emails"],
+      ["list_candidates", "/candidates"],
+    ] as const) {
+      const raw = rawReader(() => []);
+      const scoped = createScopedGreenhouseReader({
+        actorResolver: actorResolver(),
+        permissionProvider: permissionProvider(new Map([[100, [1]]])),
+        rawReader: raw,
+      });
+
+      await scoped.scopedRead(100, toolName, { email: "colleague@turing.com", actor_id: 900, user_id: 901 });
+
+      assert.equal(raw.calls[0]?.path, path);
+      assert.equal(raw.calls[0]?.params?.email, "colleague@turing.com", `${toolName} must forward its own filter`);
+      assert.equal(raw.calls[0]?.params?.actor_id, undefined);
+      assert.equal(raw.calls[0]?.params?.user_id, undefined);
+    }
+  });
+
+  it("still drops `email` on an endpoint that documents no such filter", async () => {
+    const raw = rawReader(() => [{ id: 10, job_id: 1 }]);
+    const scoped = createScopedGreenhouseReader({
+      actorResolver: actorResolver(),
+      permissionProvider: permissionProvider(new Map([[100, [1]]])),
+      rawReader: raw,
+    });
+
+    await scoped.scopedRead(100, "list_applications", { email: "someone.else@turing.com", status: "active" });
+
+    assert.deepStrictEqual(raw.calls[0]?.params, { status: "active" });
+  });
+
   it("denies application-backed reads when a permission parent lookup fails", async () => {
     const raw = rawReader((path, params) => {
       if (path === "/scorecards") {

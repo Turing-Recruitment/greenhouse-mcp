@@ -192,6 +192,20 @@ export interface RecruiterProjectionMetadata {
   omittedFields: RecruiterProjectionOmittedField[];
   requiredFieldOmissions: RecruiterProjectionRequiredFieldOmission[];
   incompleteProjection: boolean;
+  /**
+   * The read is gated on the caller's ROLE, not on their requisitions, and this caller does not hold
+   * it — so no row of this endpoint is returned to them and every count in the envelope is zero.
+   *
+   * Stated on EVERY call to a role-gated tool by a caller outside the role, never only when rows
+   * existed: a disclosure that appeared exactly when there was something to withhold would itself
+   * answer the question the gate exists to refuse ("does a record for this colleague exist").
+   */
+  roleGatedRowsWithheld?: RecruiterProjectionRoleGate;
+}
+
+export interface RecruiterProjectionRoleGate {
+  reason: "privacy";
+  note: string;
 }
 
 export interface RecruiterToolDefinition {
