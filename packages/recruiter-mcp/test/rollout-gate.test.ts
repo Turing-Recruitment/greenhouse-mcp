@@ -13,6 +13,7 @@ import { RECRUITER_MCP_READINESS_CHECK_NAMES } from "../src/readiness.js";
 import { PILOT_TOOL_NAMES } from "../src/tools/register.js";
 import { buildClaudeMcpb } from "../src/claude-mcpb.js";
 import { DESKTOP_ROUTING_CASES, DESKTOP_USER_TEST_EVIDENCE_WARNING, MIN_ROUTING_RUNS, ROUTING_TEST_VERSION } from "../src/desktop-user-test.js";
+import { ACTION_DEFINITIONS } from "../../action-mcp/dist/index.js";
 
 type DesktopSurface = "chatgpt_desktop" | "claude_desktop";
 type RecruiterClient = "claude_desktop_chat" | "claude_code" | "chatgpt_codex_host";
@@ -1324,6 +1325,66 @@ describe("rollout evidence gate", () => {
     const check = report.checks.find((entry) => entry.name === "distribution_chatgpt_codex_host_exact_catalog");
     assert.equal(check?.status, "fail");
     assert.deepEqual(check?.details?.unexpected, ["search_my_interview_questions"]);
+  });
+
+  it("accepts a WRITE-ENTITLED distribution catalog, which the validator has always accepted", async () => {
+    // CLO-83's dual catalog: an entitled session sees the read catalog plus every preview/apply pair,
+    // appended. The validator accepted that; this gate filtered every name against the READ catalog
+    // and called all 22 action tools unexpected — so a correct write-entitled deployment passed
+    // validation and then failed its own release gate. One shared classifier now decides.
+    const dir = await mkdtemp(join(tmpdir(), "greenhouse-rollout-gate-entitled-"));
+    await writeCompleteEvidence(dir);
+    const actionTools = ACTION_DEFINITIONS.flatMap((definition) => [definition.previewTool, definition.applyTool]);
+    for (const [file, client] of [
+      ["distribution-chatgpt.json", "chatgpt_codex_host"],
+      ["distribution-claude.json", "claude_desktop_chat"],
+      ["distribution-claude-code.json", "claude_code"],
+    ] as const) {
+      const base = distributionReport(client);
+      await writeJson(join(dir, file), { ...base, toolNames: [...base.toolNames, ...actionTools] });
+    }
+
+    const report = await runRolloutGate({ manifestPath: join(dir, "manifest.json") });
+    const check = report.checks.find((entry) => entry.name === "distribution_chatgpt_codex_host_exact_catalog");
+
+    assert.equal(check?.status, "pass", JSON.stringify(check?.details));
+    assert.equal(check?.details?.catalog, "write_entitled");
+    assert.equal(check?.details?.expectedCount, RECRUITER_TOOL_NAMES.length + actionTools.length);
+  });
+
+  it("accepts a catalog missing a reader the report DECLARES was denylisted, and no other", async () => {
+    // "Hide by denylist only, with a cited reason" is the documented escape hatch; the gate used to
+    // reject the result of using it. A declaration is required — an undeclared missing tool still fails.
+    const dir = await mkdtemp(join(tmpdir(), "greenhouse-rollout-gate-denylist-"));
+    await writeCompleteEvidence(dir);
+    for (const [file, client] of [
+      ["distribution-chatgpt.json", "chatgpt_codex_host"],
+      ["distribution-claude.json", "claude_desktop_chat"],
+      ["distribution-claude-code.json", "claude_code"],
+    ] as const) {
+      const base = distributionReport(client);
+      await writeJson(join(dir, file), {
+        ...base,
+        toolNames: base.toolNames.filter((name: string) => name !== "search_my_job_boards"),
+        disabledTools: ["search_my_job_boards"],
+      });
+    }
+
+    const report = await runRolloutGate({ manifestPath: join(dir, "manifest.json") });
+    const check = report.checks.find((entry) => entry.name === "distribution_chatgpt_codex_host_exact_catalog");
+    assert.equal(check?.status, "pass", JSON.stringify(check?.details));
+
+    const undeclaredDir = await mkdtemp(join(tmpdir(), "greenhouse-rollout-gate-undeclared-"));
+    await writeCompleteEvidence(undeclaredDir);
+    const base = distributionReport("chatgpt_codex_host");
+    await writeJson(join(undeclaredDir, "distribution-chatgpt.json"), {
+      ...base,
+      toolNames: base.toolNames.filter((name: string) => name !== "search_my_job_boards"),
+    });
+    const undeclared = await runRolloutGate({ manifestPath: join(undeclaredDir, "manifest.json") });
+    const undeclaredCheck = undeclared.checks.find((entry) => entry.name === "distribution_chatgpt_codex_host_exact_catalog");
+    assert.equal(undeclaredCheck?.status, "fail");
+    assert.deepEqual(undeclaredCheck?.details?.missing, ["search_my_job_boards"]);
   });
 
   it("re-derives a duplicate-free remote catalog instead of trusting passing labels", async () => {

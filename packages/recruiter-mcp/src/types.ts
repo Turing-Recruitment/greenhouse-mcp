@@ -106,6 +106,14 @@ export interface EvidenceReadEnvelope {
    * short answer as a complete one.
    */
   privacy_withheld?: number;
+  /**
+   * Date fields the caller bounded EXCLUSIVELY (`{gt}` / `{lt}`) and this read applied inclusively.
+   *
+   * The tool advertises one cheap string per date filter, so the exclusive form has nowhere to go;
+   * the bound is widened by one instant rather than rejected, and named here so an answer built on
+   * it is not quietly one row wider than the question. Absent when nothing was widened.
+   */
+  bounds_treated_inclusive?: string[];
   unresolved_scope_rows: number;
   pages_read: number;
   per_page: number;

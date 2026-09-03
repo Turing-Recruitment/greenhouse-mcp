@@ -19,6 +19,7 @@
  */
 
 import { PIPELINE_QUALITY_CLOCK, SCORECARD_WINDOW_CLOCK } from "../../tools/analysis-window-copy.js";
+import { RECRUITER_READ_TOOL_ORDER, recruiterReadToolKind } from "../../tools/catalog-order.js";
 
 export interface RecruitingCapabilityRecipe {
   id: string;
@@ -414,6 +415,31 @@ const RECIPES: RecruitingCapabilityRecipe[] = [
  * no-argument call (and any caller that predates the write plane) still reports a read-only surface —
  * this never fails open into claiming a write capability the session does not hold.
  */
+/**
+ * The record surfaces this session can browse, with a purpose derived from the tool's own name.
+ *
+ * Derived, not curated: a curated list is exactly what went stale. The wording keeps the original
+ * caveat — browsing is not an authoritative analysis precursor — on the tools it was written for.
+ */
+function browsingTools(modelVisibleTools?: ReadonlySet<string>): Array<{ tool: string; purpose: string }> {
+  const mounted = modelVisibleTools
+    ? RECRUITER_READ_TOOL_ORDER.filter((name) => modelVisibleTools.has(name))
+    : [...RECRUITER_READ_TOOL_ORDER];
+  return mounted
+    .filter((name) => recruiterReadToolKind(name) === "evidence")
+    .map((tool) => ({ tool, purpose: browsingPurpose(tool) }));
+}
+
+function browsingPurpose(tool: string): string {
+  if (tool === "read_my_resume") {
+    return "Read the text of one explicitly selected attachment. Sensitive, untrusted candidate evidence.";
+  }
+  const subject = tool.replace(/^(search|get)_my_/, "").replace(/_/g, " ");
+  return tool.startsWith("get_")
+    ? `Inspect one ${subject} record you can see.`
+    : `Browse ${subject} within your permitted scope. Not an authoritative analysis precursor.`;
+}
+
 export function getRecruitingCapabilities(
   modelVisibleTools?: ReadonlySet<string>,
   grantedActionTools: ReadonlySet<string> = new Set()
@@ -467,10 +493,11 @@ export function getRecruitingCapabilities(
       },
     ],
     recipes,
-    browsing_tools: [
-      { tool: "search_my_jobs", purpose: "Browse/debug visible jobs. Not an authoritative analysis precursor." },
-      { tool: "get_my_job", purpose: "Inspect one visible job." },
-    ].filter((entry) => visible(entry.tool)),
+    // Every evidence reader THIS session mounted, derived from the catalog rather than named here.
+    // The hard-coded pair this replaces was written when the catalog was 44 tools and two of them
+    // were readers a model would browse with; it stayed at two while the catalog reached 80-odd, so
+    // the document told the model it held two record surfaces and named none of the others.
+    browsing_tools: browsingTools(modelVisibleTools),
     excluded: [
       grantedNames.length === 0
         ? "No write/admin tools (no reject, move-stage, offer, assignment, or patch operations)."

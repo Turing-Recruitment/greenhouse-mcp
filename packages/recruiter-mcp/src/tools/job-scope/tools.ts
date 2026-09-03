@@ -1,7 +1,7 @@
 import { ACTION_DEFINITIONS } from "../../../../action-mcp/dist/index.js";
 import { newCorrelationId } from "../../audit.js";
 import { isActionToolGranted, isToolEnabled, readPositiveInt } from "../../limits.js";
-import { RECRUITER_READ_TOOL_ORDER } from "../catalog-order.js";
+import { RECRUITER_READ_TOOL_ORDER, recruiterReadToolKind } from "../catalog-order.js";
 import {
   createToolDeadline,
   deny,
@@ -446,7 +446,14 @@ export async function runGetRecruitingCapabilities(
  * being enabled, so a session that reaches this line has the analysis surface on.
  */
 function activeAllowlistedTools(runtime: RecruiterToolRuntime): Set<string> | undefined {
-  return new Set(RECRUITER_READ_TOOL_ORDER.filter((name) => !runtime.toolConfig.disabledTools.has(name)));
+  // The registrar's OWN predicate, not a subset of it. Filtering on `disabledTools` alone announced
+  // every evidence reader as available on a runtime where the evidence kill switch had removed all
+  // of them (GREENHOUSE_RECRUITER_DISABLE_EVIDENCE), and did the same for a disabled surface.
+  return new Set(
+    RECRUITER_READ_TOOL_ORDER.filter((name) =>
+      isToolEnabled(runtime.toolConfig, runtime.session.surface, name, recruiterReadToolKind(name))
+    )
+  );
 }
 
 /**

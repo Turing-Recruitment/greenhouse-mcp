@@ -5,7 +5,8 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import type { AuditReviewReport } from "./audit-review.js";
 import type { DesktopConfigFileManifest, DesktopConfigFileManifestEntry } from "./desktop-config.js";
 import { APPROVED_DESKTOP_DELIVERY_CHANNELS } from "./desktop-delivery.js";
-import type { DistributionValidationReport } from "./distribution-validation.js";
+import { classifyDistributionCatalog, type DistributionValidationReport } from "./distribution-validation.js";
+import { expectedMountedCatalog } from "./readiness.js";
 import { MANAGED_ROSTER_SOURCES } from "./email-session.js";
 import type { IssuedEmailSessionFileManifest, PreflightVerifiedEmailRosterReport } from "./email-session.js";
 import type { IdentityBootstrapPlan } from "./identity-bootstrap.js";
@@ -1051,6 +1052,20 @@ async function validateActiveRevocationTokenBinding(
   return missing.length === 0 ? { ok: true } : { ok: false, missing };
 }
 
+/**
+ * The readers a distribution report DECLARES were denylisted on the deployment it validated.
+ *
+ * Fails closed on anything unexpected — a non-array, a non-string entry, or a name outside the read
+ * catalog leaves the set empty, so a malformed declaration is held to the full catalog rather than
+ * excusing a missing tool.
+ */
+function readDeclaredDisabledTools(report: DistributionValidationReport): ReadonlySet<string> {
+  const declared = (report as { disabledTools?: unknown }).disabledTools;
+  if (!Array.isArray(declared)) return new Set<string>();
+  const names = declared.filter((name): name is string => typeof name === "string" && PILOT_TOOL_NAME_SET.has(name));
+  return names.length === declared.length ? new Set(names) : new Set<string>();
+}
+
 async function validateDistributionEvidence(
   baseDir: string,
   entry: DistributionValidationEvidence,
@@ -1071,10 +1086,22 @@ async function validateDistributionEvidence(
   const validatorChecks = summarizeRequiredDistributionChecks(report.checks);
   const toolSet = new Set(report.toolNames);
   const missingAnalysis = REQUIRED_ANALYSIS_TOOLS.filter((toolName) => !toolSet.has(toolName));
-  const missingCatalog = REQUIRED_RECRUITER_TOOL_NAMES.filter((toolName) => !toolSet.has(toolName));
-  const unexpectedCatalog = report.toolNames.filter((toolName) => !PILOT_TOOL_NAME_SET.has(toolName));
+  // ONE classifier, shared with the validator that produced this report (CLO-83's dual catalog).
+  // Filtering every name against the READ catalog called all 22 action tools "unexpected", so a
+  // correct write-entitled deployment passed distribution validation and then failed this gate.
+  // A reader an operator removed by name, with a reason, is the ONE supported way to shrink the
+  // catalog (catalog-order.ts, production.env.example). The report declares what it removed, and the
+  // gate holds it to the catalog that deployment is supposed to mount — a tool missing without such a
+  // declaration is still a failure, which is what this check is for.
+  const declaredDisabled = readDeclaredDisabledTools(report);
+  const expectedReadCatalog = expectedMountedCatalog(declaredDisabled);
+  const catalog = classifyDistributionCatalog(report.toolNames, expectedReadCatalog);
+  const expectedCatalog = catalog.expected;
+  const expectedCatalogSet = new Set(expectedCatalog);
+  const missingCatalog = expectedCatalog.filter((toolName) => !toolSet.has(toolName));
+  const unexpectedCatalog = report.toolNames.filter((toolName) => !expectedCatalogSet.has(toolName));
   const duplicateCatalog = [...new Set(report.toolNames.filter((toolName, index) => report.toolNames.indexOf(toolName) !== index))];
-  const catalogOrderMatches = report.toolNames.every((toolName, index) => toolName === REQUIRED_RECRUITER_TOOL_NAMES[index]);
+  const catalogOrderMatches = report.toolNames.every((toolName, index) => toolName === expectedCatalog[index]);
   const productionUrl = validateProductionMcpUrl(report.mcpUrl);
   const endpointBinding = validateDistributionEndpointBinding(report);
   const versionBinding = validateDistributionVersionBinding(report);
@@ -1132,9 +1159,9 @@ async function validateDistributionEvidence(
             failedChecks: validatorChecks.failedChecks,
           },
         },
-    missingCatalog.length === 0 && unexpectedCatalog.length === 0 && duplicateCatalog.length === 0 && report.toolNames.length === REQUIRED_RECRUITER_TOOL_NAMES.length && catalogOrderMatches
-      ? { name: `${checkPrefix}_exact_catalog`, status: "pass", summary: `Remote catalog exactly matches the ${REQUIRED_RECRUITER_TOOL_NAMES.length}-tool pilot allowlist.` }
-      : { name: `${checkPrefix}_exact_catalog`, status: "fail", summary: "Remote catalog does not exactly match the active pilot allowlist.", details: { missing: missingCatalog, unexpected: unexpectedCatalog, duplicates: duplicateCatalog, orderMatch: catalogOrderMatches, expectedCount: REQUIRED_RECRUITER_TOOL_NAMES.length, actualCount: report.toolNames.length } },
+    missingCatalog.length === 0 && unexpectedCatalog.length === 0 && duplicateCatalog.length === 0 && report.toolNames.length === expectedCatalog.length && catalogOrderMatches
+      ? { name: `${checkPrefix}_exact_catalog`, status: "pass", summary: `Remote catalog exactly matches the ${expectedCatalog.length}-tool ${catalog.variant} catalog.`, details: { catalog: catalog.variant, expectedCount: expectedCatalog.length } }
+      : { name: `${checkPrefix}_exact_catalog`, status: "fail", summary: "Remote catalog does not exactly match the mounted recruiter catalog.", details: { catalog: catalog.variant, missing: missingCatalog, unexpected: unexpectedCatalog, duplicates: duplicateCatalog, orderMatch: catalogOrderMatches, expectedCount: expectedCatalog.length, actualCount: report.toolNames.length } },
     missingAnalysis.length === 0
       ? { name: `${checkPrefix}_analysis_tools`, status: "pass", summary: "Remote catalog includes the ambitious analysis tools." }
       : { name: `${checkPrefix}_analysis_tools`, status: "fail", summary: "Remote catalog is missing required analysis tools.", details: { missing: missingAnalysis } },

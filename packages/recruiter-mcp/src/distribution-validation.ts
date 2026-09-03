@@ -28,6 +28,13 @@ export interface DistributionValidationReport {
   sessionIssuedAt?: string;
   checks: DistributionValidationCheck[];
   toolNames: string[];
+  /**
+   * Readers an operator removed with GREENHOUSE_RECRUITER_DISABLE_TOOLS, DECLARED so the rollout gate
+   * can hold the report to the catalog the deployment is supposed to mount rather than to the full
+   * one. Without it, using the single documented way to remove a reader — with a reason, by name —
+   * made the report fail the gate as a missing tool.
+   */
+  disabledTools?: string[];
 }
 
 export interface RemoteDistributionValidationOptions {
@@ -39,12 +46,15 @@ export interface RemoteDistributionValidationOptions {
   versionUrl?: string;
   expectedCommit?: string;
   expectedToolNames?: string[];
+  /** The readers GREENHOUSE_RECRUITER_DISABLE_TOOLS removed on the validated deployment. */
+  disabledTools?: string[];
   fetchImpl?: typeof fetch;
   now?: () => Date;
 }
 
 const DEFAULT_MCP_URL = "http://127.0.0.1:3333/mcp";
 const DEFAULT_EXPECTED_TOOL_NAMES = [...PILOT_TOOL_NAMES];
+const PILOT_TOOL_NAME_SET = new Set<string>(PILOT_TOOL_NAMES);
 const FORBIDDEN_TOOL_PATTERNS = [
   new RegExp("^" + "patch" + "_"),
   exactToolName("reject", "application"),
@@ -126,6 +136,7 @@ export async function runRemoteDistributionValidationFromEnv(
     expectedCommit: env.GREENHOUSE_RECRUITER_EXPECTED_COMMIT_SHA,
     token,
     expectedToolNames: expectedToolNamesFromEnv(env, token),
+    disabledTools: [...createRecruiterToolConfig(env).disabledTools].filter((name) => PILOT_TOOL_NAME_SET.has(name)).sort(),
     fetchImpl: options.fetchImpl,
     now: options.now,
   });
@@ -153,6 +164,33 @@ function expectedToolNamesFromEnv(env: NodeJS.ProcessEnv, token: string | undefi
     .map((tool) => tool.name);
 }
 
+/**
+ * The ONE place a catalog report is classified as read-only or write-entitled.
+ *
+ * Two gates read the same report and disagreed about it: this validator accepts the read catalog with
+ * the 22 action tools appended (CLO-83's dual catalog), while the rollout gate filtered every name
+ * against PILOT_TOOL_NAME_SET and called all 22 "unexpected" — so a correct write-entitled deployment
+ * passed validation and then failed its own release gate. One classifier, both callers.
+ *
+ * Detection is structural, not configured: the segment AFTER the read catalog must be exactly the
+ * action catalog, each name once. A partial or interleaved action set is a defect, not a variant, and
+ * falls back to read_only so the missing/unexpected checks report it.
+ */
+export function classifyDistributionCatalog(
+  toolNames: readonly string[],
+  expectedReadToolNames: readonly string[] = DEFAULT_EXPECTED_TOOL_NAMES
+): { variant: "read_only" | "write_entitled"; expected: string[] } {
+  const actionToolNames = ACTION_DEFINITIONS.flatMap((definition) => [definition.previewTool, definition.applyTool]);
+  const actionToolSet = new Set(actionToolNames);
+  const appendedSegment = toolNames.slice(expectedReadToolNames.length);
+  const writeEntitled = appendedSegment.length === actionToolNames.length
+    && new Set(appendedSegment).size === appendedSegment.length
+    && appendedSegment.every((name) => actionToolSet.has(name));
+  return writeEntitled
+    ? { variant: "write_entitled", expected: [...expectedReadToolNames, ...appendedSegment] }
+    : { variant: "read_only", expected: [...expectedReadToolNames] };
+}
+
 export function validateRemoteToolCatalog(
   toolNames: string[],
   expectedToolNames: string[] = DEFAULT_EXPECTED_TOOL_NAMES
@@ -162,14 +200,9 @@ export function validateRemoteToolCatalog(
   // builds it from the full definition list — so a partial or interleaved action set is a defect,
   // not a mode. Detection is structural: the appended segment must be exactly the action catalog,
   // and everything below then validates against the catalog variant actually observed.
-  const actionToolNames = ACTION_DEFINITIONS.flatMap((definition) => [definition.previewTool, definition.applyTool]);
-  const actionToolSet = new Set(actionToolNames);
-  const appendedSegment = toolNames.slice(expectedToolNames.length);
-  const writeEntitled = appendedSegment.length === actionToolNames.length
-    && new Set(appendedSegment).size === appendedSegment.length
-    && appendedSegment.every((name) => actionToolSet.has(name));
-  if (writeEntitled) expectedToolNames = [...expectedToolNames, ...appendedSegment];
-  const catalogVariant = writeEntitled ? "write_entitled" : "read_only";
+  const classified = classifyDistributionCatalog(toolNames, expectedToolNames);
+  expectedToolNames = classified.expected;
+  const catalogVariant = classified.variant;
   const toolSet = new Set(toolNames);
   const expectedSet = new Set(expectedToolNames);
   const missing = expectedToolNames.filter((name) => !toolSet.has(name));
@@ -592,6 +625,9 @@ function report(
     sessionIssuedAt: sessionMetadata.issuedAt,
     checks,
     toolNames,
+    // Only when there IS one: an absent field means "nothing was removed", which is the normal case
+    // and the one every existing evidence file records.
+    ...(options.disabledTools && options.disabledTools.length > 0 ? { disabledTools: [...options.disabledTools] } : {}),
   };
 }
 

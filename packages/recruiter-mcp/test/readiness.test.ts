@@ -477,10 +477,25 @@ describe("recruiter MCP readiness", () => {
   // /readyz must refuse to serve a production surface whose mounted catalog is not the full ordered
   // read catalog. Every surviving control that can shrink it is exercised here, one per case, because
   // deleting the negative test would have left toolCatalogCheck with nothing proving it can fail.
+  it("treats a denylisted reader as a supported state: ready, with the removal named", () => {
+    // "Hide by denylist only, with a cited reason" is what catalog-order.ts and production.env.example
+    // tell an operator to do, and doing it 503'd the service — the check compared the mount against
+    // the FULL catalog. The documented escape hatch now warns and NAMES the tool; a reader that
+    // vanished for any other reason still fails below.
+    for (const disabled of ["search_my_jobs", "answer_my_recruiting_question"]) {
+      const report = buildRecruiterMcpReadinessReport({
+        ...completeEnv(),
+        GREENHOUSE_RECRUITER_DISABLE_TOOLS: disabled,
+      } as NodeJS.ProcessEnv);
+      const check = report.checks.find((entry) => entry.name === "tool_catalog");
+      assert.equal(report.ok, true, disabled);
+      assert.equal(check?.status, "warn", disabled);
+      assert.match(check?.summary ?? "", new RegExp(disabled), "the warning must name what was removed");
+    }
+  });
+
   it("fails readiness when any operator control shrinks the mounted catalog on a hosted surface", () => {
     const cases: Array<[string, NodeJS.ProcessEnv]> = [
-      ["a denylisted reader", { GREENHOUSE_RECRUITER_DISABLE_TOOLS: "search_my_jobs" } as NodeJS.ProcessEnv],
-      ["a denylisted analyzer", { GREENHOUSE_RECRUITER_DISABLE_TOOLS: "answer_my_recruiting_question" } as NodeJS.ProcessEnv],
       ["the evidence category switch", { GREENHOUSE_RECRUITER_DISABLE_EVIDENCE: "true" } as NodeJS.ProcessEnv],
       ["the analytics category switch", { GREENHOUSE_RECRUITER_DISABLE_ANALYTICS: "true" } as NodeJS.ProcessEnv],
       ["the Claude Desktop surface switch", { GREENHOUSE_RECRUITER_DISABLE_CLAUDE_DESKTOP: "true" } as NodeJS.ProcessEnv],

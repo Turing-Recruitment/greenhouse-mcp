@@ -132,7 +132,7 @@ export const SCOPED_ENDPOINT_ADAPTERS: readonly ScopedEndpointAdapter[] = HARVES
       allowedProjectionProfiles: endpoint.allowedProjectionProfiles,
       joinDependencies: endpoint.joinDependencies,
       scopePolicy: endpoint.scopePolicy,
-      boundingRule: boundingRuleForScopeClass(endpoint.scopeClass),
+      boundingRule: boundingRuleForEndpoint(endpoint),
       exposure,
       evidenceTools,
       nonExposureReason: nonExposureReason(endpoint, exposure),
@@ -211,6 +211,31 @@ function nonExposureReason(endpoint: EndpointRegistryEntry, exposure: EndpointEx
   return "Registry-covered read endpoint without a default model-facing evidence tool; available for future scoped facts or metrics.";
 }
 
+/**
+ * The bounding rule as a per-ENDPOINT fact, not a per-class slogan.
+ *
+ * `admin_reference` covered two different shapes and told both the same story: /v3/user_job_permissions
+ * rows do carry job_id and are bounded by it, while future_job_permissions, bulk_requests and
+ * bulk_requests/{uuid} carry none at all — so "rows must carry a permitted job_id" described a rule
+ * that could not be running on three of the four. A model reading it would conclude a global read was
+ * requisition-scoped.
+ */
+function boundingRuleForEndpoint(endpoint: EndpointRegistryEntry): string {
+  if (endpoint.scopeClass === "admin_reference") {
+    const carriesJobId = endpoint.responseFields.some((field) => field.name === "job_id");
+    if (carriesJobId) {
+      // R2d bound /v3/user_job_permissions. The row carries job_id and the endpoint takes job_ids, so
+      // a reader sees who can reach THEIR reqs, never an org-wide access map.
+      return "Rows must carry a permitted job_id before projection; a reader sees permission rows for their own requisitions only.";
+    }
+    // No job on the row, so nothing to bound it to. Two of these are org diagnostics with no personal
+    // data and are returned to everyone; /v3/future_job_permissions is a staff-permission row and is
+    // gated on the reader's ROLE instead (evidence-projection.ts, the site-admin/operator row gate).
+    return "Rows carry no job_id, so this is a global org-configuration read; where the rows are staff-permission records, they reach site admins and allowlisted operators only.";
+  }
+  return boundingRuleForScopeClass(endpoint.scopeClass);
+}
+
 function boundingRuleForScopeClass(scopeClass: HarvestScopeClass): string {
   if (scopeClass === "job_scoped") {
     return "Rows must carry a permitted job_id or permitted endpoint parent job before projection.";
@@ -233,12 +258,8 @@ function boundingRuleForScopeClass(scopeClass: HarvestScopeClass): string {
   if (scopeClass === "global_reference") {
     return "Reference rows are not job-filtered; they may be used only as safe projected dimensions for scoped facts.";
   }
-  if (scopeClass === "admin_reference") {
-    // R2d bound /v3/user_job_permissions, so "not exposed on the default recruiter surface" stopped
-    // being true. The row is bounded exactly like any other job-scoped read — it carries job_id and
-    // the endpoint takes job_ids — so a reader sees who can reach THEIR reqs, never an org-wide map.
-    return "Rows must carry a permitted job_id before projection; a reader sees permission rows for their own requisitions only.";
-  }
+  // admin_reference is answered per endpoint by boundingRuleForEndpoint above: the class covers rows
+  // that carry a job_id and rows that carry none, and one sentence could not be true of both.
   // R2d bound /v3/user_emails. There is no job to bound a staff-directory row to, so the gate is the
   // reader's ROLE rather than their requisitions: the projector returns rows to a site admin or an
   // allowlisted operator and nothing to a job-scoped recruiter, which is the line Greenhouse itself

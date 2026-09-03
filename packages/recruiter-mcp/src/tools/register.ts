@@ -411,7 +411,7 @@ export function registerRecruiterTools(server: McpToolRegistrar, runtime: Recrui
       READ_MY_RESUME_TOOL.description,
       {
         attachment_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).describe(
-          "Exact resume attachment id returned by search_my_attachments. Required so the selected file/version is explicit."
+          "Exact attachment id returned by search_my_attachments (resume, cover letter, take-home, offer letter). Required so the selected file/version is explicit."
         ),
       },
       RECRUITER_READ_ONLY_TOOL_ANNOTATIONS,

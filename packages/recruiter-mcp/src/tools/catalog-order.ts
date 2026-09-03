@@ -16,6 +16,34 @@
  * It lives in its own leaf module so `resolvers/job-scope/capabilities` can tell the model which
  * tools it holds without importing the registrar that imports the job-scope tools.
  */
+/**
+ * The ANALYTICAL front doors, as distinct from the evidence readers.
+ *
+ * Two gates read the difference — `isToolEnabled` takes the tool's kind, and the capability
+ * document lists browsing (evidence) tools separately — and both sit in modules that must not import
+ * the registrar (it imports them). So the split lives here, on the same leaf as the order, and
+ * `catalog-registrar.test.ts` asserts it against `RECRUITER_TOOL_DEFINITIONS` name by name, so the
+ * two cannot drift.
+ */
+export const RECRUITER_ANALYSIS_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "answer_my_recruiting_question",
+  "analyze_scorecard_accountability",
+  "analyze_interview_feedback_drag",
+  "analyze_stage_latency",
+  "analyze_pipeline_quality",
+  "analyze_source_quality",
+  "analyze_rejection_reason_drift",
+  "resolve_job_scope",
+  "confirm_job_scope",
+  "get_job_scope",
+  "get_recruiting_capabilities",
+]);
+
+/** Evidence unless it is one of the analytical front doors — including read_my_resume, which reads a record. */
+export function recruiterReadToolKind(name: string): "evidence" | "analysis" {
+  return RECRUITER_ANALYSIS_TOOL_NAMES.has(name) ? "analysis" : "evidence";
+}
+
 export const RECRUITER_READ_TOOL_ORDER = [
   // Analytical front doors and scope resolution first: the routing ladder in SERVER_INSTRUCTIONS
   // tells the model to prefer these, and a client picker reads top-down.
