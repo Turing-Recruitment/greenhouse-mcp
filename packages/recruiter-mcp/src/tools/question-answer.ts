@@ -70,9 +70,6 @@ interface AnalysisPlan {
   missingEndpoints?: string[];
 }
 
-// The default ceiling is the full recipe panel, so a broad diagnostic runs every recipe
-// (an explicit max_recipes still overrides). Keep this equal to the RECIPES count.
-const DEFAULT_MAX_RECIPES = 6;
 const RECIPES: RecipeDefinition[] = [
   {
     id: "scorecard_accountability",
@@ -147,6 +144,11 @@ const RECIPES: RecipeDefinition[] = [
     params: (params) => pickParams(params, ["window_start", "window_end", "job_ids", "max_rankings", "per_page", "evidence_pack", "evidence_pack_limit"]),
   },
 ];
+
+// The default ceiling is the full recipe panel, so a broad diagnostic runs every recipe (an
+// explicit max_recipes still overrides). DERIVED, not typed: the hand-written 6 would have
+// silently selected a seventh registered recipe out of every broad run.
+const DEFAULT_MAX_RECIPES = RECIPES.length;
 
 // The recipe ids the planner can actually execute (one analyze_* tool each).
 // get_recruiting_capabilities must only mark these as availability: "available";
@@ -255,6 +257,10 @@ export async function runRecruitingQuestionAnswer(
   const scopeHeader = plannerScope.header;
   params = plannerScope.jobIds !== undefined ? withPlannerJobIds(params, plannerScope.jobIds) : stripScopeHandle(params);
 
+  // The disclosure is computed here so every answer shape below can state it; the FORWARDING
+  // into recipe params happens after the planned-domain branch, which does its own windowing.
+  const appliedTimeWindow = resolveQuestionTimeWindow(question, params, runtime.now());
+
   const missingDomain = detectMissingDomain(question);
   if (missingDomain) {
     // T3.2 (audit C-CORE): detectMissingDomain already maps the question to facts + endpoints +
@@ -299,6 +305,7 @@ export async function runRecruitingQuestionAnswer(
           completeness_status: missingDomain.completenessStatus,
           data_domains: plan.requiredEndpoints,
           projection_profile: plan.requiredProjectionProfile,
+          applied_time_window: appliedTimeWindow,
           scope_boundary: "No recipe reads ran because the planner identified a recognized but unimplemented fact/domain.",
           plan,
           ...(scopeHeader ? { scope: scopeHeader } : {}),
@@ -306,7 +313,7 @@ export async function runRecruitingQuestionAnswer(
         answer: {
           mode: "missing_domain",
           domain_recognized: true,
-          message: missingDomain.message,
+          message: composeAnswerMessage({ scopeHeader, appliedTimeWindow, lead: missingDomain.message }),
           required_metrics: plan.requiredMetrics,
           missing_facts: plan.missingFacts,
           missing_endpoints: plan.missingEndpoints,
@@ -331,7 +338,6 @@ export async function runRecruitingQuestionAnswer(
   // phrase the recruiter said out loud is a stated intent and runs exactly like an explicit
   // window, uncapped: maxLookbackDays exists only to bound the FUZZY default (limits.ts:475-480),
   // is applied in memory after a full read, and so guards no API cost.
-  const appliedTimeWindow = resolveQuestionTimeWindow(question, params, runtime.now());
   if (appliedTimeWindow?.origin === "question") {
     params = {
       ...params,
@@ -340,56 +346,18 @@ export async function runRecruitingQuestionAnswer(
     };
   }
 
-  const selected = selectRecipes(question, params);
-  if (selected.length === 0) {
-    // No recognized domain and no recipe matched: an unrecognized question. Degrade honestly to
-    // missing_domain (domain_recognized: false) instead of a confident broad composite.
-    const plan = buildUnrecognizedPlan(question, scopeHeader);
-    const result: RecruiterToolResult = {
-      ok: true,
-      toolName,
-      actorId: undefined,
-      effectiveActorId: undefined,
-      scoped: true,
-      data: {
-        summary: {
-          question,
-          planner: "keyword-routed recipe planner",
-          domain_recognized: false,
-          selected_recipe_count: 0,
-          recipes_run_count: 0,
-          selected_recipes: [],
-          rows_read: null,
-          rows_considered: null,
-          completeness_status: "missing_domain",
-          data_domains: plan.requiredEndpoints,
-          projection_profile: plan.requiredProjectionProfile,
-          scope_boundary: "No recipe reads ran because no approved recipe matched this question.",
-          plan,
-          ...(scopeHeader ? { scope: scopeHeader } : {}),
-        },
-        answer: {
-          mode: "missing_domain",
-          domain_recognized: false,
-          message: "No approved scoped-analysis recipe matches this question. Ask about scorecard accountability, interview feedback drag, stage latency, pipeline quality, or source quality; or request a broad diagnostic explicitly (recipes: \"all\").",
-          required_metrics: [],
-          missing_facts: [],
-          missing_endpoints: [],
-          completeness_status: "missing_domain",
-        },
-        analyses: [],
-        denials: [],
-        next_steps: [
-          "Rephrase toward an approved recipe: scorecard accountability, interview feedback drag, stage latency, pipeline quality, or source quality.",
-          "Pass recipes: \"all\" (or ask for a broad diagnostic) to run the full panel.",
-        ],
-      },
-      nextCursor: null,
-    };
-    const auditDenied = await emitPlannerAudit(runtime, startedAt, correlationId, result, null, null, actAsUser);
-    return auditDenied ?? result;
-  }
-  const plan = buildAnalysisPlan(question, selected, scopeHeader);
+  const matchedRecipes = selectRecipes(question, params);
+  // CLO-275: no recognized domain and no keyword match used to be a dead end — "no approved recipe
+  // matches this question", nothing read, nothing learned. The broad panel already exists and is
+  // the same permission-bounded set of analyses; running it and LABELLING the result an
+  // approximation answers something instead of nothing. The honesty that mattered in the old
+  // refusal is kept, and made louder: mode says approximate_composite, domain_recognized stays
+  // false, and the message names both what ran and the recipes to rephrase toward.
+  const approximateComposite = matchedRecipes.length === 0;
+  const selected = approximateComposite ? broadDiagnosticPanel() : matchedRecipes;
+  const plan = approximateComposite
+    ? { ...buildAnalysisPlan(question, selected, scopeHeader), stopReason: "approximate_composite:unrecognized_question" }
+    : buildAnalysisPlan(question, selected, scopeHeader);
   const analyses: Array<Record<string, unknown>> = [];
   const denials: Array<Record<string, unknown>> = [];
   let rowsRead = 0;
@@ -484,7 +452,11 @@ export async function runRecruitingQuestionAnswer(
     }
   }
 
-  if (analyses.length === denials.length) {
+  // A composite is an approximation by construction, so "every recipe denied" is a RESULT to
+  // report (which analyses were unavailable, and why), not a reason to hand back a bare denial
+  // for a question the planner chose to approximate. A matched-recipe run still collapses: there
+  // the caller asked for that specific analysis and it did not happen.
+  if (!approximateComposite && analyses.length === denials.length) {
     const first = denials[0];
     const denial = isRecord(first?.denial) && typeof first.denial.code === "string"
       ? first.denial
@@ -507,7 +479,9 @@ export async function runRecruitingQuestionAnswer(
     });
   const anyChildIncomplete = childCompletenessStatuses.some((status) => status === "incomplete");
   const anyChildPartial = childCompletenessStatuses.some((status) => status === "partial");
-  const headlineCompleteness = plannerTimedOut || anyChildIncomplete
+  // A denied child is missing evidence, so the headline says incomplete rather than presenting a
+  // partial panel as a clean success.
+  const headlineCompleteness = plannerTimedOut || anyChildIncomplete || denials.length > 0
     ? "incomplete"
     : anyChildPartial
       ? "partial"
@@ -523,8 +497,8 @@ export async function runRecruitingQuestionAnswer(
     data: {
       summary: {
         question,
-        planner: "keyword-routed recipe planner",
-        domain_recognized: true,
+        planner: approximateComposite ? "keyword-routed recipe planner (broad-panel approximation)" : "keyword-routed recipe planner",
+        domain_recognized: !approximateComposite,
         selected_recipe_count: selected.length,
         recipes_run_count: recipesRunCount,
         planner_timed_out: plannerTimedOut,
@@ -539,14 +513,30 @@ export async function runRecruitingQuestionAnswer(
         scope_boundary: "All recipe reads run through the recruiter scopedRead surface; no raw Greenhouse client access or model-supplied actor ids are used.",
         ...(scopeHeader ? { scope: scopeHeader } : {}),
       },
-      answer: buildAnswer(selected, analyses, denials),
+      answer: buildAnswer(selected, analyses, denials, {
+        mode: approximateComposite
+          ? "approximate_composite"
+          : selected.length > 1
+            ? "composite_analysis"
+            : "single_recipe_analysis",
+        domainRecognized: !approximateComposite,
+        ...(approximateComposite
+          ? { message: composeCompositeMessage(scopeHeader, appliedTimeWindow, analyses, denials) }
+          : {}),
+      }),
       analyses,
       denials,
-      next_steps: [
-        "Use the returned recipe outputs to pick one drilldown path, then use a visible get_my_* tool for a specific scoped id when available.",
-        "Rerun this planner with job_ids or narrower windows when you want a req-specific answer.",
-        "Ask for one of the selected recipes directly when you need maximum detail from a single analysis.",
-      ],
+      next_steps: approximateComposite
+        ? [
+            // Iterated, never hand-typed: a newly registered recipe is named here the day it lands.
+            ...PLANNER_RECIPE_IDS.map((id) => `Ask this directly as the ${id} analysis for a precise answer.`),
+            "Or name a req, role, or requisition id to scope the same panel to one requisition.",
+          ]
+        : [
+            "Use the returned recipe outputs to pick one drilldown path, then use a visible get_my_* tool for a specific scoped id when available.",
+            "Rerun this planner with job_ids or narrower windows when you want a req-specific answer.",
+            "Ask for one of the selected recipes directly when you need maximum detail from a single analysis.",
+          ],
     },
     nextCursor: null,
   };
@@ -596,8 +586,11 @@ function selectRecipes(question: string, params: Record<string, unknown>): Recip
   const requested = explicit.length > 0
     ? explicit
     : RECIPES.filter((recipe) => recipe.keywords.test(question)).map((recipe) => recipe.id);
-  // No silent broad fallback: an unmatched specific question must degrade to missing_domain,
-  // not receive a confident five-recipe composite. Broad diagnostics run only on explicit intent.
+  // Selection stays strict: only a keyword match or an explicit broad-diagnostic request selects
+  // recipes here, so a specific question never picks up a neighbouring recipe by accident. An
+  // EMPTY selection is a real answer from this function — the caller (CLO-275) runs the broad panel
+  // and labels the result an approximation rather than dead-ending, which is a decision about how
+  // to answer, not about which recipe the question matched.
   const recipeIds = requested.length > 0
     ? requested
     : (isBroadDiagnosticIntent(question, params) ? BROAD_DIAGNOSTIC_RECIPES : []);
@@ -960,8 +953,10 @@ async function executePlannedDomain(
   };
 }
 
-// Broad diagnostics are legitimate only when the operator explicitly asks for them — never as a
-// silent fallback for a specific question the planner failed to route.
+// Explicit broad intent ("everything", recipes: "all", broad: true) selects the panel as the
+// question's own answer — domain_recognized stays true and nothing is labelled an approximation.
+// That is distinct from the CLO-275 fallback, where an unmatched question runs the same panel but
+// the answer says so: mode approximate_composite, domain_recognized false.
 function isBroadDiagnosticIntent(question: string, params: Record<string, unknown>): boolean {
   if (params.broad === true) return true;
   const recipesParam = params.recipes ?? params.recipe;
@@ -970,19 +965,55 @@ function isBroadDiagnosticIntent(question: string, params: Record<string, unknow
   return /\b(overall|health check|full diagnostic|full picture|everything|comprehensive|end to end|across all|across my)\b/.test(normalized);
 }
 
-function buildUnrecognizedPlan(question: string, scopeHeader: AnalysisContextHeader | null): AnalysisPlan {
-  return {
-    interpretedQuestion: question,
-    requestedScope: requestedScope(scopeHeader),
-    requiredMetrics: [],
-    requiredFacts: [],
-    requiredEndpoints: [],
-    requiredProjectionProfile: "recruiter_default",
-    needsUserConfirmation: false,
-    stopReason: "missing_domain:unrecognized_question",
-    missingFacts: [],
-    missingEndpoints: [],
-  };
+/** The full diagnostic panel, resolved from the registry so a newly registered recipe joins it. */
+function broadDiagnosticPanel(): RecipeDefinition[] {
+  return BROAD_DIAGNOSTIC_RECIPES
+    .map((id) => RECIPES.find((recipe) => recipe.id === id))
+    .filter((recipe): recipe is RecipeDefinition => recipe !== undefined);
+}
+
+/**
+ * One composition contract for every answer that carries a message: what scope it ran over, then
+ * the shape-specific lead, then the time window when there is one, then what to do next. Written
+ * once so a recruiter reads the same disclosures in the same order whichever branch answered.
+ */
+function composeAnswerMessage(input: {
+  scopeHeader: AnalysisContextHeader | null;
+  appliedTimeWindow: AppliedTimeWindow | null;
+  lead?: string;
+  trailer?: string;
+}): string {
+  const sentences: string[] = [
+    `Answered over ${input.scopeHeader?.scope_label ?? "the reqs your Greenhouse permissions return"}.`,
+  ];
+  if (input.lead) sentences.push(input.lead);
+  const window = input.appliedTimeWindow;
+  if (window?.origin === "question" && window.window_start && window.window_end) {
+    sentences.push(`Time window: ${window.label} (${window.window_start.slice(0, 10)} to ${window.window_end.slice(0, 10)}).`);
+  } else if (window?.origin === "explicit") {
+    sentences.push("Time window: the window_start/window_end you passed; each analysis states the interval it resolved.");
+  }
+  if (input.trailer) sentences.push(input.trailer);
+  return sentences.join(" ");
+}
+
+function composeCompositeMessage(
+  scopeHeader: AnalysisContextHeader | null,
+  appliedTimeWindow: AppliedTimeWindow | null,
+  analyses: Array<Record<string, unknown>>,
+  denials: Array<Record<string, unknown>>
+): string {
+  const ran = analyses.filter((entry) => entry.status === "ok").map((entry) => String(entry.recipe));
+  const blocked = denials.map((entry) => String(entry.recipe));
+  const lead = ran.length > 0
+    ? `No single analysis matched this question; the broad panel ran instead (${ran.join(", ")}).`
+    : `No single analysis matched this question; the broad panel ran instead (none of it could complete: ${blocked.join(", ")}).`;
+  return composeAnswerMessage({
+    scopeHeader,
+    appliedTimeWindow,
+    lead,
+    trailer: `Treat this as an approximation and rephrase toward one of: ${PLANNER_RECIPE_IDS.join(", ")}.`,
+  });
 }
 
 function buildAnalysisPlan(
@@ -1119,12 +1150,16 @@ function summarizeRecipeParams(params: Record<string, unknown>): Record<string, 
 function buildAnswer(
   selected: RecipeDefinition[],
   analyses: Array<Record<string, unknown>>,
-  denials: Array<Record<string, unknown>>
+  denials: Array<Record<string, unknown>>,
+  // Taken as INPUTS: the composite needs its own mode and an honest domain_recognized: false, and
+  // hardcoding them here is what made the shape unavailable to any caller but the matched path.
+  shape: { mode: string; domainRecognized: boolean; message?: string }
 ): Record<string, unknown> {
   const successful = analyses.filter((entry) => entry.status === "ok");
   return {
-    mode: selected.length > 1 ? "composite_analysis" : "single_recipe_analysis",
-    domain_recognized: true,
+    mode: shape.mode,
+    domain_recognized: shape.domainRecognized,
+    ...(shape.message !== undefined ? { message: shape.message } : {}),
     successful_recipes: successful.map((entry) => entry.recipe),
     denied_recipes: denials.map((entry) => entry.recipe),
     metric_definitions: metricDefinitionsForRecipes(selected),

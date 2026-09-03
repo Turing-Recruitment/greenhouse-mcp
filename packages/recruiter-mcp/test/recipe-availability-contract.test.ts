@@ -12,7 +12,11 @@ import { analysisRuntime, fakeScopedReader, scopedSuccess } from "./test-helpers
 // example_question through the planner (with a forced scope so scope resolution never
 // masks the routing) and assert the advertised availability matches whether it runs.
 
-const NON_RUN_MODES = new Set(["missing_domain", "unrecognized_question", "resolution_required"]);
+// "approximate_composite" (CLO-275) counts as NOT-RUN for this contract: the broad panel running as
+// a labeled approximation is the planner declining to route the question, not the advertised recipe
+// executing. Counting it as a run would let a "planned" recipe pass on the strength of an
+// approximation that never touched its data.
+const NON_RUN_MODES = new Set(["missing_domain", "unrecognized_question", "resolution_required", "approximate_composite"]);
 
 function genericReader() {
   const row = {

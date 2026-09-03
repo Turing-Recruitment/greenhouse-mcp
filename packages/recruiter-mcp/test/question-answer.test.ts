@@ -2,7 +2,10 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_LIMITS } from "../src/limits.js";
 import { BROAD_DIAGNOSTIC_RECIPES, PLANNER_RECIPE_IDS, runRecruitingQuestionAnswer } from "../src/tools/question-answer.js";
-import { fakeScopedReader, scopedSuccess, testRuntime } from "./test-helpers.js";
+import { createFixtureInventoryProvider, type JobScopeFixture } from "../src/resolvers/job-scope/inventory.js";
+import { fakeScopedReader, scopedDenial, scopedSuccess, testRuntime } from "./test-helpers.js";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 // The inventory loader now issues four enrichment reads (offices/departments/job posts/post
 // locations — the multi-signal matching joins, 2026-07-02) alongside list_jobs; planner tests
@@ -153,26 +156,24 @@ describe("recruiting question planner", () => {
     assert.equal(data.denials.length, 0);
   });
 
-  it("returns missing_domain with domain_recognized=false for an unmatched, non-broad question — never a guessed broad composite (regression: silent fallback)", async () => {
-    const scopedReader = fakeScopedReader((toolName) => {
-      if (toolName === "list_jobs") {
-        return scopedSuccess(toolName, []);
-      }
-      throw new Error(`planner must not run a recipe read for an unmatched question (${toolName})`);
-    });
+  // INVERTED by CLO-275. This locked the planner into a dead end for anything outside the keyword
+  // vocabulary — the refusal was the whole answer. The property worth keeping is not the refusal
+  // but the LABEL: the broad panel may run, and it must never be dressed up as a confident answer
+  // to the specific question that was asked.
+  it("CLO-275: an unmatched, non-broad question gets a LABELLED approximation, never a confident composite", async () => {
+    const scopedReader = fakeScopedReader((toolName) => scopedSuccess(toolName, []));
     const { runtime } = testRuntime(scopedReader);
     const result = await runRecruitingQuestionAnswer(runtime, {
       question: "Which candidates are the best cultural fit?",
     });
     assert.equal(result.ok, true);
     const data = result.ok ? result.data as any : null;
-    assert.equal(data.answer.mode, "missing_domain");
+    assert.equal(data.answer.mode, "approximate_composite", "never composite_analysis: nothing matched this question");
     assert.equal(data.answer.domain_recognized, false);
     assert.equal(data.summary.domain_recognized, false);
-    assert.equal(data.summary.completeness_status, "missing_domain");
-    assert.deepStrictEqual(data.summary.selected_recipes, []);
-    assert.deepStrictEqual(data.analyses, []);
-    assert.deepStrictEqual(analysisToolCalls(scopedReader), ["list_jobs"]);
+    assert.deepStrictEqual(data.summary.selected_recipes, BROAD_DIAGNOSTIC_RECIPES);
+    assert.match(data.answer.message, /Treat this as an approximation and rephrase toward one of:/);
+    assert.ok(data.analyses.length > 0, "the panel ran rather than dead-ending");
   });
 
   it("executes job-post exposure via the fact-backed planner (job_post_exposure_by_post), not a broad composite (T3.2)", async () => {
@@ -670,5 +671,150 @@ describe("recruiting question planner — the question's own time window", () =>
     });
     assert.ok((data.answer.omissions as string[]).some((line) => line.includes("this month")));
     assert.ok(!(data.answer.omissions as string[]).some((line) => line.includes("explicit window params")));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P6 (CLO-275): an unknown question gets a labeled composite instead of a refusal.
+// "No approved recipe matches this question" was a dead end for anything phrased outside
+// the keyword vocabulary. The broad panel already exists; running it and LABELLING the
+// result an approximation beats handing back nothing.
+// ---------------------------------------------------------------------------
+
+const SCOPE_FIXTURE = JSON.parse(
+  readFileSync(resolve("test/fixtures/job-scope-resolution.fixture.json"), "utf8")
+) as JobScopeFixture;
+
+const UNKNOWN_QUESTION = "how is recruiting going for the Brazil team";
+
+function panelReader() {
+  return fakeScopedReader((toolName) => {
+    if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+    if (toolName === "list_applications") {
+      return scopedSuccess(toolName, [
+        { id: 100, candidate_id: 1000, job_id: 10, source_id: 1, referrer_id: 2, status: "active", applied_at: "2026-06-10T00:00:00.000Z", last_activity_at: "2026-06-11T00:00:00.000Z", stage_id: 7, stage_name: "Phone Screen", current_stage_at: "2026-06-10T00:00:00.000Z" },
+      ]);
+    }
+    return scopedSuccess(toolName, []);
+  });
+}
+
+describe("recruiting question planner — unknown questions get a labeled composite (CLO-275)", () => {
+  it("A9: a narrow recruiter's unrecognized question runs the broad panel, labeled as an approximation", async () => {
+    const reader = panelReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: UNKNOWN_QUESTION });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "approximate_composite");
+    assert.equal(data.answer.domain_recognized, false);
+    assert.equal(data.summary.domain_recognized, false);
+    assert.ok(data.analyses.length > 0, "the panel actually ran");
+    const message: string = data.answer.message;
+    assert.match(message, /^Answered over /, "first sentence states the scope");
+    assert.match(message, /No single analysis matched this question; the broad panel ran instead \(/);
+    assert.match(message, /Treat this as an approximation and rephrase toward one of:/);
+  });
+
+  it("A9 (org-wide actor): the admin path reaches the composite too, not resolution_required", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_applications") {
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 9001001, source_id: 1, referrer_id: 2, status: "active", applied_at: "2026-06-10T00:00:00.000Z", last_activity_at: "2026-06-11T00:00:00.000Z", stage_id: 7, stage_name: "Phone Screen", current_stage_at: "2026-06-10T00:00:00.000Z" },
+        ]);
+      }
+      return scopedSuccess(toolName, []);
+    });
+    const { runtime } = testRuntime(reader, {
+      jobInventory: createFixtureInventoryProvider(SCOPE_FIXTURE, "site_admin"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: UNKNOWN_QUESTION });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.scope_resolution_required, undefined);
+    assert.equal(data.answer.mode, "approximate_composite");
+    assert.equal(data.answer.domain_recognized, false);
+    assert.match(data.answer.message, /org-wide/);
+  });
+
+  it("A10: the composite names every runnable recipe by iteration, never a hand-typed list", async () => {
+    const reader = panelReader();
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: UNKNOWN_QUESTION });
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    const nextSteps: string[] = data.next_steps;
+    for (const id of PLANNER_RECIPE_IDS) {
+      assert.ok(nextSteps.some((step) => step.includes(id)), `next_steps must name ${id}`);
+      assert.ok(String(data.answer.message).includes(id), `the message must name ${id}`);
+    }
+  });
+
+  it("A11: a recognized planned domain still routes to planned_metric, never the composite", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_offers") {
+        return scopedSuccess(toolName, [{ id: 1, job_id: 10, application_id: 101, status: "Accepted", sent_on: "2026-06-01" }]);
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+    const { runtime } = testRuntime(reader);
+    const result = await runRecruitingQuestionAnswer(runtime, { question: "What is the offer acceptance rate this quarter?" });
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "planned_metric");
+  });
+
+  it("A11b: a deadline that kills the first recipe still returns the labeled composite, marked incomplete", async () => {
+    let now = 0;
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") {
+        now = 60;
+        return scopedSuccess(toolName, []);
+      }
+      throw new Error(`no recipe read should run past the deadline (${toolName})`);
+    });
+    const { runtime } = testRuntime(reader, {
+      limits: { ...DEFAULT_LIMITS, maxToolDurationMs: 50, maxAnalysisDurationMs: 50 },
+      now: () => now,
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: UNKNOWN_QUESTION });
+
+    assert.equal(result.ok, true, "an all-denied panel must not collapse back into a bare refusal");
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "approximate_composite");
+    assert.equal(data.summary.completeness_status, "incomplete");
+    assert.equal(data.denials[0].denial.code, "TOOL_TIMEOUT");
+    assert.equal(data.analyses[0].status, "denied");
+    assert.ok(String(data.answer.message).length > 0);
+  });
+
+  it("A11c: a mixed success/denial panel reports both and stays incomplete", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_jobs") return scopedSuccess(toolName, []);
+      if (toolName === "list_scorecards") return scopedDenial(toolName, "ACTOR_DENIED");
+      if (toolName === "list_applications") {
+        return scopedSuccess(toolName, [
+          { id: 100, candidate_id: 1000, job_id: 10, source_id: 1, referrer_id: 2, status: "active", applied_at: "2026-06-10T00:00:00.000Z", last_activity_at: "2026-06-11T00:00:00.000Z", stage_id: 7, stage_name: "Phone Screen", current_stage_at: "2026-06-10T00:00:00.000Z" },
+        ]);
+      }
+      return scopedSuccess(toolName, []);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await runRecruitingQuestionAnswer(runtime, { question: UNKNOWN_QUESTION });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.answer.mode, "approximate_composite");
+    assert.ok(data.analyses.some((entry: any) => entry.status === "ok"), "the recipes that could run are reported");
+    assert.ok(data.analyses.some((entry: any) => entry.status === "denied"), "the recipes that could not are reported too");
+    assert.equal(data.summary.completeness_status, "incomplete");
   });
 });
