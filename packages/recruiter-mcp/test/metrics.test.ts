@@ -252,3 +252,64 @@ describe("metric registry", () => {
     assert.equal(conversion.completeness, "failed_missing_fact");
   });
 });
+
+// ---------------------------------------------------------------------------
+// H0a: hire_count joins the registry without widening the GLOBAL blocks-answer map.
+//
+// METRIC_IDS_BY_REQUIRED_FIELD (evidence-projection.ts:298) is built from every
+// registered metric's requiredFields and is consulted on EVERY endpoint
+// projection: an omitted field that is any metric's required field becomes a
+// blocks_answer omission on that endpoint, whatever the caller was asking for. So
+// a new metric's requiredFields is not a local decision — naming a field no
+// metric required before would start blocking answers on unrelated endpoints.
+// This locks the KEY SET (the thing that has that effect), not the values.
+// ---------------------------------------------------------------------------
+describe("METRIC_IDS_BY_REQUIRED_FIELD key set", () => {
+  // Snapshot taken BEFORE hire_count was registered. Adding hire_count must leave
+  // it byte-identical; a diff here means some endpoint projection just started
+  // reporting blocks_answer for a field it never blocked on.
+  const REQUIRED_FIELD_KEYS_BEFORE_HIRE_COUNT = [
+    "application_stage_id",
+    "approval_status",
+    "availability_received_at",
+    "created_at",
+    "days_in_stage",
+    "exited_at",
+    "interviewed_at",
+    "open",
+    "pool_id",
+    "pool_stage_id",
+    "related_post_id",
+    "scheduled_at",
+    "scorecard_id",
+    "source_id",
+    "status",
+    "submitted_at",
+    "tracking_link_id",
+    "type",
+  ];
+
+  function requiredFieldKeys(): string[] {
+    return [...new Set(METRIC_REGISTRY.flatMap((metric) => metric.requiredFields))].sort();
+  }
+
+  it("registers hire_count with the single field that adds no new key", () => {
+    const hireCount = METRIC_REGISTRY_BY_ID.get("hire_count");
+    assert.ok(hireCount, "hire_count must be registered");
+    assert.deepStrictEqual(hireCount!.requiredFields, ["status"]);
+    assert.equal(hireCount!.windowField, "resolved_at", "the clock a hire is windowed on is declared, not inferred");
+    assert.deepStrictEqual(hireCount!.requiredFacts, ["hire_fact"]);
+  });
+
+  it("adds no field key to the global blocks-answer map", () => {
+    assert.deepStrictEqual(
+      requiredFieldKeys(),
+      REQUIRED_FIELD_KEYS_BEFORE_HIRE_COUNT,
+      "a new key here makes some endpoint projection start blocking on a field it never blocked on"
+    );
+    assert.ok(
+      REQUIRED_FIELD_KEYS_BEFORE_HIRE_COUNT.includes("status"),
+      "hire_count's only required field was already a key, so its metric id joins an existing entry"
+    );
+  });
+});

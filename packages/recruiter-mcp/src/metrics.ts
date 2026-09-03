@@ -4,6 +4,7 @@ import type {
   ApprovalFlowFact,
   FactBuildResult,
   FactCompletenessStatus,
+  HireFact,
   InterviewEventFact,
   JobPostExposureFact,
   NoteActivityFact,
@@ -28,7 +29,11 @@ export type MetricFactName =
   | "note_activity_fact"
   | "opening_headcount_fact"
   | "offer_fact"
-  | "scorecard_question_answer_fact";
+  | "scorecard_question_answer_fact"
+  // H0: the hire, as an accepted offer with a hire date. Distinct from offer_fact on purpose —
+  // offer_fact is every offer row's status mix, hire_fact is the hire denominator every People Ops
+  // recipe is built on.
+  | "hire_fact";
 
 export type MetricCompletenessStatus = FactCompletenessStatus | "failed_missing_fact" | "incomplete_truncated";
 
@@ -60,6 +65,13 @@ export interface MetricDefinition {
   requiredFacts: MetricFactName[];
   requiredFields: string[];
   requiredRoleProfile: RecruiterProjectionProfileName;
+  /**
+   * The FACT field a time window is applied on for this metric, when it has one. Serialized into
+   * the capability output so a caller can see which clock a windowed number ran on rather than
+   * inferring it — the offer domain has three plausible ones (`sent_on`, `resolved_at`,
+   * `created_at`) and they answer different questions.
+   */
+  windowField?: string;
   defaultTimeWindow?: string;
   scopeBehavior: "job" | "job_set" | "permitted_scope" | "org_reference";
   exclusions: string[];
@@ -284,6 +296,30 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     compute: computeOfferResolutionMix,
   },
   {
+    id: "hire_count",
+    displayName: "Hires (accepted offers)",
+    requiredFacts: ["hire_fact"],
+    // MINIMAL on purpose. METRIC_IDS_BY_REQUIRED_FIELD (evidence-projection.ts) is a GLOBAL
+    // field -> metric-id map, so every field named here starts blocking answers on every endpoint
+    // projection that drops it. "status" is the one field without which a hire cannot be
+    // identified at all, and it is already a required field of five registered metrics, so naming
+    // it adds no new key to that map. The hire DATE is deliberately absent: a hire missing
+    // resolved_at is dated from sent_on and labeled (buildHireFacts), never fail-closed.
+    requiredFields: ["status"],
+    requiredRoleProfile: "recruiter_default",
+    windowField: "resolved_at",
+    defaultTimeWindow: "last_90_days",
+    scopeBehavior: "job_set",
+    exclusions: [
+      "a hire is an accepted offer; Harvest v3 carries no hire timestamp on the application row, and applications.status=hired depends on someone calling the hire endpoint",
+      "offers whose status is not exactly Accepted are excluded",
+      "hires dated from sent_on rather than resolved_at are counted and labeled dated_from: \"sent_on\"",
+      "private candidates the actor's Greenhouse permissions withhold are absent from the count; the read reports how many",
+    ],
+    completenessRules: ["hire_fact must be complete"],
+    compute: computeHireCount,
+  },
+  {
     id: "rubric_answer_coverage",
     displayName: "Rubric answer coverage",
     requiredFacts: ["scorecard_question_answer_fact"],
@@ -361,6 +397,40 @@ function offerFacts(context: MetricComputeContext): Array<FactBuildResult<OfferF
 
 function rubricAnswers(context: MetricComputeContext): Array<FactBuildResult<ScorecardQuestionAnswerFact>> {
   return factResults(context, "scorecard_question_answer_fact");
+}
+
+function hireFacts(context: MetricComputeContext): Array<FactBuildResult<HireFact>> {
+  return factResults(context, "hire_fact");
+}
+
+/**
+ * How many hires, and on which clock each one was dated.
+ *
+ * The fact builder's own omissions are carried onto the metric because they are the only place the
+ * answer learns that N of these hires were dated from `sent_on` rather than `resolved_at`, or that
+ * M accepted offers carry no date at all. metricReadiness surfaces a fact result's omissions only
+ * when the result is INCOMPLETE, and a labeled approximation is not incompleteness — so without
+ * this the label would exist on the row and never reach the reader.
+ */
+function computeHireCount(context: MetricComputeContext): MetricResult {
+  const readiness = metricReadiness("hire_count", hireFacts(context));
+  if (readiness) return readiness;
+  const results = hireFacts(context);
+  const facts = results.flatMap((result) => result.facts);
+  const byClock = new Map<string, number>();
+  for (const fact of facts) {
+    byClock.set(fact.dated_from, (byClock.get(fact.dated_from) ?? 0) + 1);
+  }
+  return {
+    metricId: "hire_count",
+    completeness: "complete",
+    value: facts.length,
+    unit: "count",
+    groups: [...byClock.entries()].map(([dated_from, hire_count]) => ({ dated_from, hire_count })),
+    evidenceRefs: evidenceRefsForFactResults(results),
+    exclusions: metricExclusions("hire_count"),
+    omissions: results.flatMap((result) => result.omissions),
+  };
 }
 
 function computeApprovalPendingAge(context: MetricComputeContext): MetricResult {

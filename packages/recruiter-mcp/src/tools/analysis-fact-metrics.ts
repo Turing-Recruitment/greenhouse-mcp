@@ -25,6 +25,8 @@ export interface AnalysisFactMetricLayer {
     required_facts: MetricFactName[];
     required_fields: string[];
     required_role_profile: RecruiterProjectionProfileName;
+    /** The fact field this metric's time window runs on, when it declares one. */
+    window_field?: string;
     scope_behavior: string;
     exclusions: string[];
     completeness_rules: string[];
@@ -112,6 +114,7 @@ export function buildAnalysisFactMetricLayer(input: {
         required_facts: metric.requiredFacts,
         required_fields: metric.requiredFields,
         required_role_profile: metric.requiredRoleProfile,
+        ...(metric.windowField ? { window_field: metric.windowField } : {}),
         scope_behavior: metric.scopeBehavior,
         exclusions: metric.exclusions,
         completeness_rules: metric.completenessRules,

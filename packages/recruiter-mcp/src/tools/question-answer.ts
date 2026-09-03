@@ -1299,6 +1299,7 @@ function metricDefinitionsForRecipes(selected: RecipeDefinition[]): Array<Record
       required_facts: metric.requiredFacts,
       required_fields: metric.requiredFields,
       required_role_profile: metric.requiredRoleProfile,
+      ...(metric.windowField ? { window_field: metric.windowField } : {}),
       scope_behavior: metric.scopeBehavior,
       exclusions: metric.exclusions,
       completeness_rules: metric.completenessRules,

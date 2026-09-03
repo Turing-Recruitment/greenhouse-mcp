@@ -143,6 +143,56 @@ export const SCORECARD_ANALYSIS_READ_PARAM_NAMES = readParamNames(
   "submitted_at"
 );
 
+/**
+ * The hire read's own filters on /v3/offers. `sanitizeReadParams` drops an unlisted param SILENTLY,
+ * so a hire read that asked for `status=Accepted&current_only=true` without this set would have
+ * become an unfiltered read of every offer version in the permitted scope — the same number,
+ * silently wrong. Every name here is on the vendored /v3/offers contract
+ * (harvest-v3-registry.generated.ts, /v3/offers): `current_only` collapses the version chain to the
+ * latest row per application, `status` is the {Created,Accepted,Rejected,Deprecated} enum, and
+ * `resolved_at` / `sent_on` / `starts_on` are its range filters (admitted here as base names; the
+ * bracket forms are matched against them).
+ */
+export const HIRE_FACTS_OFFER_READ_PARAM_NAMES = readParamNames(
+  ...COMMON_PAGINATION_PARAM_NAMES,
+  "ids",
+  "job_ids",
+  "application_ids",
+  "candidate_ids",
+  "opening_ids",
+  "status",
+  "current_only",
+  "resolved_at",
+  "sent_on",
+  "starts_on"
+);
+
+/**
+ * The reconciliation line's filters on /v3/openings: `open=false` plus a `closed_at` range and, when
+ * the caller already knows the hire close reasons, `close_reason_ids`. Same silent-drop hazard as
+ * above — `open` and `closed_at` reach the evidence search set but no ANALYSIS set carried them.
+ */
+export const HIRE_FACTS_OPENING_READ_PARAM_NAMES = readParamNames(
+  ...COMMON_PAGINATION_PARAM_NAMES,
+  "ids",
+  "job_ids",
+  "open",
+  "opened_at",
+  "closed_at",
+  "close_reason_ids"
+);
+
+/**
+ * The id-bridge reads the hire path makes to put names and application status beside a hire:
+ * /v3/candidates?ids= and /v3/applications?ids=, in 50-id chunks. Nothing but the id filter and
+ * pagination — a bridge read is a lookup of rows the caller already holds ids for, and any other
+ * filter on it would narrow a set that is already exactly bounded.
+ */
+export const HIRE_FACTS_ID_BRIDGE_READ_PARAM_NAMES = readParamNames(
+  ...COMMON_PAGINATION_PARAM_NAMES,
+  "ids"
+);
+
 export const REJECTION_REASON_DRIFT_READ_PARAM_NAMES = readParamNames(
   ...COMMON_PAGINATION_PARAM_NAMES,
   "job_ids",
