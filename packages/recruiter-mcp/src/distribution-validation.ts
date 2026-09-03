@@ -173,21 +173,25 @@ function expectedToolNamesFromEnv(env: NodeJS.ProcessEnv, token: string | undefi
  * passed validation and then failed its own release gate. One classifier, both callers.
  *
  * Detection is structural, not configured: the segment AFTER the read catalog must be exactly the
- * action catalog, each name once. A partial or interleaved action set is a defect, not a variant, and
- * falls back to read_only so the missing/unexpected checks report it.
+ * action catalog, in the registrar's own order. A partial, interleaved or REORDERED action set is a
+ * defect, not a variant, and falls back to read_only so the missing/unexpected checks report it.
+ *
+ * The order comparison is the fold: membership alone (`actionToolSet.has(name)`) accepted any
+ * permutation, and `expected` was then built from the segment the deployment had SENT — so a catalog
+ * with all 22 action tools reversed passed expected_tool_catalog, no_unexpected_tools and
+ * exact_tool_catalog, because the validator had adopted the very thing it was supposed to check.
+ * `expected` is now always the canonical order, whatever arrived.
  */
 export function classifyDistributionCatalog(
   toolNames: readonly string[],
   expectedReadToolNames: readonly string[] = DEFAULT_EXPECTED_TOOL_NAMES
 ): { variant: "read_only" | "write_entitled"; expected: string[] } {
   const actionToolNames = ACTION_DEFINITIONS.flatMap((definition) => [definition.previewTool, definition.applyTool]);
-  const actionToolSet = new Set(actionToolNames);
   const appendedSegment = toolNames.slice(expectedReadToolNames.length);
   const writeEntitled = appendedSegment.length === actionToolNames.length
-    && new Set(appendedSegment).size === appendedSegment.length
-    && appendedSegment.every((name) => actionToolSet.has(name));
+    && appendedSegment.every((name, index) => name === actionToolNames[index]);
   return writeEntitled
-    ? { variant: "write_entitled", expected: [...expectedReadToolNames, ...appendedSegment] }
+    ? { variant: "write_entitled", expected: [...expectedReadToolNames, ...actionToolNames] }
     : { variant: "read_only", expected: [...expectedReadToolNames] };
 }
 

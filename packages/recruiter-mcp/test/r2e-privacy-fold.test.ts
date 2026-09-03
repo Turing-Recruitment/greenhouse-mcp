@@ -179,11 +179,11 @@ describe("R2 fold 2/20: the counts around a withheld row are the disclosure", ()
     const existing = await gatedEnvelope("77");
     assert.equal(existing.projection?.roleGatedRowsWithheld?.reason, "privacy");
     assert.match(existing.projection?.roleGatedRowsWithheld?.note ?? "", /site admin/i);
-    assert.deepEqual(
-      [...new Set((existing.projection?.omittedFields ?? []).map((field) => field.reason))],
-      ["privacy"],
-      "a field the ROLE gate took with its row is not an incidental projection drop"
-    );
+    // Fold 2: the omission LIST itself is now empty rather than privacy-reasoned. Naming the fields
+    // a withheld row carried — `email`, `id`, `user_id`, `verified` for a row that exists, nothing
+    // for an id nobody holds — was the same disclosure the counts were, in a different column. The
+    // single roleGatedRowsWithheld note carries the whole explanation.
+    assert.deepEqual(existing.projection?.omittedFields, []);
   });
 
   it("states the withholding on every call, including one that matched nothing", async () => {

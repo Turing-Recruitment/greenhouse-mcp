@@ -55,6 +55,7 @@ interface DesktopReportFixture {
   catalogAttestation: string;
   catalogToolCount: number;
   catalogToolNamesHash: string;
+  observedToolNames: string[];
   containsTokens: boolean;
   taskOutcome: "useful" | "not_useful" | "could_not_use";
   taskOutcomeReason: "wrong_scope" | "timeout_error" | "installation_blocked" | "answer_received" | "not_yet_needed";
@@ -1548,6 +1549,10 @@ describe("rollout evidence gate", () => {
           catalogAttestation: "write_entitled_full_catalog",
           catalogToolCount: EXPECTED_CATALOG_TOOL_COUNTS.write_entitled_full_catalog,
           catalogToolNamesHash: catalogToolNamesHash("write_entitled_full_catalog"),
+          observedToolNames: [
+            ...PILOT_TOOL_NAMES,
+            ...ACTION_DEFINITIONS.flatMap((definition: { previewTool: string; applyTool: string }) => [definition.previewTool, definition.applyTool]),
+          ],
         },
       },
     });
@@ -1575,6 +1580,35 @@ describe("rollout evidence gate", () => {
     assert.equal(check?.status, "fail");
     assert.equal(check?.details?.catalogToolNamesHash, "0".repeat(64));
     assert.equal(check?.details?.expectedCatalogToolNamesHash, catalogToolNamesHash("read_only_full_catalog"));
+  });
+
+  it("fails desktop evidence that never recorded what the tester saw", async () => {
+    // Fold 2: the hash used to be computed from source constants, so it said "the shipping catalog"
+    // whatever the deployment had served. The evidence now carries the ordered names the client
+    // listed, and evidence without them cannot be checked at all.
+    const dir = await mkdtemp(join(tmpdir(), "greenhouse-rollout-gate-no-observed-"));
+    await writeCompleteEvidence(dir, {
+      desktopOverrides: { chatgpt_desktop: { observedToolNames: undefined } },
+    });
+
+    const report = await runRolloutGate({ manifestPath: join(dir, "manifest.json") });
+    const check = report.checks.find((entry) => entry.name === "desktop_chatgpt_codex_host");
+    assert.equal(report.ok, false);
+    assert.equal(check?.status, "fail");
+    assert.equal(check?.details?.observedToolCount, null);
+  });
+
+  it("fails desktop evidence whose recorded hash is not of the catalog it says it observed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "greenhouse-rollout-gate-observed-mismatch-"));
+    await writeCompleteEvidence(dir, {
+      desktopOverrides: { chatgpt_desktop: { observedToolNames: [...PILOT_TOOL_NAMES].reverse() } },
+    });
+
+    const report = await runRolloutGate({ manifestPath: join(dir, "manifest.json") });
+    const check = report.checks.find((entry) => entry.name === "desktop_chatgpt_codex_host");
+    assert.equal(report.ok, false);
+    assert.equal(check?.status, "fail");
+    assert.notEqual(check?.details?.observedCatalogToolNamesHash, check?.details?.catalogToolNamesHash);
   });
 
   it("fails desktop evidence whose recorded catalog COUNT is not the shipping one", async () => {
@@ -2989,6 +3023,9 @@ function desktopReport(client: RecruiterClient, overrides: Partial<DesktopReport
     // CURRENT catalog, so a fixture that ignores a catalog change fails exactly like stale evidence.
     catalogToolCount: EXPECTED_CATALOG_TOOL_COUNTS.read_only_full_catalog,
     catalogToolNamesHash: catalogToolNamesHash("read_only_full_catalog"),
+    // The ordered names the tester's client listed. The gate re-hashes THESE and requires the
+    // recorded hash to be theirs, so evidence that records a hash it never observed fails.
+    observedToolNames: [...PILOT_TOOL_NAMES],
     containsTokens: false,
     taskOutcome: "useful",
     taskOutcomeReason: "answer_received",

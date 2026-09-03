@@ -115,14 +115,24 @@ export interface EvidenceReadEnvelope {
    */
   bounds_treated_inclusive?: string[];
   unresolved_scope_rows: number;
-  pages_read: number;
-  per_page: number;
-  pagination_truncated: boolean;
+  /**
+   * What the upstream read COST — pages walked, page size, whether it stopped short, where it would
+   * resume, retries, cache hits.
+   *
+   * Optional because one envelope reports no upstream read at all: the canonical role-gate denial
+   * (`evidence-projection.ts`), which describes the refusal rather than the read behind it. Every
+   * one of these varies with whether the filtered row existed and how many pages it spanned, so a
+   * denied envelope that carried them would answer — in mechanics — the question the gate refuses to
+   * answer in rows. They are present on every real read.
+   */
+  pages_read?: number;
+  per_page?: number;
+  pagination_truncated?: boolean;
   // Resumable cursor when the read was truncated; null when complete. The complete read needs no
   // manual pagination — this is an honest escape hatch for the incomplete case, not the normal path.
-  next_cursor: string | null;
-  rate_limit_retries: number;
-  cache_hits: number;
+  next_cursor?: string | null;
+  rate_limit_retries?: number;
+  cache_hits?: number;
   warnings: string[];
   message?: string;
 }

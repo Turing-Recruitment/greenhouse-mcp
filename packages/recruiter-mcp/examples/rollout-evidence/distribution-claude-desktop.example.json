@@ -58,7 +58,7 @@
     {
       "name": "exact_tool_catalog",
       "status": "pass",
-      "summary": "catalog exactly matched 81 unique approved tools"
+      "summary": "catalog exactly matched 82 unique approved tools"
     },
     {
       "name": "no_write_tools",
