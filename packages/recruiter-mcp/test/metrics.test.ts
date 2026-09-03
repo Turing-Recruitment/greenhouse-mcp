@@ -1,8 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { FactBuildResult, FactCompletenessStatus } from "../src/facts.js";
-import { metricsBlockedByOmittedField, projectEvidenceResult } from "../src/tools/evidence-projection.js";
+import { buildProjectionMetadata, metricsBlockedByOmittedField, projectEvidenceResult } from "../src/tools/evidence-projection.js";
 import { SCOPED_ENDPOINT_ADAPTERS_BY_EVIDENCE_TOOL } from "../src/tools/scoped-endpoint-adapters.js";
+import { getHarvestEndpointByPath } from "../src/harvest-v3-registry.js";
 import type { RecruiterProjectionMetadata } from "../src/types.js";
 import {
   METRIC_REGISTRY,
@@ -257,54 +258,41 @@ describe("metric registry", () => {
 });
 
 // ---------------------------------------------------------------------------
-// H0a: what registering hire_count actually does to the GLOBAL blocks-answer map.
+// H0f: an omitted field blocks a metric only where that metric's field LIVES.
 //
-// METRIC_IDS_BY_REQUIRED_FIELD (evidence-projection.ts) is built from every
-// registered metric's requiredFields and consulted on EVERY endpoint projection:
-// an omitted field that is any metric's required field becomes a blocks_answer
-// omission on that endpoint, whatever the caller was asking for.
-//
-// The first version of this suite locked only the KEY SET and claimed from that
-// that "no endpoint gains a blocks_answer omission". That claim was FALSE, and
-// the test could not see it: buildProjectionMetadata pushes one omission PER
-// METRIC ID, so a projection dropping `status` now emits a hire_count entry
-// beside the five that were already there. What is locked below is therefore the
-// real projection output, and the claim is narrowed to what is true — no new
-// FIELD key, so no endpoint starts blocking on a field it did not block on, and
-// no projection flips from complete to incomplete.
-//
-// The decision to keep `status` anyway is argued at the registry entry
-// (metrics.ts): without it a status-dropping projection yields a confident,
-// complete hire count of ZERO.
+// The blocks-answer map was keyed by FIELD alone and consulted on every
+// endpoint's projection, so a read of /v3/prospect_pools that dropped `status`
+// announced that the scorecard submission rate, the opening fill status, the
+// source-quality breakdown and the weekly pipeline movement were all blocked —
+// four metrics that never touch that endpoint. Every registered metric now
+// declares the endpoint(s) its required fields are read from (the fact builder's
+// own `requiredEndpoints`, one per fact), and the map is keyed by (endpoint,
+// field). Declaring is MANDATORY: an undeclared metric used to fall back to
+// "any endpoint", which is the false-blocker behaviour itself.
 // ---------------------------------------------------------------------------
-describe("METRIC_IDS_BY_REQUIRED_FIELD key set", () => {
-  // Snapshot taken BEFORE hire_count was registered. Adding hire_count must leave
-  // it byte-identical; a diff here means some endpoint projection just started
-  // reporting blocks_answer for a field it never blocked on.
-  const REQUIRED_FIELD_KEYS_BEFORE_HIRE_COUNT = [
-    "application_stage_id",
-    "approval_status",
-    "availability_received_at",
-    "created_at",
-    "days_in_stage",
-    "exited_at",
-    "interviewed_at",
-    "open",
-    "pool_id",
-    "pool_stage_id",
-    "related_post_id",
-    "scheduled_at",
-    "scorecard_id",
-    "source_id",
-    "status",
-    "submitted_at",
-    "tracking_link_id",
-    "type",
-  ];
-
-  function requiredFieldKeys(): string[] {
-    return [...new Set(METRIC_REGISTRY.flatMap((metric) => metric.requiredFields))].sort();
-  }
+describe("metric required-field endpoints", () => {
+  // Each metric's fact builder passes its OWN requiredEndpoints to buildFacts (facts.ts), so this
+  // table is not a guess — it is the endpoint the metric's rows demonstrably come from.
+  const ENDPOINT_BY_METRIC: Record<string, string[]> = {
+    scorecard_submission_rate: ["/v3/scorecards"],
+    scorecard_overdue_rate: ["/v3/scorecards"],
+    interview_feedback_sla_breach_rate: ["/v3/scorecards"],
+    availability_to_scheduled_interview_hours: ["/v3/interviews"],
+    scheduled_interview_to_feedback_hours: ["/v3/scorecards"],
+    stage_conversion_rate: ["/v3/application_stages"],
+    stage_dwell_days: ["/v3/application_stages"],
+    weekly_application_volume: ["/v3/applications"],
+    weekly_qualified_pipeline_movement: ["/v3/applications"],
+    source_quality_by_outcome: ["/v3/applications"],
+    job_post_exposure_by_post: ["/v3/tracking_links"],
+    approval_latency: ["/v3/approval_flows"],
+    prospect_pool_movement: ["/v3/prospect_details"],
+    note_activity_volume: ["/v3/notes"],
+    opening_fill_status: ["/v3/openings"],
+    offer_resolution: ["/v3/offers"],
+    hire_count: ["/v3/offers"],
+    rubric_answer_coverage: ["/v3/scorecard_question_answers"],
+  };
 
   // /v3/prospect_pools documents no `status` response field, so the contract allowlist drops it —
   // a real projection that really omits `status`, not a hand-built stand-in.
@@ -329,7 +317,93 @@ describe("METRIC_IDS_BY_REQUIRED_FIELD key set", () => {
     return projection;
   }
 
-  it("registers hire_count with the single field that adds no new key", () => {
+  it("declares the endpoint its required fields live on for EVERY registered metric", () => {
+    const declared = Object.fromEntries(
+      METRIC_REGISTRY.map((metric) => [metric.id, metric.requiredFieldEndpoints])
+    );
+    assert.deepStrictEqual(
+      declared,
+      ENDPOINT_BY_METRIC,
+      "an undeclared metric falls back to 'any endpoint', which is the false-blocker behaviour itself"
+    );
+    for (const metric of METRIC_REGISTRY) {
+      assert.ok(
+        metric.requiredFieldEndpoints.length > 0,
+        `${metric.id} declares no endpoint, so nothing could ever block it`
+      );
+    }
+  });
+
+  // Endpoint path -> the evidence adapter that projects it. A metric whose declared endpoint has no
+  // adapter could never be projected at all, so its blocker could never fire either.
+  const ADAPTER_BY_ENDPOINT = new Map(
+    [...SCOPED_ENDPOINT_ADAPTERS_BY_EVIDENCE_TOOL.values()].map((adapter) => [adapter.endpointPath, adapter])
+  );
+
+  // The POSITIVE half of the guarantee, and the half nothing checked: each blocker actually FIRES.
+  //
+  // `requiredFields` was naming FACT fields for four metrics — `scorecard_id`,
+  // `application_stage_id`, `tracking_link_id` — which the builders DERIVE from the row's `id`
+  // (facts.ts), and a phantom `status` for opening_fill_status that /v3/openings does not document
+  // at all. The projection compares SOURCE-ROW keys, so those blockers could never fire on a real
+  // row: a silent miss, the exact opposite failure to the false blockers item 9 removed, and one
+  // the endpoint fix alone would have left in place.
+  it("fires each metric's blocks_answer omission when its own endpoint really drops the field", () => {
+    for (const metric of METRIC_REGISTRY) {
+      for (const endpointPath of metric.requiredFieldEndpoints) {
+        const adapter = ADAPTER_BY_ENDPOINT.get(endpointPath);
+        assert.ok(
+          adapter,
+          `${metric.id} declares ${endpointPath}, which no evidence adapter projects — its blocker could never fire`
+        );
+        const documented = (getHarvestEndpointByPath(endpointPath)?.responseFields ?? []).map((field) => field.name);
+        assert.ok(documented.length > 0, `${endpointPath} must be in the vendored Harvest contract`);
+        for (const field of metric.requiredFields) {
+          assert.ok(
+            documented.includes(field),
+            `${metric.id} requires "${field}" from ${endpointPath}, but the contract documents no such RESPONSE field — a projection can never drop it, so this blocker can never fire`
+          );
+          // A real row for this endpoint, and the same row with exactly this field dropped: the
+          // shape production hands buildProjectionMetadata when a projection really omits a field.
+          const source = [Object.fromEntries(documented.map((name) => [name, 1]))];
+          const projected = [Object.fromEntries(documented.filter((name) => name !== field).map((name) => [name, 1]))];
+          const projection = buildProjectionMetadata(adapter!, source, projected);
+          assert.ok(
+            projection.requiredFieldOmissions.some((omission) =>
+              omission.metricOrFact === metric.id
+              && omission.field === field
+              && omission.endpointPath === endpointPath
+              && omission.impact === "blocks_answer"
+            ),
+            `dropping ${field} from a ${endpointPath} projection must block ${metric.id}, got ${JSON.stringify(projection.requiredFieldOmissions)}`
+          );
+        }
+      }
+    }
+  });
+
+  it("attaches each metric's blocker ONLY on its own endpoint", () => {
+    for (const metric of METRIC_REGISTRY) {
+      for (const field of metric.requiredFields) {
+        for (const endpoint of metric.requiredFieldEndpoints) {
+          assert.ok(
+            metricsBlockedByOmittedField(endpoint, field).includes(metric.id),
+            `${metric.id} must be blocked by a projection dropping ${field} from ${endpoint}`
+          );
+        }
+        // Every OTHER registered endpoint must be silent about this metric.
+        for (const other of new Set(Object.values(ENDPOINT_BY_METRIC).flat())) {
+          if (metric.requiredFieldEndpoints.includes(other)) continue;
+          assert.ok(
+            !metricsBlockedByOmittedField(other, field).includes(metric.id),
+            `${metric.id} must NOT be blocked by a projection of ${other}, which it never reads`
+          );
+        }
+      }
+    }
+  });
+
+  it("registers hire_count with the field whose absence would fabricate a zero", () => {
     const hireCount = METRIC_REGISTRY_BY_ID.get("hire_count");
     assert.ok(hireCount, "hire_count must be registered");
     assert.deepStrictEqual(hireCount!.requiredFields, ["status"]);
@@ -337,24 +411,7 @@ describe("METRIC_IDS_BY_REQUIRED_FIELD key set", () => {
     assert.deepStrictEqual(hireCount!.requiredFacts, ["hire_fact"]);
   });
 
-  it("adds no field key to the global blocks-answer map", () => {
-    assert.deepStrictEqual(
-      requiredFieldKeys(),
-      REQUIRED_FIELD_KEYS_BEFORE_HIRE_COUNT,
-      "a new key here makes some endpoint projection start blocking on a field it never blocked on"
-    );
-    assert.ok(
-      REQUIRED_FIELD_KEYS_BEFORE_HIRE_COUNT.includes("status"),
-      "hire_count's only required field was already a key, so its metric id joins an existing entry"
-    );
-  });
-
-  // An omission blocks a metric only where that metric's field actually LIVES. The map used to be
-  // keyed by field alone and consulted on every endpoint, so dropping `status` from
-  // /v3/prospect_pools — an endpoint carrying no offers at all — announced that the HIRE COUNT was
-  // blocked. That is a false blocker on a read that was fine, and it is exactly the kind of
-  // disclosure noise that teaches an operator to ignore disclosures.
-  it("does NOT attach the offer metrics to a prospect_pools projection that drops status", () => {
+  it("emits NO blocks-answer omission on a prospect_pools projection that drops status", () => {
     const projection = statusOmittingProjection();
     assert.deepStrictEqual(
       projection.omittedFields.map((omission) => omission.field),
@@ -363,28 +420,38 @@ describe("METRIC_IDS_BY_REQUIRED_FIELD key set", () => {
     );
     assert.deepStrictEqual(
       projection.requiredFieldOmissions.map((omission) => omission.metricOrFact).sort(),
-      // Exact equality, not `includes`: an implementation that attaches everything would satisfy
-      // any "these are present" assertion while still emitting the false hire_count blocker.
-      ["opening_fill_status", "scorecard_submission_rate", "source_quality_by_outcome", "weekly_qualified_pipeline_movement"],
-      "the offer metrics read /v3/offers, so a prospect-pool projection cannot block them"
-    );
-    assert.deepStrictEqual(
-      [...new Set(projection.requiredFieldOmissions.map((omission) => omission.field))],
-      ["status"],
-      "no field other than the one omitted is implicated"
+      [],
+      "no registered metric reads status from /v3/prospect_pools, so nothing there blocks an answer"
     );
   });
 
-  it("DOES attach them where the field lives — /v3/offers", () => {
+  it("DOES attach the offer metrics where their field lives — /v3/offers", () => {
     assert.deepStrictEqual(
       metricsBlockedByOmittedField("/v3/offers", "status").sort(),
-      ["hire_count", "offer_resolution", "opening_fill_status", "scorecard_submission_rate", "source_quality_by_outcome", "weekly_qualified_pipeline_movement"],
+      ["hire_count", "offer_resolution"],
       "a projection that drops status from the OFFER rows really does block the hire count"
     );
+    assert.deepStrictEqual(metricsBlockedByOmittedField("/v3/prospect_pools", "status"), []);
     assert.deepStrictEqual(
-      metricsBlockedByOmittedField("/v3/prospect_pools", "status").sort(),
-      ["opening_fill_status", "scorecard_submission_rate", "source_quality_by_outcome", "weekly_qualified_pipeline_movement"]
+      metricsBlockedByOmittedField("/v3/applications", "status").sort(),
+      ["source_quality_by_outcome", "weekly_qualified_pipeline_movement"],
+      "the same field on the applications rows blocks the applications metrics and nothing else"
+    );
+    assert.deepStrictEqual(
+      metricsBlockedByOmittedField("/v3/scorecards", "status"),
+      ["scorecard_submission_rate"]
+    );
+    assert.deepStrictEqual(
+      metricsBlockedByOmittedField("/v3/openings", "open"),
+      ["opening_fill_status"],
+      "the opening fill status turns on `open` and `closed_at`, which is what a projection could drop"
+    );
+    assert.deepStrictEqual(
+      metricsBlockedByOmittedField("/v3/openings", "status"),
+      [],
+      "/v3/openings documents no `status` response field, so nothing there can be blocked by its absence"
     );
     assert.deepStrictEqual(metricsBlockedByOmittedField("/v3/offers", "candidate_id"), [], "a field no metric requires blocks nothing");
+    assert.deepStrictEqual(metricsBlockedByOmittedField("/offers", "status"), [], "endpoint paths are matched verbatim, never by alias");
   });
 });

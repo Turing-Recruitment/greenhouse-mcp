@@ -9,7 +9,7 @@ import type {
 } from "../types.js";
 import { readApplicationJobId } from "./application-shapes.js";
 import type { EvidenceEndpointAdapter } from "./scoped-endpoint-adapters.js";
-import { METRIC_REGISTRY, METRIC_REGISTRY_BY_ID } from "../metrics.js";
+import { METRIC_REGISTRY } from "../metrics.js";
 import {
   isForbiddenEvidencePayloadKey,
   looksLikeSensitiveEvidenceString,
@@ -435,16 +435,20 @@ function isGlobalPiiFieldName(key: string): boolean {
 }
 
 // Single source of truth for "this omitted field would block a real metric": the registered
-// metrics' requiredFields. Prior code cited facts that don't exist (candidate_profile_fact,
-// rejection_reason_fact, job_org_dimension) or that never read the field (scorecard_fact.notes,
-// note_activity_fact.body), so honest reads were falsely flagged incomplete. Field -> metric ids.
-const METRIC_IDS_BY_REQUIRED_FIELD: ReadonlyMap<string, string[]> = (() => {
+// metrics' requiredFields, keyed by the ENDPOINT each metric reads them from. Prior code cited
+// facts that don't exist (candidate_profile_fact, rejection_reason_fact, job_org_dimension) or
+// that never read the field (scorecard_fact.notes, note_activity_fact.body), so honest reads were
+// falsely flagged incomplete. (endpoint, field) -> metric ids.
+const METRIC_IDS_BY_ENDPOINT_FIELD: ReadonlyMap<string, string[]> = (() => {
   const map = new Map<string, string[]>();
   for (const metric of METRIC_REGISTRY) {
-    for (const field of metric.requiredFields) {
-      const ids = map.get(field) ?? [];
-      ids.push(metric.id);
-      map.set(field, ids);
+    for (const endpointPath of metric.requiredFieldEndpoints) {
+      for (const field of metric.requiredFields) {
+        const key = `${endpointPath}\u0000${field}`;
+        const ids = map.get(key) ?? [];
+        ids.push(metric.id);
+        map.set(key, ids);
+      }
     }
   }
   return map;
@@ -453,22 +457,19 @@ const METRIC_IDS_BY_REQUIRED_FIELD: ReadonlyMap<string, string[]> = (() => {
 /**
  * Which registered metrics an omitted field actually BLOCKS on THIS endpoint.
  *
- * The map above is keyed by field alone, and it was consulted on every endpoint's projection, so a
+ * The map used to be keyed by field ALONE and consulted on every endpoint's projection, so a
  * projection that dropped `status` from `/v3/prospect_pools` — an endpoint that carries no offers
  * at all — announced that the HIRE COUNT could not be answered. A false blocker on a read that was
  * fine is how an operator learns to ignore the disclosure block, which costs more than the noise.
  *
- * A metric that declares `requiredFieldEndpoints` is only implicated on those endpoints. A metric
- * that declares none keeps the previous field-only behaviour: that is not timidity, it is the
- * absence of evidence — nobody has yet established which endpoint each of those metrics' fields is
- * read from, and inventing the mapping here would trade a false blocker for a MISSING one, which is
- * the worse direction. The two offer metrics are declared because their endpoint is known.
+ * There is no field-global fallback any more. Every metric declares the endpoint its required
+ * fields are read from — its single fact builder's own `requiredEndpoints` (facts.ts) — so the
+ * "we don't know, assume everywhere" branch has nothing left to serve and is gone. Endpoint paths
+ * are matched VERBATIM: `/offers` is not `/v3/offers`, and every production caller is a canonical
+ * registry adapter.
  */
 export function metricsBlockedByOmittedField(endpointPath: string, field: string): string[] {
-  return (METRIC_IDS_BY_REQUIRED_FIELD.get(field) ?? []).filter((metricId) => {
-    const endpoints = METRIC_REGISTRY_BY_ID.get(metricId)?.requiredFieldEndpoints;
-    return endpoints === undefined || endpoints.includes(endpointPath);
-  });
+  return METRIC_IDS_BY_ENDPOINT_FIELD.get(`${endpointPath}\u0000${field}`) ?? [];
 }
 
 /**
@@ -1104,7 +1105,16 @@ function projectJobNoteRow(row: Record<string, unknown>): Record<string, unknown
   return projected;
 }
 
-function buildProjectionMetadata(
+/**
+ * The omission manifest for one projection: what the source row carried, what the projection kept,
+ * and which registered metrics the difference blocks.
+ *
+ * Exported so the blocker wiring can be tested at the level it actually runs — a real adapter, a
+ * real row, one field really absent from the projected copy. Asserting `metricsBlockedByOmittedField`
+ * alone proved the map and not the manifest, which is how four metrics kept naming fact fields the
+ * source row never carries: blockers that could never fire on real data.
+ */
+export function buildProjectionMetadata(
   adapter: EvidenceEndpointAdapter,
   sourceData: unknown,
   projectedData: unknown,

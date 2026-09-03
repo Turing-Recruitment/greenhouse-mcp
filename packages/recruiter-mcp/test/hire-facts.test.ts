@@ -766,3 +766,240 @@ describe("H-cost readHireSet — upstream read cost for an org-wide hire read", 
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// H1d: what "this row carries a date" means, and where the window's edges are.
+//
+// Three defects the fold-3 attack found in one helper: a malformed primary date
+// suppressed a valid fallback one while the read still read as complete; an
+// EXCLUSIVE lower bound was expanded to the end of its day, so a timestamp after
+// the boundary was excluded through the whole of that day; and the missing-date
+// count from every supplemental leg was computed and thrown away.
+// ---------------------------------------------------------------------------
+describe("H1d readAllWithDateFallback — parseable dates, exclusive bounds, honest missing counts", () => {
+  it("dates a hire from sent_on when resolved_at is present but unparseable", async () => {
+    // `isPresentString` accepted any non-empty string, so "garbage" read as a date, lost the
+    // string comparison against the window's upper bound and dropped the row — silently, because
+    // the row HAD a value in the primary field so it never counted as missing either.
+    const reader = fakeScopedReader((toolName, params) => {
+      if (Object.keys(params ?? {}).some((key) => /\[(gte|lte|gt|lt)\]$/.test(key))) {
+        throw new Error("Greenhouse API error: 422 Unprocessable Entity (/offers) [correlation_id=test]");
+      }
+      return scopedSuccess(toolName, [
+        offerRow(1),
+        offerRow(8, { resolved_at: "garbage", sent_on: "2026-05-05" }),
+      ]);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "rows");
+    if (result.kind !== "rows") return;
+    assert.deepStrictEqual(
+      result.hires.map((row) => row.id),
+      [1, 8],
+      "an unparseable resolved_at is not a date, so the declared sent_on fallback places the row"
+    );
+    assert.equal(result.read.rowsMissingField, 0, "the row was placed on a clock, so nothing is missing");
+  });
+
+  it("recovers the sent_on-only leg's rows past an unparseable primary date", async () => {
+    // The structural-disjointness check has the same definition of "present": a row whose
+    // resolved_at is junk could never have come back from the resolved_at leg, so the sent_on leg
+    // is the only place it can be recovered from.
+    const reader = fakeScopedReader((toolName, params) => {
+      if (params?.["sent_on[gte]"] !== undefined) {
+        return scopedSuccess(toolName, [
+          offerRow(8, { resolved_at: "garbage", sent_on: "2026-05-05" }),
+          offerRow(1),
+        ]);
+      }
+      return scopedSuccess(toolName, [offerRow(1)]);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "rows");
+    if (result.kind !== "rows") return;
+    assert.deepStrictEqual(
+      result.hires.map((row) => row.id),
+      [1, 8],
+      "the row the primary filter structurally could not return is recovered exactly once"
+    );
+  });
+
+  it("treats an exclusive lower bound as an instant, not as the end of its day", async () => {
+    // `gt` was routed through the INCLUSIVE upper-bound expansion, so gt:"2026-05-01" excluded
+    // everything up to 2026-05-01T23:59:59.999Z — a whole day of rows the caller asked for.
+    const reader = fakeScopedReader((toolName, params) => {
+      if (Object.keys(params ?? {}).some((key) => /\[(gte|lte|gt|lt)\]$/.test(key))) {
+        throw new Error("Greenhouse API error: 422 Unprocessable Entity (/offers) [correlation_id=test]");
+      }
+      return scopedSuccess(toolName, [
+        { id: 1, job_id: 10, status: "Accepted", resolved_at: "2026-05-01T12:00:00.000Z" },
+        { id: 2, job_id: 10, status: "Accepted", resolved_at: "2026-05-01T00:00:00.000Z" },
+      ]);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const outcome = await readAllWithDateFallback(
+      runtime,
+      "test_tool",
+      "list_offers",
+      { "resolved_at[gt]": "2026-05-01" },
+      [{ field: "resolved_at", gt: "2026-05-01" }]
+    );
+
+    assert.equal(outcome.read.kind, "rows");
+    if (outcome.read.kind !== "rows") return;
+    assert.deepStrictEqual(
+      outcome.read.rows.map((row) => row.id),
+      [1],
+      "12:00 on the bound date is AFTER the exclusive bound; midnight exactly is not"
+    );
+  });
+
+  it("keeps an inclusive upper bound end-of-day for a date-only value", async () => {
+    const reader = fakeScopedReader((toolName, params) => {
+      if (Object.keys(params ?? {}).some((key) => /\[(gte|lte|gt|lt)\]$/.test(key))) {
+        throw new Error("Greenhouse API error: 422 Unprocessable Entity (/offers) [correlation_id=test]");
+      }
+      return scopedSuccess(toolName, [
+        { id: 1, job_id: 10, status: "Accepted", resolved_at: "2026-05-01T12:00:00.000Z" },
+        { id: 2, job_id: 10, status: "Accepted", resolved_at: "2026-05-02T00:00:00.001Z" },
+      ]);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const outcome = await readAllWithDateFallback(
+      runtime,
+      "test_tool",
+      "list_offers",
+      { "resolved_at[lte]": "2026-05-01" },
+      [{ field: "resolved_at", lte: "2026-05-01" }]
+    );
+
+    assert.equal(outcome.read.kind, "rows");
+    if (outcome.read.kind !== "rows") return;
+    assert.deepStrictEqual(outcome.read.rows.map((row) => row.id), [1], "a timestamp ON the lte date stays in window");
+  });
+
+  it("carries the supplemental leg's missing-date count into the outcome", async () => {
+    // The sent_on leg 422s, so its own bracket-free re-read returns the whole scoped set — and one
+    // of those rows carries NEITHER clock. It is excluded, and before this the exclusion was
+    // computed on the leg and dropped on the floor: the outer outcome hardcoded zero.
+    const reader = fakeScopedReader((toolName, params) => {
+      if (params?.["sent_on[gte]"] !== undefined) {
+        throw new Error("Greenhouse API error: 422 Unprocessable Entity (/offers) [correlation_id=test]");
+      }
+      if (params?.["resolved_at[gte]"] !== undefined) return scopedSuccess(toolName, [offerRow(1)]);
+      return scopedSuccess(toolName, [
+        offerRow(1),
+        offerRow(4, { resolved_at: undefined, sent_on: "2026-05-05" }),
+        offerRow(5, { resolved_at: undefined, sent_on: undefined }),
+      ]);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const outcome = await readAllWithDateFallback(
+      runtime,
+      "test_tool",
+      "list_offers",
+      { "resolved_at[gte]": WINDOW.start, "resolved_at[lte]": WINDOW.end },
+      [{ field: "resolved_at", fallbackFields: ["sent_on"], gte: WINDOW.start, lte: WINDOW.end }]
+    );
+
+    assert.equal(outcome.read.kind, "rows");
+    if (outcome.read.kind !== "rows") return;
+    assert.deepStrictEqual(outcome.read.rows.map((row) => row.id), [1, 4]);
+    assert.equal(outcome.rowsMissingField, 1, "the row with neither clock is counted by the leg that found it");
+  });
+
+  it("does not count a row the PRIMARY leg already dated as missing on the fallback leg", async () => {
+    // The leg's own local window drops every row without sent_on, including the ones the primary
+    // field dates perfectly well. Folding that raw number up would report most of the scoped set as
+    // undatable; only the rows this leg was responsible for count.
+    const reader = fakeScopedReader((toolName, params) => {
+      if (params?.["sent_on[gte]"] !== undefined) {
+        throw new Error("Greenhouse API error: 422 Unprocessable Entity (/offers) [correlation_id=test]");
+      }
+      if (params?.["resolved_at[gte]"] !== undefined) return scopedSuccess(toolName, [offerRow(1, { sent_on: undefined })]);
+      return scopedSuccess(toolName, [offerRow(1, { sent_on: undefined })]);
+    });
+    const { runtime } = testRuntime(reader);
+
+    const outcome = await readAllWithDateFallback(
+      runtime,
+      "test_tool",
+      "list_offers",
+      { "resolved_at[gte]": WINDOW.start, "resolved_at[lte]": WINDOW.end },
+      [{ field: "resolved_at", fallbackFields: ["sent_on"], gte: WINDOW.start, lte: WINDOW.end }]
+    );
+
+    assert.equal(outcome.rowsMissingField, 0, "a row the primary clock places is not this leg's missing row");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H5b: a REQUESTED enrichment that failed is not the same as one nobody asked
+// for. Both leave the field unset; only the first one makes the set short, and
+// only the first one may make a status incomplete.
+// ---------------------------------------------------------------------------
+describe("H5b readHireSet — a requested enrichment that failed says so in a status", () => {
+  function reader500(failing: "chain" | "candidates") {
+    return fakeScopedReader((toolName, params) => {
+      if (toolName === "list_offers" && params?.current_only === false) {
+        if (failing === "chain") throw new Error("Greenhouse API error: 500 Internal Server Error (/offers) [correlation_id=test]");
+        return scopedSuccess(toolName, [offerRow(1)]);
+      }
+      if (toolName === "list_offers") return scopedSuccess(toolName, [offerRow(1)]);
+      if (toolName === "list_candidates") {
+        if (failing === "candidates") throw new Error("Greenhouse API error: 500 Internal Server Error (/candidates) [correlation_id=test]");
+        return scopedSuccess(toolName, [{ id: 1001, first_name: "Ada" }]);
+      }
+      throw new Error(`unexpected scoped tool ${toolName}`);
+    });
+  }
+
+  it("reports a requested chain read that failed as incomplete_upstream, not as unread", async () => {
+    const { runtime } = testRuntime(reader500("chain"));
+
+    const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {
+      includeChain: true,
+    });
+
+    assert.equal(result.kind, "rows");
+    if (result.kind !== "rows") return;
+    assert.equal(result.chain, undefined, "no rows are invented for a read that failed");
+    assert.equal(result.chainRead?.status, "incomplete_upstream", "a requested read that failed carries a status");
+    assert.equal(result.chainRead?.complete, false);
+    assert.equal(result.read.complete, true, "the HIRE read itself completed and still says so");
+  });
+
+  it("reports a requested candidate bridge that failed as incomplete_upstream", async () => {
+    const { runtime } = testRuntime(reader500("candidates"));
+
+    const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {
+      includeCandidates: true,
+    });
+
+    assert.equal(result.kind, "rows");
+    if (result.kind !== "rows") return;
+    assert.equal(result.candidates, undefined);
+    assert.equal(result.candidatesRead?.status, "incomplete_upstream");
+  });
+
+  it("leaves an enrichment NOBODY asked for with no status at all", async () => {
+    const { runtime } = testRuntime(reader500("chain"));
+
+    const result = await readHireSet(runtime, "test_tool", { label: "everything you can see" }, WINDOW, undefined, {});
+
+    assert.equal(result.kind, "rows");
+    if (result.kind !== "rows") return;
+    assert.equal(result.chainRead, undefined, "not asked for is not incomplete");
+    assert.equal(result.candidatesRead, undefined);
+    assert.equal(result.read.complete, true);
+  });
+});

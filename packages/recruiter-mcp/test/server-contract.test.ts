@@ -159,6 +159,37 @@ describe("recruiter MCP server contract", () => {
     assert.equal("email" in applicationSchema, false);
   });
 
+  // Fold-3 item 5: the REGISTERED schema is the boundary a model actually hits, and it admitted
+  // every present-but-empty scope carrier — a blank scope_handle, an empty greenhouse_job_ids —
+  // straight through to a planner that then answered permission-wide. Rejecting them here is what
+  // makes the handler check a second line of defence rather than the only one.
+  it("rejects a present-but-empty scope carrier at the registered schema", () => {
+    const scopedReader = fakeScopedReader((toolName) => scopedSuccess(toolName, []));
+    const { runtime } = testRuntime(scopedReader);
+    const schemas = new Map<string, Record<string, unknown>>();
+    registerRecruiterTools({
+      tool(name: string, _description: string, paramsSchema: Record<string, unknown>) {
+        schemas.set(name, paramsSchema);
+      },
+    } as any, runtime);
+
+    const planner = schemas.get("answer_my_recruiting_question");
+    assert.ok(planner, "the planner must be registered");
+    const check = (key: string, value: unknown) =>
+      (planner![key] as { safeParse: (input: unknown) => { success: boolean } }).safeParse(value).success;
+
+    assert.equal(check("scope_handle", ""), false, "a blank scope_handle names no scope");
+    assert.equal(check("scope_handle", "   "), false, "nor does a whitespace one");
+    assert.equal(check("scope_handle", null), false);
+    assert.equal(check("scope_handle", "signed-handle"), true, "a real handle still passes");
+    assert.equal(check("scope_handle", undefined), true, "and absent is still absent");
+    assert.equal(check("greenhouse_job_ids", []), false, "an empty id list is a named scope of zero");
+    assert.equal(check("greenhouse_job_ids", [9001006]), true);
+    assert.equal(check("greenhouse_job_ids", undefined), true);
+    assert.equal(check("requisition_ids", []), false);
+    assert.equal(check("requisition_ids", ["REQ-1"]), true);
+  });
+
   it("does not advertise unsupported resolver match modes", () => {
     const scopedReader = fakeScopedReader((toolName) => scopedSuccess(toolName, []));
     const { runtime } = testRuntime(scopedReader);

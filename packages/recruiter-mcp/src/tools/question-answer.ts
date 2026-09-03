@@ -1,4 +1,5 @@
 import {
+  explicitAnalysisWindowError,
   HARD_MAX_ANALYSIS_DURATION_MS,
   HARD_MAX_TOOL_DURATION_MS,
   HIRE_FACTS_ID_BRIDGE_READ_PARAM_NAMES,
@@ -314,6 +315,16 @@ export async function runRecruitingQuestionAnswer(
 
   const missingDomain = detectMissingDomain(question);
   if (missingDomain) {
+    // The recipes' own validator, on this path too (limits.ts). The planned-domain path read the
+    // bounds through key presence and a bare Date.parse, so a blank bound silently became an
+    // all-time answer and a start after an end became a complete zero — a different answer to the
+    // same request depending on which path the question routed to.
+    const windowError = explicitAnalysisWindowError(params);
+    if (windowError) {
+      const result = deny(toolName, "INVALID_REQUEST", windowError);
+      const auditDenied = await emitPlannerAudit(runtime, startedAt, correlationId, result, null, null, actAsUser);
+      return auditDenied ?? result;
+    }
     // T3.2 (audit C-CORE): detectMissingDomain already maps the question to facts + endpoints +
     // metric — the planner in embryo. When the domain's read/fact/metric bindings exist, EXECUTE
     // the plan (read scoped rows -> build facts -> compute the metric) instead of dead-ending at
@@ -796,6 +807,16 @@ interface PlannedDomainBinding {
    */
   outstandingWithoutWindowField?: (fact: Record<string, unknown>) => boolean;
   /**
+   * The fact field whose VERBATIM value classifies a row the window could not place.
+   *
+   * A row with no window timestamp still HAS a class, and dropping it before the metric ever saw
+   * it is what made the offer mix contradict itself: the outstanding count came back into `groups`
+   * while the metric's `total` had never counted it, so a group of three sat under an omission
+   * that said zero were unresolved — and an unrecognized status with no timestamp skipped its own
+   * disclosure entirely. Classifying happens BEFORE removal, and the counts travel to the metric.
+   */
+  undatedClassField?: string;
+  /**
    * Open the answer with the hire reconciliation line's two cheap counts. Offers only: the accepted
    * count and the "how many of those applications does Greenhouse actually call hired" count come
    * from the read already in hand plus ONE bridged applications read. The third count (openings
@@ -826,6 +847,7 @@ const PLANNED_DOMAIN_BINDINGS: ReadonlyMap<string, PlannedDomainBinding> = new M
     readParams: { current_only: true },
     readParamNames: HIRE_FACTS_OFFER_READ_PARAM_NAMES,
     outstandingWithoutWindowField: isOutstandingOffer,
+    undatedClassField: "status",
     reconcileHires: true,
   }],
 ]);
@@ -982,6 +1004,7 @@ async function executePlannedDomain(
   // month" in the sentence silently became June and dropped the May rows the caller asked for.
   // A one-sided bound is honored as one-sided: the missing side is simply unbounded.
   const bounds = plannedDomainBounds(appliedTimeWindow);
+  const undatedByClass: Record<string, number> = {};
   if (bounds) {
     if (binding.factWindowField) {
       let missingTimestamp = 0;
@@ -994,6 +1017,14 @@ async function executePlannedDomain(
           // offer that has not resolved YET. The binding says which, and the count reaches the
           // metric so it can be surfaced instead of disappearing into missingTimestamp.
           if (binding.outstandingWithoutWindowField?.(fact)) offersOutstanding += 1;
+          // Classified HERE, before the row is removed, and by its own verbatim value: the metric
+          // is the only place that knows what each class does to a total, a group and a rate, and
+          // it cannot classify a row it never receives.
+          if (binding.undatedClassField) {
+            const value = fact[binding.undatedClassField];
+            const key = typeof value === "string" && value.trim().length > 0 ? value : "unknown";
+            undatedByClass[key] = (undatedByClass[key] ?? 0) + 1;
+          }
           return false;
         }
         return at >= bounds.startMs && at <= bounds.endMs;
@@ -1001,7 +1032,11 @@ async function executePlannedDomain(
       scopedFactResult = { ...scopedFactResult, facts } as FactBuildResult<unknown>;
       omissions.push(
         `Time window applied (${bounds.label}): ${bounds.startLabel} to ${bounds.endLabel} on ${binding.factWindowField}` +
-          (missingTimestamp > 0 ? `; ${missingTimestamp} row(s) without a ${binding.factWindowField} excluded.` : ".")
+          (missingTimestamp === 0
+            ? "."
+            : binding.undatedClassField
+              ? `; ${missingTimestamp} row(s) carry no ${binding.factWindowField}, so the window cannot place them — they are outside the rate and counted in the mix by their ${binding.undatedClassField}.`
+              : `; ${missingTimestamp} row(s) without a ${binding.factWindowField} excluded.`)
       );
     } else {
       omissions.push(
@@ -1027,6 +1062,7 @@ async function executePlannedDomain(
             privacyWithheld: read.privacyWithheld,
             permissionExcluded: read.permissionExcluded,
             offersOutstanding,
+            statusesWithoutWindowField: undatedByClass,
             supersededVersionsRead: false,
           },
         }
@@ -1079,6 +1115,10 @@ async function executePlannedDomain(
       // OPTIONAL second population — a lead sentence, not the metric — could not be read. The lead
       // reduces to the count that was actually made, and the failure is named.
       reconciliationLead = `${accepted.length} accepted current offers.`;
+      // A population this answer ASKED for and did not get. The metric stands, but the envelope
+      // must not say the answer is complete: `complete` used to be published from the offer read
+      // alone, so a failed bridge left a complete verdict over half a reconciliation.
+      answerStatuses.push("incomplete_upstream");
       omissions.push(
         `How many of those applications Greenhouse marks hired could not be read (${bridged.result.ok === false ? bridged.result.denial.code : "UNKNOWN"}), so that half of the reconciliation is not reported. The accepted-offer count and the rate below it stand: they come from a read that completed.`
       );
@@ -1174,10 +1214,14 @@ async function executePlannedDomain(
         ].filter((part): part is string => Boolean(part)).join(" "),
         metric,
         read: {
-          complete: read.complete,
-          status: read.status,
+          // The ANSWER's completeness, over every read it used — not the offer read's alone.
+          complete: answerStatus === "complete",
+          status: answerStatus,
           pages_read: read.pagesRead,
           rows_returned: read.rows.length,
+          // The offer read's own verdict, kept and LABELLED as its own so the two can never be
+          // read for each other again.
+          offer_read: { complete: read.complete, status: read.status },
         },
         omissions: [...omissions, ...metric.omissions],
       },
@@ -1531,12 +1575,59 @@ type PlannerScopeOutcome =
   | { ok: true; kind: "empty_scope"; header: AnalysisContextHeader | null; message: string }
   | { ok: false; code: RecruiterDenialCode; message: string };
 
+/**
+ * Every explicit scope carrier this tool accepts, and what "the caller named a scope" means for it.
+ *
+ * PRESENT-BUT-EMPTY is a named scope of zero, and it is rejected. `job_ids: []` was fixed and its
+ * siblings were not: the planner recognized `scope_handle` and `greenhouse_job_ids` only when
+ * NON-EMPTY, so `{scope_handle: "   "}` and `{greenhouse_job_ids: []}` skipped scope resolution
+ * entirely and were answered across everything the actor's Greenhouse permissions reach. A scope
+ * the caller named must never be replaced by a wider one they did not.
+ *
+ * ABSENT (undefined, or the MCP-schema-rejected null) is not empty — it means "whatever my
+ * permissions reach", and it still answers.
+ */
+const PLANNER_SCOPE_CARRIERS: ReadonlyArray<{ key: string; usable: (value: unknown) => boolean; expected: string }> = [
+  {
+    key: "scope_handle",
+    usable: (value) => typeof value === "string" && value.trim().length > 0,
+    expected: "a signed scope_handle from resolve_job_scope/confirm_job_scope",
+  },
+  {
+    key: "greenhouse_job_ids",
+    usable: (value) => Array.isArray(value) && numberArray(value).length > 0,
+    expected: "at least one positive Greenhouse job id",
+  },
+  {
+    key: "requisition_ids",
+    usable: (value) => Array.isArray(value) && stringArray(value).length > 0,
+    expected: "at least one non-blank requisition id",
+  },
+];
+
+function emptyScopeCarrierError(params: Record<string, unknown>): PlannerScopeOutcome | null {
+  for (const carrier of PLANNER_SCOPE_CARRIERS) {
+    const value = params[carrier.key];
+    if (value === undefined || value === null) continue;
+    if (carrier.usable(value)) continue;
+    return {
+      ok: false,
+      code: "INVALID_REQUEST",
+      message: `${carrier.key} was passed but names no scope. Pass ${carrier.expected}, or omit ${carrier.key} to answer across every job your Greenhouse permissions return.`,
+    };
+  }
+  return null;
+}
+
 async function resolvePlannerScope(
   runtime: RecruiterToolRuntime,
   question: string,
   params: Record<string, unknown>,
   deadline: ToolDeadline | undefined
 ): Promise<PlannerScopeOutcome> {
+  // Before ANY read, including the job-inventory load the default scope needs.
+  const emptyCarrier = emptyScopeCarrierError(params);
+  if (emptyCarrier) return emptyCarrier;
   const scopeHandle = typeof params.scope_handle === "string" && params.scope_handle.trim().length > 0
     ? params.scope_handle.trim()
     : null;

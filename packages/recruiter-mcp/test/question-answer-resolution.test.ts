@@ -894,3 +894,161 @@ describe("answer_my_recruiting_question — org-wide default (CLO-274)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Fold-3 item 5: EVERY explicit scope carrier, not just job_ids.
+//
+// `job_ids: []` was fixed and the sibling carriers were not: the planner
+// recognized `scope_handle` and `greenhouse_job_ids` only when NON-EMPTY, so
+// `{scope_handle: "   "}` and `{greenhouse_job_ids: []}` fell through to
+// default-scope resolution and answered permission-wide — a scope the caller
+// named being replaced by a wider one it did not.
+// ---------------------------------------------------------------------------
+describe("answer_my_recruiting_question — a present-but-empty scope carrier is rejected, never widened", () => {
+  for (const [label, params] of [
+    ["a blank scope_handle", { scope_handle: "" }],
+    ["a whitespace scope_handle", { scope_handle: "   " }],
+    ["a non-string scope_handle", { scope_handle: 0 }],
+    ["an empty greenhouse_job_ids", { greenhouse_job_ids: [] }],
+    ["a greenhouse_job_ids of only unusable ids", { greenhouse_job_ids: [0] }],
+    ["an empty requisition_ids", { requisition_ids: [] }],
+    ["a requisition_ids of only blanks", { requisition_ids: ["  "] }],
+    ["a whitespace job_ids", { job_ids: "   " }],
+    ["a zero job_ids", { job_ids: "0" }],
+  ] as const) {
+    it(`rejects ${label} on the planned-domain path instead of answering permission-wide`, async () => {
+      const reader = fakeScopedReader((toolName) => {
+        throw new Error(`an explicitly empty scope carrier must read nothing (called ${toolName})`);
+      });
+      const { runtime } = testRuntime(reader, {
+        scopeSigner: signer,
+        jobInventory: createFixtureInventoryProvider(fixture, "narrow_recruiter"),
+      });
+
+      const result = await runRecruitingQuestionAnswer(runtime, {
+        question: "What is our offer acceptance rate this month?",
+        ...params,
+      });
+
+      assert.equal(result.ok, false, "a named-but-empty scope is an error, never a permission-wide answer");
+      assert.equal(result.ok === false && result.denial.code, "INVALID_REQUEST");
+      assert.deepStrictEqual(reader.calls.map((call) => call.toolName), [], "and it costs no upstream read");
+    });
+  }
+
+  it("still answers permission-wide when NO scope carrier is present at all", async () => {
+    // The other half of the rule, and the one that stops the fix from becoming a fail-closed:
+    // absent is not empty, and an unscoped question is still answered over everything the actor's
+    // Greenhouse permissions reach.
+    const reader = fakeScopedReader((toolName) => scopedSuccess(toolName, [
+      { id: 1, job_id: 9001006, application_id: 101, status: "Accepted", resolved_at: "2026-06-05T10:00:00.000Z" },
+    ]));
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "narrow_recruiter"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate this month?",
+      scope_handle: undefined,
+      greenhouse_job_ids: undefined,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(reader.calls.filter((call) => call.toolName === "list_offers").length, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fold-3 item 6: the recipes' window validator, on the planned-domain path too.
+//
+// The planned-domain path read window bounds through key PRESENCE and parsed
+// them with a bare Date.parse, so `window_start: ""` suppressed the sentence's
+// own window and answered ALL TIME; `"0"` parsed as the year 2000 under an ISO
+// contract; and a start after an end returned a confident, complete ZERO. The
+// recipes reject all three, so which answer you got depended on routing.
+// ---------------------------------------------------------------------------
+describe("answer_my_recruiting_question — explicit window bounds are validated on the planned-domain path", () => {
+  for (const [label, params] of [
+    ["a blank window_start", { window_start: "" }],
+    ["a blank window_end", { window_end: "" }],
+    ["a non-ISO window_start", { window_start: "0", window_end: "2026-06-30" }],
+    ["a non-string window_start", { window_start: 0 }],
+    ["a null window_end", { window_end: null }],
+    ["a start after its end", { window_start: "2026-06-30", window_end: "2026-04-01" }],
+  ] as const) {
+    it(`rejects ${label} rather than answering over a window nobody asked for`, async () => {
+      const reader = fakeScopedReader((toolName) => {
+        throw new Error(`an invalid window must read nothing (called ${toolName})`);
+      });
+      const { runtime } = testRuntime(reader, {
+        scopeSigner: signer,
+        jobInventory: createFixtureInventoryProvider(fixture, "narrow_recruiter"),
+      });
+
+      const result = await runRecruitingQuestionAnswer(runtime, {
+        question: "What is our offer acceptance rate this month?",
+        ...params,
+      });
+
+      assert.equal(result.ok, false, "an unusable bound is a request error, not an all-time answer");
+      assert.equal(result.ok === false && result.denial.code, "INVALID_REQUEST");
+      assert.equal(
+        reader.calls.filter((call) => call.toolName === "list_offers").length,
+        0,
+        "and no offer read is paid for"
+      );
+    });
+  }
+
+  it("accepts a valid explicit window and answers over exactly it", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_offers") {
+        return scopedSuccess(toolName, [
+          { id: 1, job_id: 9001006, application_id: 101, status: "Accepted", resolved_at: "2026-05-05T10:00:00.000Z" },
+          { id: 2, job_id: 9001006, application_id: 102, status: "Accepted", resolved_at: "2026-01-05T10:00:00.000Z" },
+        ]);
+      }
+      return scopedSuccess(toolName, []);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "narrow_recruiter"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate?",
+      window_start: "2026-04-01",
+      window_end: "2026-06-30",
+    });
+
+    assert.equal(result.ok, true);
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.rows_considered, 1, "only the offer resolved inside the explicit window");
+  });
+
+  it("accepts a ONE-SIDED explicit window rather than demanding both bounds", async () => {
+    const reader = fakeScopedReader((toolName) => {
+      if (toolName === "list_offers") {
+        return scopedSuccess(toolName, [
+          { id: 1, job_id: 9001006, application_id: 101, status: "Accepted", resolved_at: "2026-05-05T10:00:00.000Z" },
+          { id: 2, job_id: 9001006, application_id: 102, status: "Accepted", resolved_at: "2026-01-05T10:00:00.000Z" },
+        ]);
+      }
+      return scopedSuccess(toolName, []);
+    });
+    const { runtime } = testRuntime(reader, {
+      scopeSigner: signer,
+      jobInventory: createFixtureInventoryProvider(fixture, "narrow_recruiter"),
+    });
+
+    const result = await runRecruitingQuestionAnswer(runtime, {
+      question: "What is our offer acceptance rate?",
+      window_start: "2026-04-01",
+    });
+
+    assert.equal(result.ok, true, "a one-sided window is honoured as one-sided, never rejected");
+    const data = result.ok ? (result.data as any) : null;
+    assert.equal(data.summary.rows_considered, 1);
+  });
+});

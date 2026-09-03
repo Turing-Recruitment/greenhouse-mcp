@@ -520,6 +520,34 @@ function readAnalysisWindowDate(value: unknown): string | null {
   return value;
 }
 
+const WINDOW_ORDER_MESSAGE = "Analysis window_start must be on or before window_end.";
+
+/**
+ * The ONE window validator, for every path that accepts explicit bounds.
+ *
+ * The recipes have always run every present bound through `readAnalysisWindowDate` (strict ISO
+ * shape, no control characters, parses) and then through an ordering check. The planned-domain
+ * path did neither: it tested key PRESENCE and parsed with a bare `Date.parse`, so `window_start:
+ * ""` suppressed the sentence's own window and answered ALL TIME, `"0"` was read as the year 2000
+ * under an ISO contract, and a start after an end came back as a confident, complete zero. Which
+ * answer a caller got depended on which path their question routed to, which is not a contract.
+ *
+ * Returns the message to deny with, or null when every present bound is usable. Absent bounds are
+ * absent — a one-sided window stays one-sided rather than becoming an error.
+ */
+export function explicitAnalysisWindowError(params: Record<string, unknown>): string | null {
+  let start: string | null;
+  let end: string | null;
+  try {
+    start = readAnalysisWindowDate(params.window_start);
+    end = readAnalysisWindowDate(params.window_end);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  if (start !== null && end !== null && Date.parse(start) > Date.parse(end)) return WINDOW_ORDER_MESSAGE;
+  return null;
+}
+
 /**
  * True when the caller supplied BOTH window bounds explicitly. An explicit window runs free of
  * maxLookbackDays (the 9179880 pattern: explicit values run past defaults) — the cap is applied

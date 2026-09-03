@@ -14,7 +14,7 @@ import type {
   ScorecardFact,
   ScorecardQuestionAnswerFact,
 } from "./facts.js";
-import { classifyOfferStatus } from "./facts.js";
+import { classifyOfferStatus, type OfferStatusClass } from "./facts.js";
 import type { RecruiterProjectionProfileName } from "./types.js";
 
 export type MetricFactName =
@@ -73,6 +73,18 @@ export interface MetricComputeContext {
     permissionExcluded?: number;
     /** Offers excluded by the window for having no resolved_at while still being unresolved. */
     offersOutstanding?: number;
+    /**
+     * Every offer the window could NOT place, counted by its verbatim status.
+     *
+     * The window runs on `resolved_at`, so a row without one is removed before the metric sees it.
+     * Removing it silently made the mix contradict itself: the outstanding count re-entered
+     * `groups` while `total` had never counted it, so three grouped offers sat under an omission
+     * that said zero were unresolved, and an unrecognized status with no timestamp skipped its own
+     * disclosure. These rows are counted in `total` and in `groups`, classified by the SAME
+     * classifier as the rest of the mix, and never folded into the rate: a row the window cannot
+     * place cannot be claimed as accepted or rejected inside it.
+     */
+    statusesWithoutWindowField?: Record<string, number>;
     /** Whether the full version chain was read. False means re-extension counts are not claimed. */
     supersededVersionsRead?: boolean;
   };
@@ -84,6 +96,16 @@ export interface MetricDefinition {
   id: string;
   displayName: string;
   requiredFacts: MetricFactName[];
+  /**
+   * The SOURCE-ROW field names this metric cannot be answered without, as the endpoint emits them.
+   *
+   * Row names, never FACT names. The projection manifest compares the keys the upstream row carried
+   * against the keys the projection kept (evidence-projection.ts), so a metric that named its fact
+   * field — `scorecard_id`, which buildScorecardFacts derives from the row's `id` — declared a
+   * blocker that could never fire on a real row. That is the silent-miss twin of the false blockers
+   * `requiredFieldEndpoints` removed, and metrics.test.ts now checks every entry against the
+   * vendored Harvest contract's documented response fields for the declared endpoint.
+   */
   requiredFields: string[];
   requiredRoleProfile: RecruiterProjectionProfileName;
   /**
@@ -94,16 +116,20 @@ export interface MetricDefinition {
    */
   windowField?: string;
   /**
-   * The endpoint(s) this metric's `requiredFields` are actually read FROM.
+   * The endpoint(s) this metric's `requiredFields` are actually read FROM. MANDATORY.
    *
-   * Undeclared means "any endpoint", which is what the projection layer assumed for every metric:
-   * dropping `status` from /v3/prospect_pools announced that the hire count was blocked, on a read
-   * that had nothing to do with offers. Declaring it here is what lets evidence-projection key the
-   * blocks_answer omission by (endpoint, field) instead of by field alone. Left undeclared where
-   * the endpoint has not been established — a MISSING blocker is worse than a noisy one, so the
-   * mapping is added with evidence, never guessed.
+   * Optional was the defect, not the caution. "Undeclared means any endpoint" is exactly the
+   * behaviour that made a /v3/prospect_pools projection dropping `status` announce that the hire
+   * count, the scorecard submission rate, the opening fill status, the source-quality breakdown
+   * and the weekly pipeline movement were all blocked — five metrics, four of which never touch
+   * that endpoint. Leaving the field optional kept that fallback alive for sixteen metrics whose
+   * endpoint was never in doubt: each one's single fact builder declares its own
+   * `requiredEndpoints` to buildFacts (facts.ts), and that IS the endpoint its rows come from.
+   *
+   * Required here means the compiler asks the question for every metric added from now on, rather
+   * than a new metric silently inheriting the noisiest possible answer.
    */
-  requiredFieldEndpoints?: string[];
+  requiredFieldEndpoints: string[];
   defaultTimeWindow?: string;
   scopeBehavior: "job" | "job_set" | "permitted_scope" | "org_reference";
   exclusions: string[];
@@ -116,7 +142,10 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     id: "scorecard_submission_rate",
     displayName: "Scorecard submission rate",
     requiredFacts: ["scorecard_fact"],
-    requiredFields: ["scorecard_id", "status", "submitted_at"],
+    // Row names: /v3/scorecards emits `id`, and buildScorecardFacts derives `scorecard_id` from it.
+    requiredFields: ["id", "status", "submitted_at"],
+    // /v3/scorecards: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/scorecards"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -128,7 +157,9 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     id: "scorecard_overdue_rate",
     displayName: "Scorecard overdue rate",
     requiredFacts: ["scorecard_fact"],
-    requiredFields: ["scorecard_id", "interviewed_at", "submitted_at"],
+    requiredFields: ["id", "interviewed_at", "submitted_at"],
+    // /v3/scorecards: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/scorecards"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -141,6 +172,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Interview feedback SLA breach rate",
     requiredFacts: ["scorecard_fact"],
     requiredFields: ["interviewed_at", "submitted_at"],
+    // /v3/scorecards: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/scorecards"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -153,6 +186,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Time from availability received to scheduled interview",
     requiredFacts: ["interview_event_fact"],
     requiredFields: ["availability_received_at", "scheduled_at"],
+    // /v3/interviews: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/interviews"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -165,6 +200,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Time from interview to feedback completion",
     requiredFacts: ["scorecard_fact"],
     requiredFields: ["interviewed_at", "submitted_at"],
+    // /v3/scorecards: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/scorecards"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -176,7 +213,10 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     id: "stage_conversion_rate",
     displayName: "Stage conversion rate",
     requiredFacts: ["application_stage_transition_fact"],
-    requiredFields: ["application_stage_id", "exited_at"],
+    // /v3/application_stages emits `id`; `application_stage_id` is the fact name, not the row's.
+    requiredFields: ["id", "exited_at"],
+    // /v3/application_stages: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/application_stages"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -195,6 +235,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Stage dwell",
     requiredFacts: ["application_stage_transition_fact"],
     requiredFields: ["days_in_stage"],
+    // /v3/application_stages: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/application_stages"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "job_set",
@@ -207,6 +249,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Weekly application volume",
     requiredFacts: ["application_lifecycle_fact"],
     requiredFields: ["created_at"],
+    // /v3/applications: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/applications"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_12_weeks",
     scopeBehavior: "job_set",
@@ -219,6 +263,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Weekly not-rejected pipeline movement",
     requiredFacts: ["application_lifecycle_fact"],
     requiredFields: ["created_at", "status"],
+    // /v3/applications: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/applications"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_12_weeks",
     scopeBehavior: "job_set",
@@ -240,6 +286,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Source quality by outcome",
     requiredFacts: ["application_lifecycle_fact"],
     requiredFields: ["source_id", "status"],
+    // /v3/applications: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/applications"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_90_days",
     scopeBehavior: "job_set",
@@ -251,7 +299,10 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     id: "job_post_exposure_by_post",
     displayName: "Job-post tracking-link count by post (exposure proxy)",
     requiredFacts: ["job_post_exposure_fact"],
-    requiredFields: ["tracking_link_id", "related_post_id"],
+    // /v3/tracking_links emits `id`; `tracking_link_id` is the fact name, not the row's.
+    requiredFields: ["id", "related_post_id"],
+    // /v3/tracking_links: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/tracking_links"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_90_days",
     scopeBehavior: "job_set",
@@ -267,6 +318,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Approval bottleneck (pending age)",
     requiredFacts: ["approval_flow_fact"],
     requiredFields: ["created_at", "approval_status"],
+    // /v3/approval_flows: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/approval_flows"],
     requiredRoleProfile: "recruiting_manager",
     defaultTimeWindow: "last_90_days",
     scopeBehavior: "job_set",
@@ -281,6 +334,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Prospect pool distribution",
     requiredFacts: ["prospect_state_fact"],
     requiredFields: ["pool_id", "pool_stage_id"],
+    // /v3/prospect_details: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/prospect_details"],
     requiredRoleProfile: "recruiting_manager",
     defaultTimeWindow: "last_90_days",
     scopeBehavior: "job_set",
@@ -296,6 +351,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Note activity volume",
     requiredFacts: ["note_activity_fact"],
     requiredFields: ["type", "created_at"],
+    // /v3/notes: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/notes"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_30_days",
     scopeBehavior: "permitted_scope",
@@ -307,7 +364,11 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     id: "opening_fill_status",
     displayName: "Opening fill status",
     requiredFacts: ["opening_headcount_fact"],
-    requiredFields: ["status", "open"],
+    // /v3/openings documents no `status` at all, and computeOpeningFillStatus never reads one: it
+    // decides on `open` and `closed_at`, which are the fields a projection could really drop.
+    requiredFields: ["open", "closed_at"],
+    // /v3/openings: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/openings"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "current",
     scopeBehavior: "job_set",
@@ -379,6 +440,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     displayName: "Rubric answer coverage",
     requiredFacts: ["scorecard_question_answer_fact"],
     requiredFields: ["scorecard_id"],
+    // /v3/scorecard_question_answers: the endpoint this metric's fact builder reads (facts.ts).
+    requiredFieldEndpoints: ["/v3/scorecard_question_answers"],
     requiredRoleProfile: "recruiter_default",
     defaultTimeWindow: "last_90_days",
     scopeBehavior: "job_set",
@@ -604,6 +667,29 @@ function computeOpeningFillStatus(context: MetricComputeContext): MetricResult {
   };
 }
 
+/**
+ * The group an offer the window could not place is counted under, by what its status MEANS.
+ *
+ * Not by its verbatim value: `outstanding_no_resolved_at` is the group every consumer already
+ * reads, and splitting it per tenant status string would break that while saying nothing extra —
+ * the verbatim values are named in the omissions instead.
+ */
+type OfferStatusClassGroup =
+  | "outstanding_no_resolved_at"
+  | "superseded_no_resolved_at"
+  | "unrecognized_status_no_resolved_at"
+  | "resolved_status_no_resolved_at";
+
+const UNDATED_GROUP_BY_CLASS: Record<OfferStatusClass, OfferStatusClassGroup> = {
+  outstanding: "outstanding_no_resolved_at",
+  superseded: "superseded_no_resolved_at",
+  unknown: "unrecognized_status_no_resolved_at",
+  // An offer that says it was accepted or rejected but carries no resolved_at is a real data gap,
+  // not a normal state. It is counted and named apart from the offers that are simply still out.
+  accepted: "resolved_status_no_resolved_at",
+  rejected: "resolved_status_no_resolved_at",
+};
+
 function computeOfferResolutionMix(context: MetricComputeContext): MetricResult {
   const readiness = metricReadiness("offer_resolution", offerFacts(context));
   if (readiness) return readiness;
@@ -624,16 +710,40 @@ function computeOfferResolutionMix(context: MetricComputeContext): MetricResult 
     else if (offerClass === "rejected") rejected += 1;
     else if (offerClass === "unknown") unrecognized.set(key, (unrecognized.get(key) ?? 0) + 1);
   }
+  // The offers the window could not place, classified BEFORE it removed them. Each one joins
+  // `total` and a group of its own class, and none of them joins the rate: a row with no
+  // resolved_at cannot be claimed as accepted or rejected INSIDE a resolved_at window.
+  const undated = context.offerRead?.statusesWithoutWindowField;
+  const undatedByClass = new Map<OfferStatusClassGroup, number>();
+  if (undated) {
+    for (const [status, count] of Object.entries(undated)) {
+      total += count;
+      const offerClass = classifyOfferStatus(status);
+      undatedByClass.set(UNDATED_GROUP_BY_CLASS[offerClass], (undatedByClass.get(UNDATED_GROUP_BY_CLASS[offerClass]) ?? 0) + count);
+      // An unrecognized status is unrecognized whether or not it carried a date. Skipping the
+      // disclosure for the undated ones is how a renamed tenant status moves a rate unremarked.
+      if (offerClass === "unknown") unrecognized.set(status, (unrecognized.get(status) ?? 0) + count);
+    }
+  }
   const resolved = accepted + rejected;
   // The offers that were sent and have not come back. Windowing on `resolved_at` — the clock every
   // published hire report uses — structurally excludes them, because an unresolved offer has no
   // resolved_at to place. Before this they simply vanished, and the "N unresolved excluded"
   // disclosure below was a guaranteed 0 sitting under an answer that had silently dropped them.
-  // They are counted, grouped and named instead.
-  const outstanding = context.offerRead?.offersOutstanding ?? 0;
+  // They are counted, grouped and named instead. The reader's own tally is the fallback for a
+  // caller that hands over `offersOutstanding` without the fuller class breakdown.
+  const outstanding = undated
+    ? undatedByClass.get("outstanding_no_resolved_at") ?? 0
+    : context.offerRead?.offersOutstanding ?? 0;
+  if (!undated && outstanding > 0) {
+    total += outstanding;
+    undatedByClass.set("outstanding_no_resolved_at", outstanding);
+  }
   const groups: Array<Record<string, string | number | null>> = [
     ...[...byStatus.entries()].map(([offer_status, offer_count]) => ({ offer_status, offer_count })),
-    ...(outstanding > 0 ? [{ offer_status: "outstanding_no_resolved_at", offer_count: outstanding }] : []),
+    ...[...undatedByClass.entries()]
+      .filter(([, offer_count]) => offer_count > 0)
+      .map(([offer_status, offer_count]) => ({ offer_status, offer_count })),
   ];
   const readOmissions: string[] = [];
   if (unrecognized.size > 0) {
@@ -647,6 +757,18 @@ function computeOfferResolutionMix(context: MetricComputeContext): MetricResult 
   if (outstanding > 0) {
     readOmissions.push(
       `offers_outstanding: ${outstanding} offer(s) in scope are still open (no resolved_at yet), so the resolved_at window cannot place them and they are outside the rate. They are counted here rather than dropped.`
+    );
+  }
+  const supersededUndated = undatedByClass.get("superseded_no_resolved_at") ?? 0;
+  if (supersededUndated > 0) {
+    readOmissions.push(
+      `${supersededUndated} superseded offer version(s) carry no resolved_at; they are counted in the mix and are outside the rate, because a superseded version is a previous draft rather than an outcome.`
+    );
+  }
+  const resolvedUndated = undatedByClass.get("resolved_status_no_resolved_at") ?? 0;
+  if (resolvedUndated > 0) {
+    readOmissions.push(
+      `${resolvedUndated} offer(s) say they were accepted or rejected but carry no resolved_at, so no window can place them. They are counted in the mix and left out of the rate rather than dated by guesswork.`
     );
   }
   const rawRowsRead = context.offerRead?.rawRowsRead;
