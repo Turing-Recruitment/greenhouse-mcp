@@ -96,6 +96,16 @@ export interface MetricDefinition {
   id: string;
   displayName: string;
   requiredFacts: MetricFactName[];
+  /**
+   * The SOURCE-ROW field names this metric cannot be answered without, as the endpoint emits them.
+   *
+   * Row names, never FACT names. The projection manifest compares the keys the upstream row carried
+   * against the keys the projection kept (evidence-projection.ts), so a metric that named its fact
+   * field — `scorecard_id`, which buildScorecardFacts derives from the row's `id` — declared a
+   * blocker that could never fire on a real row. That is the silent-miss twin of the false blockers
+   * `requiredFieldEndpoints` removed, and metrics.test.ts now checks every entry against the
+   * vendored Harvest contract's documented response fields for the declared endpoint.
+   */
   requiredFields: string[];
   requiredRoleProfile: RecruiterProjectionProfileName;
   /**
@@ -132,7 +142,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     id: "scorecard_submission_rate",
     displayName: "Scorecard submission rate",
     requiredFacts: ["scorecard_fact"],
-    requiredFields: ["scorecard_id", "status", "submitted_at"],
+    // Row names: /v3/scorecards emits `id`, and buildScorecardFacts derives `scorecard_id` from it.
+    requiredFields: ["id", "status", "submitted_at"],
     // /v3/scorecards: the endpoint this metric's fact builder reads (facts.ts).
     requiredFieldEndpoints: ["/v3/scorecards"],
     requiredRoleProfile: "recruiter_default",
@@ -146,7 +157,7 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     id: "scorecard_overdue_rate",
     displayName: "Scorecard overdue rate",
     requiredFacts: ["scorecard_fact"],
-    requiredFields: ["scorecard_id", "interviewed_at", "submitted_at"],
+    requiredFields: ["id", "interviewed_at", "submitted_at"],
     // /v3/scorecards: the endpoint this metric's fact builder reads (facts.ts).
     requiredFieldEndpoints: ["/v3/scorecards"],
     requiredRoleProfile: "recruiter_default",
@@ -202,7 +213,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     id: "stage_conversion_rate",
     displayName: "Stage conversion rate",
     requiredFacts: ["application_stage_transition_fact"],
-    requiredFields: ["application_stage_id", "exited_at"],
+    // /v3/application_stages emits `id`; `application_stage_id` is the fact name, not the row's.
+    requiredFields: ["id", "exited_at"],
     // /v3/application_stages: the endpoint this metric's fact builder reads (facts.ts).
     requiredFieldEndpoints: ["/v3/application_stages"],
     requiredRoleProfile: "recruiter_default",
@@ -287,7 +299,8 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     id: "job_post_exposure_by_post",
     displayName: "Job-post tracking-link count by post (exposure proxy)",
     requiredFacts: ["job_post_exposure_fact"],
-    requiredFields: ["tracking_link_id", "related_post_id"],
+    // /v3/tracking_links emits `id`; `tracking_link_id` is the fact name, not the row's.
+    requiredFields: ["id", "related_post_id"],
     // /v3/tracking_links: the endpoint this metric's fact builder reads (facts.ts).
     requiredFieldEndpoints: ["/v3/tracking_links"],
     requiredRoleProfile: "recruiter_default",
@@ -351,7 +364,9 @@ export const METRIC_REGISTRY: MetricDefinition[] = [
     id: "opening_fill_status",
     displayName: "Opening fill status",
     requiredFacts: ["opening_headcount_fact"],
-    requiredFields: ["status", "open"],
+    // /v3/openings documents no `status` at all, and computeOpeningFillStatus never reads one: it
+    // decides on `open` and `closed_at`, which are the fields a projection could really drop.
+    requiredFields: ["open", "closed_at"],
     // /v3/openings: the endpoint this metric's fact builder reads (facts.ts).
     requiredFieldEndpoints: ["/v3/openings"],
     requiredRoleProfile: "recruiter_default",

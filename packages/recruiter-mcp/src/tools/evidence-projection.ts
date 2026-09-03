@@ -862,7 +862,16 @@ function projectJobNoteRow(row: Record<string, unknown>): Record<string, unknown
   return projected;
 }
 
-function buildProjectionMetadata(
+/**
+ * The omission manifest for one projection: what the source row carried, what the projection kept,
+ * and which registered metrics the difference blocks.
+ *
+ * Exported so the blocker wiring can be tested at the level it actually runs — a real adapter, a
+ * real row, one field really absent from the projected copy. Asserting `metricsBlockedByOmittedField`
+ * alone proved the map and not the manifest, which is how four metrics kept naming fact fields the
+ * source row never carries: blockers that could never fire on real data.
+ */
+export function buildProjectionMetadata(
   adapter: EvidenceEndpointAdapter,
   sourceData: unknown,
   projectedData: unknown
