@@ -93,7 +93,10 @@ export const applicationStageMoveAction: ActionDefinition = {
     return {
       method: "POST",
       path: `/applications/${binding.application_id}/move`,
-      body: { from_stage_id: binding.from_application_stage_id, to_stage_id: binding.to_interview_stage_id },
+      // Greenhouse's move endpoint speaks INTERVIEW (job) stage ids on both sides. Sending the
+      // application-stage row id here was rejected live (2026-09-04, 422 "The specified stage does
+      // not exist in the job."); the same move with the interview stage id returned 204.
+      body: { from_stage_id: binding.from_interview_stage_id, to_stage_id: binding.to_interview_stage_id },
     };
   },
   async observe(record, context) {

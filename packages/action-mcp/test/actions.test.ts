@@ -51,7 +51,7 @@ const WIRE_CASES: ReadonlyArray<{
       before: { application_stage_id: 501, interview_stage_id: 601 },
       after: { interview_stage_id: 602, stage_name: "Onsite" }, effects: ["May run transition rules."],
     },
-    expected: { method: "POST", path: "/applications/100/move", body: { from_stage_id: 501, to_stage_id: 602 } },
+    expected: { method: "POST", path: "/applications/100/move", body: { from_stage_id: 601, to_stage_id: 602 } },
   },
   {
     kind: "application_rejection",

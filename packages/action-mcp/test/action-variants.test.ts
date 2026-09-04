@@ -243,7 +243,7 @@ describe("action-specific variants", () => {
     assert.deepEqual(await definition.mutation(action.approval, action, context(success)), {
       method: "POST",
       path: "/applications/100/move",
-      body: { from_stage_id: 501, to_stage_id: 602 },
+      body: { from_stage_id: 601, to_stage_id: 602 },
     });
 
     for (const [label, rows, message] of [
