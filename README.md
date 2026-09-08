@@ -143,6 +143,27 @@ verification command.
 
 ## Configuration and data handling
 
+### ChatGPT and Claude custom connectors
+
+For an OAuth-enabled deployment, create a custom connector with the hosted `/mcp`
+URL and select OAuth. Leave the client ID and client secret blank; select Client
+ID Metadata Documents (CIMD) if the client offers a registration-method choice.
+Claude and ChatGPT publish their callback URLs in metadata documents that this
+server validates automatically. No per-connector callback registration is needed.
+Each person signs in with their work Google account and receives their own scoped
+session. Workspace publication and allowed actions remain admin settings.
+
+ChatGPT's stable and callback-specific `https://chatgpt.com/oauth/.../client.json`
+documents are supported using public-client PKCE (`none`). The server checks the
+document's client ID, supported authentication methods, and exact redirect match;
+it never follows metadata redirects to another location. Existing static-client
+configuration remains available for clients that need manual registration.
+
+Validate the actual workspace connection and refresh before broad publication.
+See [OpenAI's authentication contract](https://developers.openai.com/plugins/build/auth).
+
+### Server configuration
+
 The recruiter and action environment contracts live in their package deployment
 directories. Secrets belong in the runtime environment or secret manager, never in
 the image or repository. Durable session files are bearer credentials and are not

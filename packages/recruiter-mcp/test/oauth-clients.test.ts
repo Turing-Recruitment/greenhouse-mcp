@@ -117,13 +117,22 @@ describe("OAuth client resolution (slice 5)", () => {
     assert.equal(result.status, "invalid_redirect");
   });
 
-  it("rejects a non-claude.ai CIMD URL WITHOUT fetching it (SSRF containment)", async () => {
+  it("rejects untrusted CIMD URLs WITHOUT fetching them (SSRF containment)", async () => {
     const { fetchImpl, calls } = trackingFetch();
     for (const clientId of [
       "https://evil.example.com/client-metadata",
       "https://claude.ai.evil.example.com/metadata",
       "http://claude.ai/oauth/downgraded-to-http",
       "https://internal-service.local/metadata",
+      "https://chatgpt.com.evil.example.com/oauth/client.json",
+      "https://chatgpt.com@evil.example.com/oauth/client.json",
+      "http://chatgpt.com/oauth/client.json",
+      "https://chatgpt.com:8443/oauth/client.json",
+      "https://chatgpt.com/share/client.json",
+      "https://chatgpt.com/oauth/client.json?url=https://evil.example.com",
+      "https://chatgpt.com/oauth/client.json#fragment",
+      "https://chatgpt.com/oauth/a/b/client.json",
+      "https://chatgpt.com/oauth/%2e%2e/client.json",
     ]) {
       const result = await resolveOauthClient(requireConfig(), {
         clientId,
@@ -132,7 +141,52 @@ describe("OAuth client resolution (slice 5)", () => {
       });
       assert.equal(result.status, "invalid_client", `expected invalid_client for ${clientId}`);
     }
-    assert.equal(calls.length, 0, "no non-claude.ai metadata URL may ever be fetched");
+    assert.equal(calls.length, 0, "no untrusted metadata URL may ever be fetched");
+  });
+
+  it("discovers both ChatGPT metadata URL forms without static registration and preserves ChatGPT attribution", async () => {
+    const config = requireConfig(oauthEnv({
+      GREENHOUSE_RECRUITER_OAUTH_STATIC_CLIENT_ID: undefined,
+      GREENHOUSE_RECRUITER_OAUTH_STATIC_CLIENT_REDIRECT_URIS: undefined,
+    }));
+    for (const [clientId, redirectUri] of [
+      ["https://chatgpt.com/oauth/client.json", STATIC_REDIRECT],
+      ["https://chatgpt.com/oauth/callback-123/client.json", "https://chatgpt.com/connector/oauth/callback-123"],
+    ]) {
+      const { fetchImpl, calls } = trackingFetch(() => Response.json({
+        client_id: clientId,
+        redirect_uris: [redirectUri],
+        // OpenAI's plural field permits none even though the legacy preference is JWT.
+        token_endpoint_auth_method: "private_key_jwt",
+        token_endpoint_auth_methods_supported: ["none", "private_key_jwt"],
+      }));
+      assert.deepEqual(await resolveOauthClient(config, { clientId: clientId!, redirectUri: redirectUri!, fetchImpl }), {
+        status: "resolved", client: "chatgpt_codex_host", surface: "chatgpt_desktop", clientId,
+      });
+      assert.deepEqual(calls, [clientId]);
+      assert.equal((await resolveOauthClient(config, {
+        clientId: clientId!, redirectUri: `${redirectUri}/wrong`, fetchImpl,
+      })).status, "invalid_redirect");
+    }
+  });
+
+  it("refuses ChatGPT documents with a mismatched identity or unsupported token authentication", async () => {
+    const clientId = "https://chatgpt.com/oauth/client.json";
+    for (const fields of [
+      { client_id: "https://chatgpt.com/oauth/another/client.json", token_endpoint_auth_methods_supported: ["none"] },
+      { token_endpoint_auth_methods_supported: ["none"] },
+      { client_id: clientId, token_endpoint_auth_methods_supported: ["private_key_jwt"] },
+      { client_id: clientId, token_endpoint_auth_methods_supported: "none" },
+      { client_id: clientId, token_endpoint_auth_method: "private_key_jwt" },
+    ]) {
+      const { fetchImpl, calls } = trackingFetch(() => Response.json({ redirect_uris: [STATIC_REDIRECT], ...fields }));
+      assert.equal((await resolveOauthClient(requireConfig(), { clientId, redirectUri: STATIC_REDIRECT, fetchImpl })).status, "invalid_client");
+      assert.deepEqual(calls, [clientId]);
+    }
+    const { fetchImpl } = trackingFetch(() => Response.json({
+      client_id: clientId, redirect_uris: [STATIC_REDIRECT], token_endpoint_auth_method: "none",
+    }));
+    assert.equal((await resolveOauthClient(requireConfig(), { clientId, redirectUri: STATIC_REDIRECT, fetchImpl })).status, "resolved");
   });
 
   it("resolves the env static client to chatgpt_codex_host on chatgpt_desktop — never action-plane 'codex'", async () => {

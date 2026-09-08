@@ -25,6 +25,10 @@ const SUPABASE_ORIGIN = "https://ibxvxmfhovmththllwoi.supabase.co";
 const LOOPBACK_REDIRECT = "http://localhost:53682/callback";
 const HOSTED_CIMD_URL = "https://claude.ai/oauth/hosted-chat-client-metadata";
 const HOSTED_CALLBACK = "https://claude.ai/api/mcp/auth_callback";
+const CHATGPT_CLIENTS = [
+  { clientId: "https://chatgpt.com/oauth/client.json", redirectUri: "https://chatgpt.com/connector_platform_oauth_redirect" },
+  { clientId: "https://chatgpt.com/oauth/callback-123/client.json", redirectUri: "https://chatgpt.com/connector/oauth/callback-123" },
+];
 // RFC 7636 appendix B vector.
 const CODE_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const CODE_CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
@@ -106,6 +110,15 @@ function installFlowFetchStub(world: FlowWorld): () => void {
     if (urlText === HOSTED_CIMD_URL) {
       world.cimdFetches += 1;
       return jsonResponse({ client_name: "Claude", redirect_uris: [HOSTED_CALLBACK] });
+    }
+    const chatgpt = CHATGPT_CLIENTS.find((client) => client.clientId === urlText);
+    if (chatgpt) {
+      world.cimdFetches += 1;
+      return jsonResponse({
+        client_id: chatgpt.clientId, redirect_uris: [chatgpt.redirectUri],
+        token_endpoint_auth_method: "private_key_jwt",
+        token_endpoint_auth_methods_supported: ["none", "private_key_jwt"],
+      });
     }
     throw new Error(`unexpected fetch in oauth full-flow test: ${method} ${urlText}`);
   }) as typeof fetch;
@@ -290,7 +303,11 @@ function decodeAccessTokenClaims(token: string): Record<string, unknown> {
 }
 
 describe("OAuth full flow (slice 9)", () => {
-  it("drives discovery -> challenge -> sign-in -> code -> tokens -> parity -> rotation -> reuse-kill -> jti revocation", async () => {
+  for (const client of [
+    { clientId: CLAUDE_CODE_CIMD_URL, redirectUri: LOOPBACK_REDIRECT, client: "claude_code", surface: "claude_desktop" },
+    ...CHATGPT_CLIENTS.map((entry) => ({ ...entry, client: "chatgpt_codex_host", surface: "chatgpt_desktop" })),
+  ] as const) {
+  it(`drives discovery -> sign-in -> tokens -> catalog -> refresh -> revocation for ${client.clientId}`, async () => {
     const auditDir = await mkdtemp(join(tmpdir(), "greenhouse-oauth-flow-"));
     const world: FlowWorld = {
       grantRows: new Map(),
@@ -327,8 +344,8 @@ describe("OAuth full flow (slice 9)", () => {
       // 3. /authorize hands the browser to Google with signed pending state.
       const authorizeParams = new URLSearchParams({
         response_type: "code",
-        client_id: CLAUDE_CODE_CIMD_URL,
-        redirect_uri: LOOPBACK_REDIRECT,
+        client_id: client.clientId,
+        redirect_uri: client.redirectUri,
         state: "client-opaque-state-value",
         code_challenge: CODE_CHALLENGE,
         code_challenge_method: "S256",
@@ -350,7 +367,7 @@ describe("OAuth full flow (slice 9)", () => {
       );
       assert.equal(callback.status, 302);
       const clientLocation = new URL(callback.headers.get("location")!);
-      assert.equal(`${clientLocation.protocol}//${clientLocation.host}${clientLocation.pathname}`, LOOPBACK_REDIRECT);
+      assert.equal(`${clientLocation.protocol}//${clientLocation.host}${clientLocation.pathname}`, client.redirectUri);
       assert.equal(clientLocation.searchParams.get("state"), "client-opaque-state-value");
       const authorizationCode = clientLocation.searchParams.get("code")!;
       assert.ok(authorizationCode);
@@ -363,8 +380,8 @@ describe("OAuth full flow (slice 9)", () => {
         body: new URLSearchParams({
           grant_type: "authorization_code",
           code: authorizationCode,
-          redirect_uri: LOOPBACK_REDIRECT,
-          client_id: CLAUDE_CODE_CIMD_URL,
+          redirect_uri: client.redirectUri,
+          client_id: client.clientId,
           code_verifier: CODE_VERIFIER,
           resource: RESOURCE_URL,
         }).toString(),
@@ -375,14 +392,17 @@ describe("OAuth full flow (slice 9)", () => {
       const refreshToken1 = tokens["refresh_token"] as string;
       assert.equal(tokens["token_type"], "Bearer");
       assert.equal(accessToken.split(".").length, 3);
+      assert.equal(decodeAccessTokenClaims(accessToken)["client"], client.client);
+      assert.equal(decodeAccessTokenClaims(accessToken)["surface"], client.surface);
+      assert.equal(world.cimdFetches, client.client === "claude_code" ? 0 : 1);
 
       // 6. The signed-in session sees EXACTLY the catalog a legacy session sees, same boot.
       const oauthToolNames = await listToolNames(base, accessToken);
       const legacyToken = createSignedSessionToken({
         subject: `email:${RECRUITER_EMAIL}`,
         email: RECRUITER_EMAIL,
-        surface: "claude_desktop",
-        client: "claude_code",
+        surface: client.surface as "claude_desktop" | "chatgpt_desktop",
+        client: client.client as "claude_code" | "chatgpt_codex_host",
         tokenId: "legacy-parity-session",
         issuedAt: "2026-06-23T00:00:00.000Z",
       }, STRONG_SESSION_SECRET);
@@ -396,13 +416,14 @@ describe("OAuth full flow (slice 9)", () => {
         body: new URLSearchParams({
           grant_type: "refresh_token",
           refresh_token: refreshToken1,
-          client_id: CLAUDE_CODE_CIMD_URL,
+          client_id: client.clientId,
         }).toString(),
       });
       assert.equal(rotate.status, 200);
       const rotated = await rotate.json() as Record<string, unknown>;
       const refreshToken2 = rotated["refresh_token"] as string;
       assert.notEqual(refreshToken2, refreshToken1);
+      assert.deepEqual(await listToolNames(base, rotated["access_token"] as string), oauthToolNames);
 
       const reuse = await fetch(`${base}/token`, {
         method: "POST",
@@ -410,7 +431,7 @@ describe("OAuth full flow (slice 9)", () => {
         body: new URLSearchParams({
           grant_type: "refresh_token",
           refresh_token: refreshToken1,
-          client_id: CLAUDE_CODE_CIMD_URL,
+          client_id: client.clientId,
         }).toString(),
       });
       assert.equal(reuse.status, 400);
@@ -422,7 +443,7 @@ describe("OAuth full flow (slice 9)", () => {
         body: new URLSearchParams({
           grant_type: "refresh_token",
           refresh_token: refreshToken2,
-          client_id: CLAUDE_CODE_CIMD_URL,
+          client_id: client.clientId,
         }).toString(),
       });
       assert.equal(afterFamilyKill.status, 400);
@@ -452,6 +473,7 @@ describe("OAuth full flow (slice 9)", () => {
       await rm(auditDir, { recursive: true, force: true });
     }
   });
+  }
 
   it("authorizes a hosted-Claude CIMD client through the same stub (document fetched once)", async () => {
     const auditDir = await mkdtemp(join(tmpdir(), "greenhouse-oauth-cimd-"));

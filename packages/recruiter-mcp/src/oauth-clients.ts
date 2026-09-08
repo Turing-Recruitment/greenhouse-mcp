@@ -3,19 +3,19 @@ import type { OauthAuthorizationConfig } from "./oauth-config.js";
 import type { RecruiterClient, RecruiterSurface } from "./types.js";
 
 // Client resolution for the OAuth sign-in layer. No dynamic client registration exists on this
-// server (DCR is deprecated in the 2026-07-28 authorization spec and skipping it eliminates a
-// registered-clients table): a client is identified by its HTTPS client-metadata-document URL
-// (Claude hosted and Claude Code both publish one), or by the single env-listed static client
+// server: a client is identified by its trusted HTTPS client-metadata-document URL
+// (Claude and ChatGPT publish these), or by the single env-listed static client
 // an org Owner can paste into a connector's Advanced settings.
 //
 // The client_id -> RecruiterClient mapping is what feeds signed client identity to the write
-// plane's attribution bridge, so the values here are RECRUITER vocabulary: the static ChatGPT
+// plane's attribution bridge, so the values here are RECRUITER vocabulary: a ChatGPT
 // client maps to "chatgpt_codex_host", never the action plane's "codex" — auth.ts's
 // isClientSurfaceCompatible would reject "codex" outright, and the edge translation to
 // action-plane names happens exactly once, in actionClientForRecruiterSession.
 
 export const CLAUDE_CODE_CIMD_URL = "https://claude.ai/oauth/claude-code-client-metadata";
 const CLAUDE_CIMD_ORIGIN = "https://claude.ai";
+const CHATGPT_CIMD_ORIGIN = "https://chatgpt.com";
 
 export type OauthClientResolution =
   | {
@@ -70,15 +70,13 @@ export async function resolveOauthClient(
     return { status: "resolved", client: "chatgpt_codex_host", surface: "chatgpt_desktop", clientId };
   }
 
-  // 3. Any other claude.ai-origin HTTPS metadata URL is treated as hosted Claude chat (the
-  //    exact hosted CIMD literal is unknowable until observed live; the claude.ai origin is
-  //    the trust boundary). Everything else is refused WITHOUT a fetch — the resolver must
-  //    never be a proxy that requests attacker-chosen URLs.
-  const metadataUrl = parseClaudeCimdUrl(clientId);
+  // 3. Hosted Claude and ChatGPT publish callbacks in trusted metadata documents. Refuse
+  //    other origins before fetching; ChatGPT uses stable or callback-specific document paths.
+  const metadataUrl = parseHostedCimdUrl(clientId);
   if (metadataUrl === undefined) {
     return {
       status: "invalid_client",
-      reason: "client_id must be the static client id or a https://claude.ai client-metadata URL.",
+      reason: "client_id must be the static client id or a supported Claude or ChatGPT client-metadata URL.",
     };
   }
   const document = await fetchCimdDocument(metadataUrl, config, input.fetchImpl ?? fetch);
@@ -94,19 +92,24 @@ export async function resolveOauthClient(
       reason: "redirect_uri is not listed in the client metadata document.",
     };
   }
-  return { status: "resolved", client: "claude_desktop_chat", surface: "claude_desktop", clientId };
+  return metadataUrl.origin === CHATGPT_CIMD_ORIGIN
+    ? { status: "resolved", client: "chatgpt_codex_host", surface: "chatgpt_desktop", clientId }
+    : { status: "resolved", client: "claude_desktop_chat", surface: "claude_desktop", clientId };
 }
 
-function parseClaudeCimdUrl(clientId: string): URL | undefined {
+function parseHostedCimdUrl(clientId: string): URL | undefined {
   let url: URL;
   try {
     url = new URL(clientId);
   } catch {
     return undefined;
   }
-  if (url.protocol !== "https:" || url.origin !== CLAUDE_CIMD_ORIGIN) return undefined;
+  if (url.protocol !== "https:") return undefined;
   if (url.username || url.password || url.hash) return undefined;
-  return url;
+  if (url.origin === CLAUDE_CIMD_ORIGIN) return url;
+  if (url.origin === CHATGPT_CIMD_ORIGIN && url.href === clientId && !url.search
+    && /^\/oauth\/(?:[A-Za-z0-9_-]+\/)?client\.json$/.test(url.pathname)) return url;
+  return undefined;
 }
 
 interface CimdDocument {
@@ -137,6 +140,15 @@ async function fetchCimdDocument(
     return undefined;
   }
   if (parsed === null || typeof parsed !== "object") return undefined;
+  if (url.origin === CHATGPT_CIMD_ORIGIN) {
+    const document = parsed as Record<string, unknown>;
+    // OpenAI's plural methods override its legacy private_key_jwt preference. This server
+    // advertises only none + PKCE, so refuse documents that cannot use that method.
+    const methods = document.token_endpoint_auth_methods_supported
+      ?? [document.token_endpoint_auth_method];
+    if (document.client_id !== url.href || !Array.isArray(methods)
+      || !methods.every((method) => typeof method === "string") || !methods.includes("none")) return undefined;
+  }
   const redirectUris = (parsed as { redirect_uris?: unknown }).redirect_uris;
   if (!Array.isArray(redirectUris) || !redirectUris.every((entry) => typeof entry === "string")) {
     return undefined;
